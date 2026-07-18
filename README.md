@@ -6,7 +6,7 @@
 
 NanoApps Beta lets you [run a collection of](#included-apps), and [build your own](#contributing-to-nanoapps), homebrew apps on iPod nano 7th generation. Out of the box it includes essential utilities like Calculator, Countdown Days, Files, Paint, and Screenshots, productivity tools like Calendar, Notes, Reminders, and Books, and lightweight games like 2048, Tetris, Minesweeper, and Rhythm.
 
-Homebrew apps appear as colorful icons on the native nano Home Screen, render with the full LVGL widget toolkit, and launch with the familiar zoom animation, so they feel at home next to Music and Photos. Games and visualization apps can also use OpenGL ES for 3D rendering. Contributions are very welcome: see [Contributing to NanoApps](#contributing-to-nanoapps), join the [iPod nano Hacking Discord](https://discord.gg/7PnGEXjW3X), and share what you build on [r/ipod](https://www.reddit.com/r/ipod/).
+Homebrew apps appear as colorful icons on the native nano Home Screen, render with the full LVGL widget toolkit, and launch with the familiar zoom animation, so they feel at home next to Music and Photos. Games and visualization apps can also use OpenGL ES for 3D rendering. Contributions are very welcome: see [Contributing to NanoApps](#contributing-to-nanoapps), join the [NanoApps Discord](https://discord.gg/Er3KJwaCMg), and share what you build on [r/ipod](https://www.reddit.com/r/ipod/).
 
 ## Getting Started
 
@@ -228,4 +228,4 @@ Good places to start:
 - Build more user-friendly installation methods, such as untethered injection.
 - Add Windows and Mac development and install support in addition to Linux.
 
-[Pull requests](https://github.com/nfzerox/NanoApps/pulls) are welcome. Fork it, play with it, and discuss with fellow hackers on the [iPod nano Hacking Discord](https://discord.gg/7PnGEXjW3X). If you make something cool, post it, share it on [r/ipod](https://www.reddit.com/r/ipod/) and social media.
+[Pull requests](https://github.com/nfzerox/NanoApps/pulls) are welcome. Fork it, play with it, and discuss with fellow hackers on the [NanoApps Discord](https://discord.gg/Er3KJwaCMg). If you make something cool, post it, share it on [r/ipod](https://www.reddit.com/r/ipod/) and social media.
