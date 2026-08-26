@@ -181,12 +181,16 @@ void hb_touch_drain_all(void);
 
 /* True if `path` exists on the main iPod filesystem. */
 bool hb_fs_exists(const char *path);
+/* Same, on an explicit RetailOS volume id (0=Main/FAT, 1=Root, 4=Resources). */
+bool hb_fs_exists_at(const char *path, int volume_id);
 
 /* Create/truncate `path` and write `size` bytes from `data`. Returns
    true on success. Path is relative to the volume root, e.g.
    "/iPod_Control/myfile.txt". Caches data, sets EOF, flushes before
    returning, so the data is durable on disk. */
 bool hb_fs_write(const char *path, const void *data, uint32_t size);
+bool hb_fs_write_at(const char *path, const void *data, uint32_t size,
+                    int volume_id);
 
 /* Write several buffers to one file, in order, with a single open (e.g. a
    recording ring split across multiple allocations). */
@@ -202,6 +206,8 @@ bool hb_fs_stream_close(void);
 /* Read up to `max_size` bytes from `path` into `buf`. Returns the
    number of bytes actually read (0 if file is missing or read failed). */
 uint32_t hb_fs_read(const char *path, void *buf, uint32_t max_size);
+uint32_t hb_fs_read_at(const char *path, void *buf, uint32_t max_size,
+                       int volume_id);
 
 /* Directory iteration. Opaque storage; pass the same hb_dir_t through
    open / next / close. Caller owns the buffer.
@@ -224,7 +230,8 @@ bool hb_fs_dir_open (hb_dir_t *iter, const char *path, bool recursive);
 bool hb_fs_dir_next (hb_dir_t *iter, char *out_name, int out_size,
                      bool *out_is_dir);
 void hb_fs_dir_close(hb_dir_t *iter);
-/* Same as hb_fs_dir_open but on an explicit volume id (0=Main, 4=Resources). */
+/* Same as hb_fs_dir_open but on an explicit volume id
+   (0=Main/FAT, 1=Root/internal, 4=Resources). */
 bool hb_fs_dir_open_at(hb_dir_t *iter, const char *path, bool recursive,
                        int volume_id);
 
@@ -232,26 +239,32 @@ bool hb_fs_dir_open_at(hb_dir_t *iter, const char *path, bool recursive,
    call (success or already-missing). Will fail to delete a non-empty
    directory — use hb_fs_rmdir_recursive for that. */
 bool hb_fs_remove(const char *path);
+bool hb_fs_remove_at(const char *path, int volume_id);
 
 /* Create a directory, including any missing intermediate directories
    (mkdir -p semantics). Returns true on success or if the dir already
    existed. */
 bool hb_fs_mkdir(const char *path);
+bool hb_fs_mkdir_at(const char *path, int volume_id);
 
 /* Get file size in bytes. Returns 0 if the file doesn't exist or stat
    fails. (Zero-byte files indistinguishable from missing — use
    hb_fs_exists if you need to disambiguate.) */
 uint32_t hb_fs_size(const char *path);
+uint32_t hb_fs_size_at(const char *path, int volume_id);
 
 /* True if `path` exists AND is a directory. */
 bool hb_fs_is_dir(const char *path);
+bool hb_fs_is_dir_at(const char *path, int volume_id);
 
 /* Remove an empty directory. Use hb_fs_rmrf for non-empty trees. */
 bool hb_fs_rmdir(const char *path);
+bool hb_fs_rmdir_at(const char *path, int volume_id);
 
 /* Recursive remove — file OR directory. Returns true on full success.
    Use for cleaning up app data folders, /Apps/Foo.app etc. */
 bool hb_fs_rmrf(const char *path);
+bool hb_fs_rmrf_at(const char *path, int volume_id);
 
 /* Smart unlink — works on either files or empty dirs (uses
    is_dir + remove vs. rmdir). */

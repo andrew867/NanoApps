@@ -10,16 +10,14 @@
  *   - Text viewer: read the file's first ~4 KB and show it.
  *   - Op confirm: confirmation modal for destructive ops.
  *
- * Browse roots:
- *   - Data volume (default): "/"
- *   - Resources volume: not natively walkable here; we use the OS
- *     volume id 4 via hb_fs_dir_open_at when the user toggles the
- *     volume button.
+ * Browse roots (RetailOS volume ids):
+ *   - FAT / Main (0): USB-visible music disk ("/" when Connected exports)
+ *   - Root / Internal (1): internal system tree (Device/, GrapeFirmware, …)
+ *   - Resources (4): bundled UI/sounds via hb_fs_dir_open_at
  *
- * Copy/paste: a single "clipboard" path. Tapping "Copy" on a file
- * remembers its path; the next "Paste" in the current directory
- * reads it and writes a new file with the same basename. Rename is
- * implemented as in-place: read + write to new name + remove old.
+ * Copy/paste: a single "clipboard" path + source volume. Tapping "Copy"
+ * remembers path+vol; "Paste" writes into the current directory/volume
+ * with the same basename (cross-volume OK — e.g. Root → FAT for grape).
  *
  * For binary files, the viewer warns and shows file size only — no
  * decoders for images / WAV yet. Tracked as a follow-up.
@@ -38,8 +36,9 @@
 #define ROWS_PER_PAGE  25
 #define MAX_NAME_LEN  64
 #define PREVIEW_BYTES 4096
-#define VOL_MAIN      0
-#define VOL_RES       4
+#define VOL_MAIN      0   /* FAT / USB-visible */
+#define VOL_ROOT      1   /* Internal root FS */
+#define VOL_RES       4   /* Resources bundle */
 
 typedef struct {
     char name[MAX_NAME_LEN];
@@ -56,8 +55,9 @@ static bool    s_suppress_next_click = false;
 static char    s_cwd[256] = "/";
 static int     s_vol = VOL_MAIN;
 
-/* Clipboard (set by "Copy" action). Path includes volume prefix. */
+/* Clipboard (set by "Copy" action). Path + source volume. */
 static char    s_clip_path[256] = {0};
+static int     s_clip_vol = VOL_MAIN;
 static bool    s_clip_set = false;
 
 /* "Selected" entry for the action sheet. */
@@ -262,8 +262,14 @@ static void on_up(lv_event_t *e)
 static void on_vol_changed(lv_event_t *e)
 {
     lv_obj_t *dd = lv_event_get_target(e);
-    /* Option 0 = FAT (VOL_MAIN, default), option 1 = Resources (VOL_RES). */
-    s_vol = (lv_dropdown_get_selected(dd) == 0) ? VOL_MAIN : VOL_RES;
+    /* 0=FAT (VOL_MAIN), 1=Root/Internal (VOL_ROOT), 2=Resources (VOL_RES). */
+    uint16_t sel = lv_dropdown_get_selected(dd);
+    if (sel == 0)
+        s_vol = VOL_MAIN;
+    else if (sel == 1)
+        s_vol = VOL_ROOT;
+    else
+        s_vol = VOL_RES;
     s_copy(s_cwd, "/", sizeof s_cwd);
     s_page = 0;
     scan();
@@ -282,16 +288,16 @@ static void on_paste(lv_event_t *e)
 {
     (void)e;
     if (!s_clip_set) return;
-    /* Read clipboard file into heap, write into cwd with same basename. */
-    uint32_t sz = hb_fs_size(s_clip_path);
-    if (sz == 0 || sz > 1024 * 1024) return;       /* skip huge files */
+    /* Read clipboard file (source vol) into heap, write into cwd on current vol. */
+    uint32_t sz = hb_fs_size_at(s_clip_path, s_clip_vol);
+    if (sz == 0 || sz > 2 * 1024 * 1024) return;       /* skip huge files */
     char *buf = lv_malloc(sz);
     if (!buf) return;
-    uint32_t rd = hb_fs_read(s_clip_path, buf, sz);
+    uint32_t rd = hb_fs_read_at(s_clip_path, buf, sz, s_clip_vol);
     if (rd == 0) { lv_free(buf); return; }
     char dest[256]; s_copy(dest, s_cwd, sizeof dest);
     path_append(dest, base_name(s_clip_path));
-    hb_fs_write(dest, buf, rd);
+    hb_fs_write_at(dest, buf, rd, s_vol);
     lv_free(buf);
     scan();
     show_list();
@@ -317,8 +323,8 @@ static void show_text(const char *path)
 {
     s_view = VIEW_TEXT;
     static char text[PREVIEW_BYTES + 32];
-    uint32_t total = hb_fs_size(path);
-    uint32_t rd = hb_fs_read(path, text, PREVIEW_BYTES);
+    uint32_t total = hb_fs_size_at(path, s_vol);
+    uint32_t rd = hb_fs_read_at(path, text, PREVIEW_BYTES, s_vol);
     text[rd] = 0;
     if (looks_binary(text, rd)) {
         /* Unsupported / binary file -> hex dump (folded in from the Toolbox hex
@@ -379,8 +385,8 @@ static void on_action_delete(lv_event_t *e)
     entry_t *ent = &s_entries[s_sel_idx];
     char path[256]; s_copy(path, s_cwd, sizeof path);
     path_append(path, ent->name);
-    if (ent->is_dir) hb_fs_rmrf(path);
-    else             hb_fs_remove(path);
+    if (ent->is_dir) hb_fs_rmrf_at(path, s_vol);
+    else             hb_fs_remove_at(path, s_vol);
     scan();
     show_list();
 }
@@ -393,6 +399,7 @@ static void on_action_copy(lv_event_t *e)
     if (ent->is_dir) { show_list(); return; }       /* dir copy unsupported */
     s_copy(s_clip_path, s_cwd, sizeof s_clip_path);
     path_append(s_clip_path, ent->name);
+    s_clip_vol = s_vol;
     s_clip_set = true;
     show_list();
 }
@@ -428,14 +435,14 @@ static void on_rename_save(lv_event_t *e)
     if (ent->is_dir) { show_list(); return; }     /* dir rename unsupported */
     char src[256]; s_copy(src, s_cwd, sizeof src); path_append(src, ent->name);
     char dst[256]; s_copy(dst, s_cwd, sizeof dst); path_append(dst, new_name);
-    /* Copy via heap, then remove source. */
-    uint32_t sz = hb_fs_size(src);
-    if (sz == 0 || sz > 1024 * 1024) { show_list(); return; }
+    /* Copy via heap, then remove source (same volume). */
+    uint32_t sz = hb_fs_size_at(src, s_vol);
+    if (sz == 0 || sz > 2 * 1024 * 1024) { show_list(); return; }
     char *buf = lv_malloc(sz);
     if (!buf) { show_list(); return; }
-    uint32_t rd = hb_fs_read(src, buf, sz);
-    if (rd > 0 && hb_fs_write(dst, buf, rd)) {
-        hb_fs_remove(src);
+    uint32_t rd = hb_fs_read_at(src, buf, sz, s_vol);
+    if (rd > 0 && hb_fs_write_at(dst, buf, rd, s_vol)) {
+        hb_fs_remove_at(src, s_vol);
     }
     lv_free(buf);
     scan();
@@ -587,17 +594,17 @@ static void build_list_view(void)
     lv_obj_set_style_text_color(ul, lv_color_hex(hb_color_text()), 0);
     lv_obj_center(ul);
 
-    /* Volume selector — a dropdown on the right of the nav bar; defaults to FAT. */
+    /* Volume selector — FAT (USB), Root (internal), Resources. */
     lv_obj_t *vol = lv_dropdown_create(s_list_view);
-    lv_dropdown_set_options(vol, "FAT\nResources");
+    lv_dropdown_set_options(vol, "FAT\nRoot\nResources");
     lv_dropdown_set_selected(vol, 0);                 /* FAT (VOL_MAIN) */
-    lv_obj_set_width(vol, 104);
+    lv_obj_set_width(vol, 118);
     lv_obj_align(vol, LV_ALIGN_TOP_RIGHT, -4, 4);
     lv_obj_add_event_cb(vol, on_vol_changed, LV_EVENT_VALUE_CHANGED, NULL);
 
     s_paste_btn = lv_button_create(s_list_view);
     lv_obj_set_size(s_paste_btn, 60, 32);
-    lv_obj_align(s_paste_btn, LV_ALIGN_TOP_RIGHT, -112, 4);   /* left of the volume dropdown */
+    lv_obj_align(s_paste_btn, LV_ALIGN_TOP_RIGHT, -126, 4);   /* left of the volume dropdown */
     lv_obj_set_style_bg_color(s_paste_btn, lv_color_hex(hb_color_success()), 0);
     lv_obj_add_event_cb(s_paste_btn, on_paste, LV_EVENT_CLICKED, NULL);
     lv_obj_t *pl = lv_label_create(s_paste_btn);

@@ -20,6 +20,12 @@
 #define FS_MAIN_VOLUME  0
 #define FS_WRITE_CHUNK  0x40000u   /* one write call is capped; loop in <=256 KB pieces */
 
+/* RetailOS volume ids (N7G):
+ *   0 = Main / FAT (USB-visible music disk when Connected)
+ *   1 = Root / internal system tree (Device/, firmware blobs, …)
+ *   4 = Resources (bundled UI/sounds)
+ * Other ids may exist; callers can pass them to the *_at APIs. */
+
 /* ---- low-level OS file object -------------------------------------------
  * The object is a plain memory block the OS member functions operate on.
  * The block is sized a little over the firmware object to leave stack slack. */
@@ -69,16 +75,16 @@ typedef struct {
     uint32_t put;     /* bytes appended so far — used to set EOF on finish */
 } fobj_t;
 
-/* Open `path`: write=true creates/truncates for writing, false = read-only.
+/* Open `path` on `volume`: write=true creates/truncates, false = read-only.
    On failure the object is closed and false is returned, so the caller never
    has to clean up after a failed open. */
 static bool fobj_begin(fobj_t *f, void *obj, uint8_t *cache,
-                       const char *path, bool write)
+                       const char *path, bool write, int volume)
 {
     f->obj = obj;
     f->put = 0;
     fs_zero_cache(cache);
-    FOBJ_OPEN(obj, path, write ? 0 : 1, FS_MAIN_VOLUME, 0x1000, 1, cache);
+    FOBJ_OPEN(obj, path, write ? 0 : 1, volume, 0x1000, 1, cache);
     if (FOBJ_READY(obj)) return true;
     FOBJ_CLOSE(obj);
     return false;
@@ -107,19 +113,31 @@ static void fobj_finish(fobj_t *f)
     FOBJ_CLOSE(f->obj);
 }
 
+bool hb_fs_exists_at(const char *path, int volume_id)
+{
+    return FS_EXISTS(path, volume_id);
+}
+
 bool hb_fs_exists(const char *path)
 {
-    return FS_EXISTS(path, FS_MAIN_VOLUME);
+    return hb_fs_exists_at(path, FS_MAIN_VOLUME);
+}
+
+bool hb_fs_write_at(const char *path, const void *data, uint32_t size,
+                    int volume_id)
+{
+    uint8_t obj[FOBJ_SIZE];
+    fobj_t f;
+    if (!fobj_begin(&f, obj, fs_scratch_cache(), path, true, volume_id))
+        return false;
+    bool ok = fobj_append(&f, data, size);
+    if (ok) fobj_finish(&f); else FOBJ_CLOSE(obj);
+    return ok;
 }
 
 bool hb_fs_write(const char *path, const void *data, uint32_t size)
 {
-    uint8_t obj[FOBJ_SIZE];
-    fobj_t f;
-    if (!fobj_begin(&f, obj, fs_scratch_cache(), path, true)) return false;
-    bool ok = fobj_append(&f, data, size);
-    if (ok) fobj_finish(&f); else FOBJ_CLOSE(obj);
-    return ok;
+    return hb_fs_write_at(path, data, size, FS_MAIN_VOLUME);
 }
 
 /* Write several buffers to ONE file, in order, with a single open — for data
@@ -129,7 +147,8 @@ bool hb_fs_write_parts(const char *path, void *const *ptrs,
 {
     uint8_t obj[FOBJ_SIZE];
     fobj_t f;
-    if (!fobj_begin(&f, obj, fs_scratch_cache(), path, true)) return false;
+    if (!fobj_begin(&f, obj, fs_scratch_cache(), path, true, FS_MAIN_VOLUME))
+        return false;
     bool ok = true;
     for (int i = 0; i < nparts && ok; i++)
         ok = fobj_append(&f, ptrs[i], lens[i]);
@@ -150,7 +169,7 @@ bool hb_fs_stream_open(const char *path)
 {
     if (s_stream_live) hb_fs_stream_close();
     if (!fobj_begin(&s_stream, (void *)STREAM_OBJ_ADDR,
-                    (uint8_t *)STREAM_CACHE_ADDR, path, true))
+                    (uint8_t *)STREAM_CACHE_ADDR, path, true, FS_MAIN_VOLUME))
         return false;
     s_stream_live = true;
     return true;
@@ -172,15 +191,22 @@ bool hb_fs_stream_close(void)
 
 /* Read up to `max_size` bytes from `path` into `buf`. Returns the number of
    bytes actually read (0 if the file is missing or the read failed). */
-uint32_t hb_fs_read(const char *path, void *buf, uint32_t max_size)
+uint32_t hb_fs_read_at(const char *path, void *buf, uint32_t max_size,
+                       int volume_id)
 {
     uint8_t obj[FOBJ_SIZE];
     fobj_t f;
-    if (!fobj_begin(&f, obj, fs_scratch_cache(), path, false)) return 0;
+    if (!fobj_begin(&f, obj, fs_scratch_cache(), path, false, volume_id))
+        return 0;
     uint32_t got = 0;
     if (FOBJ_READ(obj, max_size, buf, &got) != 0) got = 0;
     FOBJ_CLOSE(obj);
     return got;
+}
+
+uint32_t hb_fs_read(const char *path, void *buf, uint32_t max_size)
+{
+    return hb_fs_read_at(path, buf, max_size, FS_MAIN_VOLUME);
 }
 
 /* ----- directory iteration -----
@@ -261,40 +287,65 @@ typedef int (*fs_setattr_t)(const char *path, uint8_t attr, int volume);
 #define FS_RMDIR     ((fs_rmdir_t)  (0x08157f3eu | 1u))
 #define FS_SETATTR   ((fs_setattr_t)(0x0814595eu | 1u))
 
-bool hb_fs_remove(const char *path)
+bool hb_fs_remove_at(const char *path, int volume_id)
 {
-    int rc = FS_REMOVE(path, FS_MAIN_VOLUME);
+    int rc = FS_REMOVE(path, volume_id);
     return rc == 0;
 }
 
-bool hb_fs_mkdir(const char *path)
+bool hb_fs_remove(const char *path)
 {
-    int rc = FS_MKDIR(path, FS_MAIN_VOLUME);
+    return hb_fs_remove_at(path, FS_MAIN_VOLUME);
+}
+
+bool hb_fs_mkdir_at(const char *path, int volume_id)
+{
+    int rc = FS_MKDIR(path, volume_id);
     /* 0 = newly created, 0xd = already existed — both mean the dir is there. */
     return rc == 0 || rc == 0xd;
 }
 
-uint32_t hb_fs_size(const char *path)
+bool hb_fs_mkdir(const char *path)
+{
+    return hb_fs_mkdir_at(path, FS_MAIN_VOLUME);
+}
+
+uint32_t hb_fs_size_at(const char *path, int volume_id)
 {
     uint32_t sz = 0;
-    int rc = FS_GETSIZE(path, &sz, FS_MAIN_VOLUME);
+    int rc = FS_GETSIZE(path, &sz, volume_id);
     if (rc != 0) return 0;
     return sz;
 }
 
-bool hb_fs_is_dir(const char *path)
+uint32_t hb_fs_size(const char *path)
+{
+    return hb_fs_size_at(path, FS_MAIN_VOLUME);
+}
+
+bool hb_fs_is_dir_at(const char *path, int volume_id)
 {
     uint8_t attr = 0;
-    int rc = FS_GETATTR(path, &attr, FS_MAIN_VOLUME);
+    int rc = FS_GETATTR(path, &attr, volume_id);
     if (rc != 0) return false;
     /* bit 0 = directory bit */
     return (attr & 1) != 0;
 }
 
+bool hb_fs_is_dir(const char *path)
+{
+    return hb_fs_is_dir_at(path, FS_MAIN_VOLUME);
+}
+
+bool hb_fs_rmdir_at(const char *path, int volume_id)
+{
+    int rc = FS_RMDIR(path, 0, volume_id, 0);
+    return rc == 0;
+}
+
 bool hb_fs_rmdir(const char *path)
 {
-    int rc = FS_RMDIR(path, 0, FS_MAIN_VOLUME, 0);
-    return rc == 0;
+    return hb_fs_rmdir_at(path, FS_MAIN_VOLUME);
 }
 
 bool hb_fs_set_attr(const char *path, uint8_t attr_byte)
@@ -332,15 +383,15 @@ static bool join_path(char *out, int out_size, const char *parent, const char *n
     return name[j] == 0;
 }
 
-bool hb_fs_rmrf(const char *path)
+bool hb_fs_rmrf_at(const char *path, int volume_id)
 {
     uint8_t attr = 0;
-    int rc = FS_GETATTR(path, &attr, FS_MAIN_VOLUME);
+    int rc = FS_GETATTR(path, &attr, volume_id);
     if (rc != 0) return false;
-    if (!(attr & 1)) return hb_fs_remove(path);
+    if (!(attr & 1)) return hb_fs_remove_at(path, volume_id);
 
     hb_dir_t d;
-    if (!hb_fs_dir_open(&d, path, false)) return false;
+    if (!hb_fs_dir_open_at(&d, path, false, volume_id)) return false;
     char name[256];
     bool is_dir = false;
     bool ok = true;
@@ -351,12 +402,17 @@ bool hb_fs_rmrf(const char *path)
         char child[256];
         if (!join_path(child, sizeof child, path, name)) { ok = false; continue; }
         if (is_dir) {
-            if (!hb_fs_rmrf(child)) ok = false;
+            if (!hb_fs_rmrf_at(child, volume_id)) ok = false;
         } else {
-            if (!hb_fs_remove(child)) ok = false;
+            if (!hb_fs_remove_at(child, volume_id)) ok = false;
         }
     }
     hb_fs_dir_close(&d);
-    if (ok) ok = hb_fs_rmdir(path);
+    if (ok) ok = hb_fs_rmdir_at(path, volume_id);
     return ok;
+}
+
+bool hb_fs_rmrf(const char *path)
+{
+    return hb_fs_rmrf_at(path, FS_MAIN_VOLUME);
 }
