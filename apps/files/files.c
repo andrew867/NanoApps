@@ -10,14 +10,13 @@
  *   - Text viewer: read the file's first ~4 KB and show it.
  *   - Op confirm: confirmation modal for destructive ops.
  *
- * Browse roots (RetailOS volume ids):
- *   - FAT / Main (0): USB-visible music disk ("/" when Connected exports)
- *   - Root / Internal (1): internal system tree (Device/, GrapeFirmware, …)
- *   - Resources (4): bundled UI/sounds via hb_fs_dir_open_at
+ * Browse roots: RetailOS volume ids are probed at startup (0..7). Known
+ * labels: 0=FAT (USB-visible), 4=Resources. Any other volume that lists
+ * entries (or holds GrapeFirmware) is offered as Internal/VolN — do not
+ * hardcode id 1 (empty on N31 1.0.2/1.1.2).
  *
- * Copy/paste: a single "clipboard" path + source volume. Tapping "Copy"
- * remembers path+vol; "Paste" writes into the current directory/volume
- * with the same basename (cross-volume OK — e.g. Root → FAT for grape).
+ * Copy/paste: clipboard remembers path + source volume; Paste writes into
+ * the current directory/volume (cross-volume OK).
  *
  * For binary files, the viewer warns and shows file size only — no
  * decoders for images / WAV yet. Tracked as a follow-up.
@@ -37,8 +36,8 @@
 #define MAX_NAME_LEN  64
 #define PREVIEW_BYTES 4096
 #define VOL_MAIN      0   /* FAT / USB-visible */
-#define VOL_ROOT      1   /* Internal root FS */
 #define VOL_RES       4   /* Resources bundle */
+#define MAX_VOLS      8
 
 typedef struct {
     char name[MAX_NAME_LEN];
@@ -54,6 +53,12 @@ static int     s_page = 0;
 static bool    s_suppress_next_click = false;
 static char    s_cwd[256] = "/";
 static int     s_vol = VOL_MAIN;
+
+/* Discovered volumes for the dropdown (sel index → volume id). */
+static int     s_vol_ids[MAX_VOLS];
+static int     s_n_vols = 0;
+static char    s_vol_dd_opts[96];   /* "FAT\nInternal\nResources" */
+static lv_obj_t *s_vol_dd;
 
 /* Clipboard (set by "Copy" action). Path + source volume. */
 static char    s_clip_path[256] = {0};
@@ -121,6 +126,116 @@ static void show_list(void);
 static void show_text(const char *path);
 static void show_actions(int idx);
 static void show_rename(int idx);
+
+/* ---- volume discovery ---- */
+
+/* Count non-dot children of path on volume (cap 8 — enough to know "alive"). */
+static int vol_list_count(int volume, const char *path)
+{
+    hb_dir_t d;
+    char fn[MAX_NAME_LEN];
+    bool is_dir = false;
+    int n = 0;
+
+    if (!hb_fs_dir_open_at(&d, path, false, volume))
+        return 0;
+    while (n < 8 && hb_fs_dir_next(&d, fn, sizeof fn, &is_dir)) {
+        if (fn[0] == '.') continue;
+        n++;
+    }
+    hb_fs_dir_close(&d);
+    return n;
+}
+
+static bool vol_has_grape(int volume)
+{
+    /* Prefer exists — works even when dir enum of / is sparse. */
+    if (hb_fs_exists_at("/iPod_Control/Device/GrapeFirmware.bin", volume))
+        return true;
+    if (hb_fs_exists_at("iPod_Control/Device/GrapeFirmware.bin", volume))
+        return true;
+    return false;
+}
+
+static void append_dd(char *dst, int cap, const char *label)
+{
+    int n = 0;
+    while (dst[n]) n++;
+    if (n && n < cap - 1) dst[n++] = '\n';
+    int i = 0;
+    while (label[i] && n < cap - 1) dst[n++] = label[i++];
+    dst[n] = 0;
+}
+
+/*
+ * Probe RetailOS volumes 0..7. Keep any that list entries at "/" (or hold
+ * GrapeFirmware). Labels: 0=FAT, 4=Resources, grape-bearing=Internal, else VolN.
+ * Always ensure FAT(0) and Resources(4) appear if they have content; never
+ * invent empty Root/id1.
+ */
+static void discover_volumes(void)
+{
+    int v;
+    char labels[MAX_VOLS][12];
+    int ids[MAX_VOLS];
+    int n = 0;
+    int internal_id = -1;
+
+    s_n_vols = 0;
+    s_vol_dd_opts[0] = 0;
+
+    for (v = 0; v < MAX_VOLS; v++) {
+        int ents = vol_list_count(v, "/");
+        bool grape = vol_has_grape(v);
+        if (!ents && !grape)
+            continue;
+        if (n >= MAX_VOLS) break;
+        ids[n] = v;
+        if (v == VOL_MAIN)
+            s_copy(labels[n], "FAT", sizeof labels[n]);
+        else if (v == VOL_RES)
+            s_copy(labels[n], "Resources", sizeof labels[n]);
+        else if (grape) {
+            s_copy(labels[n], "Internal", sizeof labels[n]);
+            internal_id = v;
+        } else {
+            /* Vol2 / Vol3 / … until we learn a better name. */
+            labels[n][0] = 'V'; labels[n][1] = 'o'; labels[n][2] = 'l';
+            labels[n][3] = (char)('0' + v);
+            labels[n][4] = 0;
+        }
+        n++;
+    }
+
+    /* If nothing probed (FS not mounted yet), fall back to FAT+Resources. */
+    if (n == 0) {
+        ids[0] = VOL_MAIN; s_copy(labels[0], "FAT", sizeof labels[0]);
+        ids[1] = VOL_RES;  s_copy(labels[1], "Resources", sizeof labels[1]);
+        n = 2;
+    } else if (internal_id < 0) {
+        /*
+         * No grape hit yet — still offer every non-empty VolN so the user can
+         * hunt Device/ by hand. Prefer renaming the first non-0/4 as Internal
+         * when it also has /iPod_Control (common internal tree root).
+         */
+        for (v = 0; v < n; v++) {
+            if (ids[v] == VOL_MAIN || ids[v] == VOL_RES) continue;
+            if (hb_fs_exists_at("/iPod_Control", ids[v]) ||
+                hb_fs_exists_at("iPod_Control", ids[v]) ||
+                vol_list_count(ids[v], "/iPod_Control") > 0) {
+                s_copy(labels[v], "Internal", sizeof labels[v]);
+                break;
+            }
+        }
+    }
+
+    for (v = 0; v < n; v++) {
+        s_vol_ids[v] = ids[v];
+        append_dd(s_vol_dd_opts, (int)sizeof s_vol_dd_opts, labels[v]);
+    }
+    s_n_vols = n;
+    s_vol = s_vol_ids[0];
+}
 
 /* ---- scan ---- */
 
@@ -262,14 +377,9 @@ static void on_up(lv_event_t *e)
 static void on_vol_changed(lv_event_t *e)
 {
     lv_obj_t *dd = lv_event_get_target(e);
-    /* 0=FAT (VOL_MAIN), 1=Root/Internal (VOL_ROOT), 2=Resources (VOL_RES). */
     uint16_t sel = lv_dropdown_get_selected(dd);
-    if (sel == 0)
-        s_vol = VOL_MAIN;
-    else if (sel == 1)
-        s_vol = VOL_ROOT;
-    else
-        s_vol = VOL_RES;
+    if (sel >= (uint16_t)s_n_vols) return;
+    s_vol = s_vol_ids[sel];
     s_copy(s_cwd, "/", sizeof s_cwd);
     s_page = 0;
     scan();
@@ -594,13 +704,14 @@ static void build_list_view(void)
     lv_obj_set_style_text_color(ul, lv_color_hex(hb_color_text()), 0);
     lv_obj_center(ul);
 
-    /* Volume selector — FAT (USB), Root (internal), Resources. */
-    lv_obj_t *vol = lv_dropdown_create(s_list_view);
-    lv_dropdown_set_options(vol, "FAT\nRoot\nResources");
-    lv_dropdown_set_selected(vol, 0);                 /* FAT (VOL_MAIN) */
-    lv_obj_set_width(vol, 118);
-    lv_obj_align(vol, LV_ALIGN_TOP_RIGHT, -4, 4);
-    lv_obj_add_event_cb(vol, on_vol_changed, LV_EVENT_VALUE_CHANGED, NULL);
+    /* Volume selector — filled by discover_volumes() (FAT / Internal / …). */
+    s_vol_dd = lv_dropdown_create(s_list_view);
+    lv_dropdown_set_options(s_vol_dd,
+                            s_vol_dd_opts[0] ? s_vol_dd_opts : "FAT\nResources");
+    lv_dropdown_set_selected(s_vol_dd, 0);
+    lv_obj_set_width(s_vol_dd, 118);
+    lv_obj_align(s_vol_dd, LV_ALIGN_TOP_RIGHT, -4, 4);
+    lv_obj_add_event_cb(s_vol_dd, on_vol_changed, LV_EVENT_VALUE_CHANGED, NULL);
 
     s_paste_btn = lv_button_create(s_list_view);
     lv_obj_set_size(s_paste_btn, 60, 32);
@@ -786,6 +897,8 @@ HB_APP_ENTRY(payload_entry)
     s_scr = lv_screen_active();
     lv_obj_set_style_bg_color(s_scr, lv_color_hex(hb_color_bg()), 0);
     lv_obj_set_style_bg_opa(s_scr, LV_OPA_COVER, 0);
+
+    discover_volumes();
 
     build_list_view();
     build_text_view();

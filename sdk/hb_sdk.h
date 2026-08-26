@@ -181,7 +181,8 @@ void hb_touch_drain_all(void);
 
 /* True if `path` exists on the main iPod filesystem. */
 bool hb_fs_exists(const char *path);
-/* Same, on an explicit RetailOS volume id (0=Main/FAT, 1=Root, 4=Resources). */
+/* Same, on an explicit RetailOS volume id (0=Main/FAT, 4=Resources;
+   other ids exist — probe with harnesses/volprobe). */
 bool hb_fs_exists_at(const char *path, int volume_id);
 
 /* Create/truncate `path` and write `size` bytes from `data`. Returns
@@ -231,7 +232,7 @@ bool hb_fs_dir_next (hb_dir_t *iter, char *out_name, int out_size,
                      bool *out_is_dir);
 void hb_fs_dir_close(hb_dir_t *iter);
 /* Same as hb_fs_dir_open but on an explicit volume id
-   (0=Main/FAT, 1=Root/internal, 4=Resources). */
+   (0=Main/FAT, 4=Resources; probe others — see harnesses/volprobe). */
 bool hb_fs_dir_open_at(hb_dir_t *iter, const char *path, bool recursive,
                        int volume_id);
 

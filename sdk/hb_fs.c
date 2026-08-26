@@ -22,9 +22,9 @@
 
 /* RetailOS volume ids (N7G):
  *   0 = Main / FAT (USB-visible music disk when Connected)
- *   1 = Root / internal system tree (Device/, firmware blobs, …)
  *   4 = Resources (bundled UI/sounds)
- * Other ids may exist; callers can pass them to the *_at APIs. */
+ * Other ids may be live (HFS+/internal trees). Do NOT assume id 1 is Root —
+ * probe with harnesses/volprobe or Files' startup discovery. */
 
 /* ---- low-level OS file object -------------------------------------------
  * The object is a plain memory block the OS member functions operate on.
