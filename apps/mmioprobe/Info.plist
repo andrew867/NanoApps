@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>	<string>org.nanoapps.mmioprobe</string>
+	<key>CFBundleName</key>		<string>Mmioprobe</string>
+	<key>CFBundleExecutable</key>	<string>mmioprobe</string>
+	<key>HBAppKind</key>			<integer>1</integer>
+	<key>HBIconGlyph</key>		<string>music</string>
+	<key>HBIconColor</key>		<string>#f59e0b</string>
+</dict>
+</plist>
