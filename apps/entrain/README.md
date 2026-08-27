@@ -10,11 +10,15 @@ nothing else. See [No claims](#no-claims).
 
 ## Screenshots
 
-![Library](screenshots/library.png)
-![Now Playing](screenshots/now-playing.png)
-![Live Tune](screenshots/live-tune.png)
-![Sleep Timer](screenshots/timer.png)
-![Settings](screenshots/settings.png)
+| | | |
+| --- | --- | --- |
+| ![Library](screenshots/library.png) | ![Now Playing](screenshots/now-playing.png) | ![Live Tune](screenshots/live-tune.png) |
+| Library | Now Playing | Live Tune |
+| ![Sleep Timer](screenshots/timer.png) | ![Settings](screenshots/settings.png) | ![First run](screenshots/first-run.png) |
+| Sleep Timer | Settings | First run |
+
+These are rendered from the host build at the device's exact 240x432, with
+`make -f Makefile.host shots` — no display or window manager required.
 
 ## What it does
 
@@ -197,7 +201,7 @@ directly. `--program N --minutes M` renders a timeline; `--beat`/`--carrier`/
 cd apps/entrain/host && make -f Makefile.host test
 ```
 
-770 checks. The two that matter most:
+770 checks, plus a source lint. The two that matter most:
 
 - **The click test** renders a chain of segments whose beat *and* carrier both
   move at every join, then asserts that the sample step across each join is no
@@ -214,6 +218,11 @@ crossings, phase continuity across a parameter glide, oscillator drift, the
 loop planner's budget and exactness, fades reaching true silence, the soft
 clipper's bounds and monotonicity, the WAV header, and the user-program parser
 including every malformed case.
+
+`make test` also runs `check_glyphs.py`, which fails the build if any
+user-facing string contains a character LVGL's Montserrat does not carry. That
+font is ASCII plus a small symbol set; anything else renders as an empty box,
+and an em dash in a settings note is exactly how that gets shipped.
 
 ## How it is put together
 
