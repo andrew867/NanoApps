@@ -28,7 +28,7 @@ WARN    := -Wall -Wextra -Wshadow -Wpointer-arith
 CFLAGS  ?= -O2 -g -std=c99 $(WARN)
 LDLIBS  := -lm
 
-.PHONY: all test wav host run shots clean
+.PHONY: all test glyphs wav host run shots clean
 
 all: test
 
@@ -41,8 +41,14 @@ $(BUILD):
 $(BUILD)/tests: tests.c $(CORE_SRCS) | $(BUILD)
 	$(CC) $(CFLAGS) -Wstrict-prototypes -o $@ $^ $(LDLIBS)
 
-test: $(BUILD)/tests
+test: $(BUILD)/tests glyphs
 	@./$(BUILD)/tests
+
+# Every user-facing string must be renderable. LVGL's Montserrat carries ASCII
+# plus a small symbol set; anything else is an empty box on screen, and an em
+# dash slipping into a settings note is exactly how that happens.
+glyphs:
+	@python3 check_glyphs.py ../ui.c ../core/program.c ../engine.c
 
 # ---- offline renderer ------------------------------------------------------
 # Render any preset or program to a .wav so it can be heard on real speakers,

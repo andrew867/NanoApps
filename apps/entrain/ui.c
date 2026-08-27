@@ -41,6 +41,11 @@
 #define C_TEXT      0xE8EAF0
 #define C_TEXT_DIM  0x8A8F98
 #define C_TEXT_MUTE 0x565C68
+/* The identity accent, matching the Home Screen icon. Band accents override it
+   wherever the band is what the element means; this is what LVGL's own theme
+   uses for the widgets we do not paint by hand, so a switch reads as part of
+   the same app rather than as LVGL's default blue. */
+#define C_ACCENT    0x8B5CF6
 
 /* Type scale. The brief asks for 34/22/16/13; the LVGL config the device
    already ships carries 36/20/16/14, and adding two more Montserrat faces
@@ -67,6 +72,9 @@
 #define PULSE_OPA_MAX  255
 #define PULSE_R_SWING  3
 #define PULSE_MAX_HZ   4.0
+/* The halo sits outside the progress arc. At the same radius the two would be
+   the same colour in the same place, and the progress fill would be invisible. */
+#define PULSE_R        (RING_R + 9)
 
 /* ---- persisted settings -------------------------------------------------- */
 
@@ -108,6 +116,7 @@ static lv_obj_t *s_state_lbl, *s_time_lbl, *s_title_lbl;
 static lv_obj_t *s_timeline, *s_timeline_fill;
 static lv_obj_t *s_seg_tick[EN_USER_MAX_SEGS];
 static lv_obj_t *s_prep_lbl;
+static lv_obj_t *s_mode_lbl;
 
 /* live tune */
 static lv_obj_t *s_tune_beat, *s_tune_carrier, *s_tune_state, *s_tune_ring;
@@ -210,6 +219,17 @@ static lv_obj_t *make_label(lv_obj_t *parent, const char *text,
     lv_label_set_text(l, text);
     lv_obj_set_style_text_font(l, font, 0);
     lv_obj_set_style_text_color(l, lv_color_hex(color), 0);
+    return l;
+}
+
+/* Body copy. An LVGL label with no width set does not wrap — it runs off the
+   right edge — so every multi-line block goes through here. */
+static lv_obj_t *make_para(lv_obj_t *parent, const char *text,
+                           const lv_font_t *font, uint32_t color, int width)
+{
+    lv_obj_t *l = make_label(parent, text, font, color);
+    lv_obj_set_width(l, width);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
     return l;
 }
 
@@ -441,8 +461,10 @@ static void add_row(int index, uint32_t color, const char *name,
     lv_obj_set_pos(n, 18, 8);
 
     lv_obj_t *d = make_label(row, detail, F_CAPTION, C_TEXT_MUTE);
-    lv_label_set_long_mode(d, LV_LABEL_LONG_DOT);
     lv_obj_set_width(d, CONTENT_W - 18);
+    /* Width first, then the mode: a detail line that wrapped would push into
+       the row below instead of being trimmed. */
+    lv_label_set_long_mode(d, LV_LABEL_LONG_DOT);
     lv_obj_set_pos(d, 18, 31);
 
     lv_obj_t *v = make_label(row, value, F_CAPTION, C_TEXT_DIM);
@@ -503,10 +525,10 @@ static void refresh_library(void)
             lv_obj_t *t = make_label(empty, "No user programs", F_BODY,
                                      C_TEXT_DIM);
             lv_obj_set_pos(t, 0, 24);
-            lv_obj_t *h = make_label(empty,
-                "Drop .txt program files into\n/Apps/Data/Entrain/programs.\n"
-                "The format is in the README.",
-                F_CAPTION, C_TEXT_MUTE);
+            lv_obj_t *h = make_para(empty,
+                "Drop .txt program files into "
+                "/Apps/Data/Entrain/programs. The format is in the README.",
+                F_CAPTION, C_TEXT_MUTE, CONTENT_W);
             lv_obj_set_pos(h, 0, 50);
         }
     }
@@ -595,12 +617,12 @@ static void build_now(void)
     s_pulse = lv_obj_create(s);
     flat(s_pulse, C_BG);
     lv_obj_remove_flag(s_pulse, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_size(s_pulse, RING_R * 2, RING_R * 2);
+    lv_obj_set_size(s_pulse, PULSE_R * 2, PULSE_R * 2);
     lv_obj_set_style_radius(s_pulse, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_opa(s_pulse, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_pulse, 2, 0);
     lv_obj_set_style_border_color(s_pulse, lv_color_hex(C_HAIRLINE), 0);
-    lv_obj_set_pos(s_pulse, RING_CX - RING_R, RING_CY - RING_R);
+    lv_obj_set_pos(s_pulse, RING_CX - PULSE_R, RING_CY - PULSE_R);
 
     s_ring = lv_arc_create(s);
     lv_obj_set_size(s_ring, RING_R * 2, RING_R * 2);
@@ -611,6 +633,10 @@ static void build_now(void)
     lv_arc_set_value(s_ring, 0);
     lv_obj_remove_style(s_ring, NULL, LV_PART_KNOB);
     lv_obj_remove_flag(s_ring, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_bg_opa(s_ring, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(s_ring, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(s_ring, 0, LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(s_ring, 0, LV_PART_MAIN);
     lv_obj_set_style_arc_width(s_ring, 4, LV_PART_MAIN);
     lv_obj_set_style_arc_color(s_ring, lv_color_hex(C_HAIRLINE), LV_PART_MAIN);
     lv_obj_set_style_arc_width(s_ring, 4, LV_PART_INDICATOR);
@@ -680,12 +706,17 @@ static void build_now(void)
         s_seg_tick[i] = t;
     }
 
+    s_mode_lbl = make_label(s, "", F_CAPTION, C_TEXT_MUTE);
+    lv_obj_set_style_text_align(s_mode_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(s_mode_lbl, CONTENT_W);
+    lv_obj_set_pos(s_mode_lbl, MARGIN, RING_CY + RING_R + 92);
+
     s_prep_lbl = make_label(s, "", F_CAPTION, C_TEXT_MUTE);
     lv_obj_set_style_text_align(s_prep_lbl, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(s_prep_lbl, CONTENT_W);
-    lv_obj_set_pos(s_prep_lbl, MARGIN, RING_CY + RING_R + 84);
+    lv_obj_set_pos(s_prep_lbl, MARGIN, RING_CY + RING_R + 118);
 
-    lv_obj_t *hint = make_label(s, "swipe up to tune  •  down for library",
+    lv_obj_t *hint = make_label(s, "up to tune  •  down for library",
                                 F_CAPTION, C_TEXT_MUTE);
     lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(hint, CONTENT_W);
@@ -726,6 +757,14 @@ static void refresh_now(void)
     }
     if (total <= 0.0) lv_obj_add_flag(s_timeline, LV_OBJ_FLAG_HIDDEN);
     else lv_obj_remove_flag(s_timeline, LV_OBJ_FLAG_HIDDEN);
+
+    /* Which mode is playing is not audible from the tone, and it decides
+       whether headphones are required, so it belongs on this screen. */
+    buf[0] = 0;
+    str_cat(buf, en_mode_name(en_engine_mode()), sizeof buf);
+    if (en_engine_mode() == EN_MODE_BINAURAL)
+        str_cat(buf, "  •  headphones", sizeof buf);
+    lv_label_set_text(s_mode_lbl, buf);
 }
 
 static void tick_now(void)
@@ -801,8 +840,8 @@ static void tick_pulse(void)
 
     if (P.reduce_motion || !en_engine_is_playing()) {
         lv_obj_set_style_border_opa(s_pulse, LV_OPA_40, 0);
-        lv_obj_set_size(s_pulse, RING_R * 2, RING_R * 2);
-        lv_obj_set_pos(s_pulse, RING_CX - RING_R, RING_CY - RING_R);
+        lv_obj_set_size(s_pulse, PULSE_R * 2, PULSE_R * 2);
+        lv_obj_set_pos(s_pulse, RING_CX - PULSE_R, RING_CY - PULSE_R);
         return;
     }
 
@@ -819,7 +858,7 @@ static void tick_pulse(void)
                     + (PULSE_OPA_MAX - PULSE_OPA_MIN) * s);
     lv_obj_set_style_border_opa(s_pulse, opa, 0);
 
-    int r = RING_R + (int)(PULSE_R_SWING * s);
+    int r = PULSE_R + (int)(PULSE_R_SWING * s);
     lv_obj_set_size(s_pulse, r * 2, r * 2);
     lv_obj_set_pos(s_pulse, RING_CX - r, RING_CY - r);
 }
@@ -881,10 +920,10 @@ static void build_tune(void)
     lv_obj_t *title = make_label(s, "Live Tune", F_TITLE, C_TEXT);
     lv_obj_set_pos(title, MARGIN, 12);
 
-    lv_obj_t *hint = make_label(s,
-        "drag up and down for the beat\nleft and right for the carrier\n"
-        "double tap to reset",
-        F_CAPTION, C_TEXT_MUTE);
+    lv_obj_t *hint = make_para(s,
+        "Drag up and down for the beat, left and right for the carrier. "
+        "Double tap to reset.",
+        F_CAPTION, C_TEXT_MUTE, CONTENT_W);
     lv_obj_set_pos(hint, MARGIN, 44);
 
     s_tune_ring = lv_obj_create(s);
@@ -916,11 +955,10 @@ static void build_tune(void)
     lv_obj_set_width(s_tune_state, CONTENT_W);
     lv_obj_set_pos(s_tune_state, MARGIN, 316);
 
-    lv_obj_t *note = make_label(s,
-        "The loop already playing keeps going\nuntil the new one is ready.",
-        F_CAPTION, C_TEXT_MUTE);
+    lv_obj_t *note = make_para(s,
+        "The loop already playing keeps going until the new one is ready.",
+        F_CAPTION, C_TEXT_MUTE, CONTENT_W);
     lv_obj_set_style_text_align(note, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_width(note, CONTENT_W);
     lv_obj_set_pos(note, MARGIN, 344);
 
     lv_obj_t *hint2 = make_label(s, "swipe down for now playing",
@@ -1004,18 +1042,18 @@ static void build_timer(void)
     lv_obj_t *title = make_label(s, "Sleep Timer", F_TITLE, C_TEXT);
     lv_obj_set_pos(title, MARGIN, 12);
 
-    lv_obj_t *sub = make_label(s, "Fades out over 8 seconds, then stops.",
-                               F_CAPTION, C_TEXT_MUTE);
+    lv_obj_t *sub = make_para(s, "Fades out, then stops.",
+                              F_CAPTION, C_TEXT_MUTE, CONTENT_W);
     lv_obj_set_pos(sub, MARGIN, 40);
 
-    make_hairline(s, 64, MARGIN, CONTENT_W);
+    make_hairline(s, 62, MARGIN, CONTENT_W);
 
     for (int i = 0; i < 6; i++) {
         lv_obj_t *row = lv_obj_create(s);
         flat(row, C_BG);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_size(row, CONTENT_W, TAP_MIN);
-        lv_obj_set_pos(row, MARGIN, 74 + i * (TAP_MIN + 1));
+        lv_obj_set_pos(row, MARGIN, 70 + i * (TAP_MIN + 1));
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(row, on_sleep_choice, LV_EVENT_CLICKED,
                             (void *)(lv_uintptr_t)i);
@@ -1035,17 +1073,21 @@ static void build_timer(void)
         s_timer_rows[i] = row;
     }
 
-    lv_obj_t *row = setting_row(s, 74 + 6 * (TAP_MIN + 1) + 12,
-                                "Blank screen while playing",
-                                "Backlight off; audio keeps running");
+    lv_obj_t *row = setting_row(s, 70 + 6 * (TAP_MIN + 1) + 10,
+                                "Blank screen",
+                                "Audio keeps running");
     s_blankplay_sw = lv_switch_create(row);
     lv_obj_set_size(s_blankplay_sw, 44, 26);
-    lv_obj_set_pos(s_blankplay_sw, CONTENT_W - 44, 14);
+    lv_obj_set_pos(s_blankplay_sw, CONTENT_W - 44, 12);
     lv_obj_add_event_cb(s_blankplay_sw, on_blankplay, LV_EVENT_VALUE_CHANGED,
                         NULL);
 
     s_sleep_lbl = make_label(s, "", F_CAPTION, C_TEXT_DIM);
-    lv_obj_set_pos(s_sleep_lbl, MARGIN, EN_SCREEN_H - 46);
+    /* The countdown sits beside the title, not under it: the subtitle needs the
+       full width, and a live number belongs in the header anyway. */
+    lv_obj_set_style_text_align(s_sleep_lbl, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_width(s_sleep_lbl, 100);
+    lv_obj_set_pos(s_sleep_lbl, EN_SCREEN_W - MARGIN - 100, 18);
 
     lv_obj_t *hint = make_label(s, "swipe down for live tune",
                                 F_CAPTION, C_TEXT_MUTE);
@@ -1154,9 +1196,10 @@ static void build_settings(void)
                               LV_PART_MAIN);
     lv_obj_set_style_radius(s_vol_slider, 2, LV_PART_MAIN);
     lv_obj_set_style_radius(s_vol_slider, 2, LV_PART_INDICATOR);
-    /* A 44 px knob so the control is grabbable with a finger even though the
-       track is only 8 px tall. */
-    lv_obj_set_style_pad_all(s_vol_slider, 18, LV_PART_KNOB);
+    /* The knob stays visually modest; the touch target is widened instead, so
+       the control is still comfortably grabbable on an 8 px track. */
+    lv_obj_set_style_pad_all(s_vol_slider, 9, LV_PART_KNOB);
+    lv_obj_set_ext_click_area(s_vol_slider, 18);
     y += 34;
 
     lv_obj_t *brow = setting_row(s, y, "Blank screen after", NULL);
@@ -1181,20 +1224,16 @@ static void build_settings(void)
     make_hairline(s, y, MARGIN, CONTENT_W);
     y += 12;
 
-    lv_obj_t *note = make_label(s,
-        "Binaural presets need headphones:\n"
-        "the beat only exists when each ear\n"
-        "gets a different frequency.\n"
-        "Isochronic presets work on speakers.",
-        F_CAPTION, C_TEXT_DIM);
+    lv_obj_t *note = make_para(s,
+        "Binaural needs headphones: the beat is the difference between "
+        "the ears. Isochronic works on speakers.",
+        F_CAPTION, C_TEXT_DIM, CONTENT_W);
     lv_obj_set_pos(note, MARGIN, y);
-    y += 76;
+    y += 74;
 
-    lv_obj_t *about = make_label(s,
-        "Entrain renders binaural, isochronic\n"
-        "and monaural tones on the device.\n"
-        "It makes no health claims.",
-        F_CAPTION, C_TEXT_MUTE);
+    lv_obj_t *about = make_para(s,
+        "Tones are generated on the device. No health claims are made.",
+        F_CAPTION, C_TEXT_MUTE, CONTENT_W);
     lv_obj_set_pos(about, MARGIN, y);
 
     lv_obj_t *hint = make_label(s, "swipe down for sleep timer",
@@ -1252,19 +1291,15 @@ static void build_first_run(void)
     lv_obj_t *title = make_label(s, "Entrain", F_TITLE, C_TEXT);
     lv_obj_set_pos(title, MARGIN, 60);
 
-    lv_obj_t *body = make_label(s,
+    lv_obj_t *body = make_para(s,
         "Put headphones on.\n\n"
-        "A binaural beat is the difference\n"
-        "between two tones, one in each ear.\n"
-        "On speakers the two tones mix in\n"
-        "the air and the effect is gone.\n\n"
-        "Isochronic presets pulse a single\n"
-        "tone instead, and do work on\n"
+        "A binaural beat is the difference between two tones, one in each "
+        "ear. On speakers the two mix in the air and the effect is gone.\n\n"
+        "Isochronic presets pulse a single tone instead, and do work on "
         "speakers.\n\n"
-        "Volume starts moderate. Long\n"
-        "sessions are the reason to leave\n"
-        "it there.",
-        F_CAPTION, C_TEXT_DIM);
+        "Volume starts moderate. Long sessions are the reason to leave it "
+        "there.",
+        F_CAPTION, C_TEXT_DIM, CONTENT_W);
     lv_obj_set_pos(body, MARGIN, 100);
 
     lv_obj_t *btn = lv_obj_create(s);
@@ -1287,6 +1322,14 @@ void en_ui_set_first_run(bool first_run)
 
 void en_ui_init(void)
 {
+    /* Re-theme before building anything. The default theme's blue would look
+       like a different app next to this palette, and re-skinning every themed
+       widget by hand afterwards is worse than setting it once. */
+    lv_display_t *disp = lv_display_get_default();
+    if (disp)
+        lv_theme_default_init(disp, lv_color_hex(C_ACCENT),
+                              lv_color_hex(C_TEXT_DIM), true, F_BODY);
+
     prefs_load();
     en_engine_init();
     en_audio_set_volume(P.volume);

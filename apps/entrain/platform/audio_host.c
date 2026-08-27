@@ -49,6 +49,18 @@ static int    s_stop_when_silent;
 static int    s_pause_when_silent;
 
 
+static uint64_t now_us(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000000ull + (uint64_t)tv.tv_usec;
+}
+
+/* Advance the cursor by wall-clock time instead of by samples written. Used by
+   the silent build, and by the ALSA build when there is no sound device — a
+   missing sound card should make the app quiet, not frozen. */
+static void advance_by_clock(uint64_t *last);
+
 static void slot_free(slot_t *s)
 {
     free(s->pcm);
@@ -127,6 +139,22 @@ static void pull(int16_t *dst, uint32_t want)
     }
 }
 
+static void advance_by_clock(uint64_t *last)
+{
+    uint64_t t = now_us();
+    pthread_mutex_lock(&s_lock);
+    if (s_cur.pcm && s_cur.rate) {
+        uint32_t adv = (uint32_t)(((t - *last) * s_cur.rate) / 1000000ull);
+        if (adv > s_cur.rate) adv = s_cur.rate;   /* clamp after a stall */
+        for (uint32_t i = 0; i < adv && s_cur.pcm; i++) {
+            int16_t l, r;
+            advance(&l, &r);
+        }
+    }
+    *last = t;
+    pthread_mutex_unlock(&s_lock);
+}
+
 /* ---- ALSA ---------------------------------------------------------------- */
 
 #define EN_CHUNK 512
@@ -163,6 +191,8 @@ static void *writer(void *arg)
     (void)arg;
     static int16_t buf[EN_CHUNK * 2];
 
+    uint64_t last = now_us();
+
     while (!s_quit) {
         uint32_t rate;
         int have;
@@ -170,14 +200,26 @@ static void *writer(void *arg)
         pthread_mutex_lock(&s_lock);
         have = (s_cur.pcm != NULL);
         rate = s_cur.rate;
-        if (have) pull(buf, EN_CHUNK);
         pthread_mutex_unlock(&s_lock);
 
-        if (!have)               { usleep(10000);  continue; }
-        if (!alsa_open(rate))    { usleep(100000); continue; }
+        if (!have) { usleep(10000); last = now_us(); continue; }
+
+        if (!alsa_open(rate)) {
+            /* No sound device — headless CI, a container, WSL. Keep time so the
+               UI still plays through at the right pace instead of freezing on
+               a progress ring that never moves. */
+            usleep(10000);
+            advance_by_clock(&last);
+            continue;
+        }
+
+        pthread_mutex_lock(&s_lock);
+        pull(buf, EN_CHUNK);
+        pthread_mutex_unlock(&s_lock);
 
         snd_pcm_sframes_t n = snd_pcm_writei(s_handle, buf, EN_CHUNK);
         if (n < 0) snd_pcm_recover(s_handle, (int)n, 1);   /* underruns happen */
+        last = now_us();
     }
     if (s_handle) { snd_pcm_close(s_handle); s_handle = NULL; }
     return NULL;
@@ -187,31 +229,13 @@ const char *en_audio_backend_name(void) { return "ALSA"; }
 
 #else /* no ALSA: keep time, make no sound */
 
-static uint64_t now_us(void)
-{
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (uint64_t)tv.tv_sec * 1000000ull + (uint64_t)tv.tv_usec;
-}
-
 static void *writer(void *arg)
 {
     (void)arg;
     uint64_t last = now_us();
     while (!s_quit) {
         usleep(10000);
-        uint64_t t = now_us();
-        pthread_mutex_lock(&s_lock);
-        if (s_cur.pcm && s_cur.rate) {
-            uint32_t adv = (uint32_t)(((t - last) * s_cur.rate) / 1000000ull);
-            if (adv > s_cur.rate) adv = s_cur.rate;   /* clamp after a stall */
-            for (uint32_t i = 0; i < adv && s_cur.pcm; i++) {
-                int16_t l, r;
-                advance(&l, &r);
-            }
-        }
-        last = t;
-        pthread_mutex_unlock(&s_lock);
+        advance_by_clock(&last);
     }
     return NULL;
 }
