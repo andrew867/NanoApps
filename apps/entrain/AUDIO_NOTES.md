@@ -289,6 +289,39 @@ this has to be right. The saving grace is that mixing makes overlap safe, which
 is exactly the property the 100-second design would not have needed and this one
 does. Render with ~3 dB of headroom so two overlapping voices cannot clip.
 
+### Nothing can be stopped once it is playing
+
+This falls out of the two findings above and is the most awkward consequence of
+the whole spike. There is no loop flag, so we re-arm each buffer ourselves —
+fine. But the voice pool **mixes** rather than cutting, which is what makes
+overlapping seams safe, and it also means a newly played buffer cannot silence
+one already in flight. No stop entry point was found on the player or the
+descriptor.
+
+So on the device:
+
+- `en_audio_stop()` stops re-arming and lets the current buffer run out. A stop
+  therefore takes up to one loop length — 11 to 18 seconds — to fall silent.
+- Pause has the same shape: it takes effect at the next buffer boundary.
+- The sleep timer's fade lands at a loop boundary rather than exactly on the
+  second.
+
+Three ways out, in order of preference, none of them v1 work:
+
+1. **Find the stop.** The voice object has methods either side of the ones
+   `play()` uses — `0x08630154` starts it, `0x08630188` resets it,
+   `0x0863028c` scores it. One of its neighbours is very likely a stop, and
+   the descriptor's vtable at `0x087ae660` is the other place to look. This is
+   a contained RE job and it is the right fix.
+2. **Steal the voice.** The allocator recycles the highest-scoring voice once
+   all eight are busy (VA `0x0804d1bc`), so playing eight short silent buffers
+   would evict a stuck one. Crude, and it depends on the scoring function
+   picking the victim we want, which is unverified.
+3. **Shorten what is playing.** `loadFile` accepts a byte window into a file,
+   so one cached loop could be played as a sequence of four-second windows,
+   bounding a stop to four seconds without needing more files on disk. Cheap to
+   build, and harness T8 is what says whether the window works at all.
+
 ### Two constraints that reach into the UI
 
 - **The MIPI-activity rule.** `sdk/hb_audio.c` carries a FIXME: calling the
