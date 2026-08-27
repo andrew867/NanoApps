@@ -97,11 +97,47 @@ static en_noise_kind_t parse_noise(const char *s, int *ok)
     return EN_NOISE_NONE;
 }
 
+/* Validate a user-program file the way the device will read it. Worth having
+   as a desktop step: the iPod's volume is mounted read-only, so a file with a
+   typo in it cannot be fixed in place once it is over there. */
+static int check_program(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) { perror(path); return 1; }
+    static char text[8192];
+    size_t n = fread(text, 1, sizeof text - 1, f);
+    fclose(f);
+    text[n] = 0;
+
+    en_user_program_t up;
+    int line = 0;
+    int rc = en_parse_program(text, (uint32_t)n, &up, &line);
+    if (rc != EN_PARSE_OK) {
+        fprintf(stderr, "%s: %s on line %d\n", path,
+                en_parse_error_text(rc), line);
+        return 1;
+    }
+
+    uint32_t total = 0;
+    for (int i = 0; i < up.n_segs; i++) total += up.segs[i].seconds;
+    printf("%s\n  name    %s\n  mode    %s\n  carrier %.2f Hz\n"
+           "  noise   %s %.2f\n  %d segment(s), %u:%02u total\n",
+           path, up.name, en_mode_name(up.mode), up.carrier_hz,
+           en_noise_name(up.noise), up.noise_level, up.n_segs,
+           total / 60u, total % 60u);
+    for (int i = 0; i < up.n_segs; i++)
+        printf("    %6.2f -> %6.2f Hz over %4u s   (%s)\n",
+               up.segs[i].beat_start, up.segs[i].beat_end, up.segs[i].seconds,
+               en_band_name(en_band_of(up.segs[i].beat_start)));
+    return 0;
+}
+
 static void usage(void)
 {
     printf(
       "entrain-wav — render Entrain audio to a .wav\n\n"
       "  --list                 show presets and programs\n"
+      "  --check FILE...        validate user-program files and stop\n"
       "  --preset N             render preset N as its device loop\n"
       "  --program N            render program N (see --minutes)\n"
       "  --beat HZ              ad-hoc: beat frequency\n"
@@ -126,6 +162,12 @@ int main(int argc, char **argv)
         const char *a = argv[i];
         int has_next = (i + 1 < argc);
         if (!strcmp(a, "--list")) { list_all(); return 0; }
+        else if (!strcmp(a, "--check")) {
+            int bad = 0;
+            while (i + 1 < argc && argv[i + 1][0] != '-')
+                bad |= check_program(argv[++i]);
+            return bad;
+        }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
         else if (!strcmp(a, "--preset") && has_next)  preset = atoi(argv[++i]);
         else if (!strcmp(a, "--program") && has_next) program = atoi(argv[++i]);

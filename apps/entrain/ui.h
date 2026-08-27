@@ -57,4 +57,9 @@ const char *en_ui_screen_name(en_screen_t screen);
 /* Force the first-run headphone notice on or off, for screenshots and tests. */
 void en_ui_set_first_run(bool first_run);
 
+/* Select the Library's segmented tab: 0 Presets, 1 Programs, 2 Custom. Exists
+   because the N31 Linux port has no touchscreen yet, so there is otherwise no
+   way to reach a tab to look at it. */
+void en_ui_set_tab(int tab);
+
 #endif /* ENTRAIN_UI_H */

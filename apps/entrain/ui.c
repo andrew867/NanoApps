@@ -1318,6 +1318,13 @@ void en_ui_set_first_run(bool first_run)
     P.seen_first_run = first_run ? 0 : 1;
 }
 
+void en_ui_set_tab(int tab)
+{
+    if (tab < 0 || tab > 2) return;
+    s_tab = tab;
+    if (s_list) refresh_library();
+}
+
 /* ---- lifecycle ----------------------------------------------------------- */
 
 void en_ui_init(void)

@@ -66,6 +66,47 @@ static struct {
     bool        sleep_firing;
 } E;
 
+/* ---- streaming --------------------------------------------------------- *
+ *
+ * When the backend can take a continuous feed, everything above — the loop
+ * planner's file budget, the chunk queue, the WAV cache — is bypassed. The
+ * audio thread pulls frames and the renderer produces them on demand, so a
+ * steady preset is one unbroken tone rather than a loop with a seam every
+ * eighteen seconds, and a program's ramp is genuinely continuous.
+ *
+ * The audio thread reads parameters that the UI thread writes. Rather than a
+ * lock the parameters are double-buffered and the slot index is flipped after
+ * the write, so the puller always reads a slot nobody is writing. A torn
+ * double here would be an audible blip, which is why it is not simply left to
+ * chance. */
+
+/* The hardware's rate. The DSP is rate-agnostic, so this is chosen to suit the
+   codec rather than the maths. */
+#define EN_STREAM_RATE 44100
+
+typedef struct {
+    double          carrier_hz;
+    double          beat_hz;
+    double          tone_level;
+    double          noise_level;
+    en_mode_t       mode;
+    en_noise_kind_t noise;
+} stream_params_t;
+
+static stream_params_t  S_params[2];
+static volatile int     S_slot;
+static double           S_t;         /* audio thread only: seconds emitted */
+static double           S_total;     /* 0 for an endless preset */
+static en_render_t      S_rnd;       /* audio thread only */
+static int              S_is_program;
+
+static void publish_params(const stream_params_t *p)
+{
+    int next = S_slot ? 0 : 1;
+    S_params[next] = *p;
+    S_slot = next;
+}
+
 /* ---- small helpers ------------------------------------------------------ */
 
 static void copy_str(char *dst, const char *src, int cap)
@@ -319,6 +360,93 @@ static bool start_next_chunk(bool first)
     return true;
 }
 
+/* Called from the audio thread. No allocation, no locks, no LVGL. */
+static uint32_t stream_pull(int16_t *dst, uint32_t frames, void *ctx)
+{
+    (void)ctx;
+
+    if (S_total > 0.0 && S_t >= S_total) return 0;   /* the program is over */
+
+    const double dt = (double)frames / (double)EN_STREAM_RATE;
+    stream_params_t p = S_params[S_slot];            /* snapshot */
+
+    en_segment_t seg;
+    memset(&seg, 0, sizeof seg);
+    seg.sample_rate = EN_STREAM_RATE;
+    seg.frames = frames;
+    seg.mode = p.mode;
+    seg.noise = p.noise;
+
+    if (S_is_program) {
+        /* Evaluate the timeline across exactly this block, so the ramp is
+           continuous across every block boundary and every segment join. */
+        double b0, c0, b1, c1, nl0, nl1;
+        en_noise_kind_t nk0, nk1;
+        program_params_at(S_t, &b0, &c0, &nk0, &nl0);
+        program_params_at(S_t + dt, &b1, &c1, &nk1, &nl1);
+        seg.noise = nk0;
+        seg.start.carrier_hz  = c0;
+        seg.start.beat_hz     = b0;
+        seg.start.tone_level  = p.tone_level;
+        seg.start.noise_level = nl0;
+        seg.end.carrier_hz    = c1;
+        seg.end.beat_hz       = b1;
+        seg.end.tone_level    = p.tone_level;
+        seg.end.noise_level   = nl1;
+    } else {
+        /* A preset, or a preset being tuned by hand. The renderer's own
+           control-rate interpolation turns a changed target into a glide, so
+           live tuning needs no re-render at all here — it just moves. */
+        seg.start.carrier_hz  = p.carrier_hz;
+        seg.start.beat_hz     = p.beat_hz;
+        seg.start.tone_level  = p.tone_level;
+        seg.start.noise_level = p.noise_level;
+        seg.end = seg.start;
+    }
+
+    en_render_segment(&S_rnd, &seg, dst);
+
+    if (S_is_program)
+        apply_program_fades(dst, frames, EN_STREAM_RATE, S_t, S_total);
+
+    S_t += dt;
+    return frames;
+}
+
+/* Push the current parameters at the stream. Used both to start it and, on
+   live tune, to move it. */
+static void stream_publish_from_state(void)
+{
+    stream_params_t p;
+    p.mode = E.mode;
+    p.tone_level = 0.8;
+    p.noise = EN_NOISE_NONE;
+    p.noise_level = 0.0;
+    p.carrier_hz = E.plan.f_l;
+    p.beat_hz = E.plan.beat_hz;
+
+    if (E.source == EN_SRC_PRESET || E.source == EN_SRC_LIVE) {
+        int n;
+        const en_preset_t *ps = en_presets(&n);
+        if (E.index >= 0 && E.index < n) {
+            p.noise = ps[E.index].noise;
+            p.noise_level = ps[E.index].noise_level;
+        }
+    }
+    publish_params(&p);
+}
+
+static bool stream_start(bool is_program, double total_s)
+{
+    S_is_program = is_program ? 1 : 0;
+    S_total = total_s;
+    S_t = 0.0;
+    en_render_init(&S_rnd, EN_STREAM_RATE,
+                   is_program ? EN_NOISE_PINK : EN_NOISE_NONE, 1);
+    stream_publish_from_state();
+    return en_audio_start_stream(EN_STREAM_RATE, stream_pull, NULL);
+}
+
 /* ---- starting things ----------------------------------------------------- */
 
 static bool start_loop(double beat, double carrier, en_mode_t mode,
@@ -370,6 +498,18 @@ bool en_engine_play_preset(int index)
     E.base_carrier = E.live_carrier = ps[index].carrier_hz;
     E.retune_at_ms = 0;
 
+    if (en_audio_can_stream()) {
+        /* Plan anyway: the realised beat is what the UI displays, and it stays
+           honest whether or not the loop it describes is ever written out. */
+        en_loop_plan_t plan;
+        if (en_plan_loop(ps[index].beat_hz, ps[index].carrier_hz, EN_RATES,
+                         EN_RATES_COUNT, EN_TARGET_BYTES, &plan))
+            E.plan = plan;
+        E.mode = ps[index].mode;
+        E.total_s = 0.0;
+        return stream_start(false, 0.0);
+    }
+
     return start_loop(ps[index].beat_hz, ps[index].carrier_hz, ps[index].mode,
                       ps[index].noise, ps[index].noise_level);
 }
@@ -387,6 +527,8 @@ bool en_engine_play_program(int index)
     E.mode = ps[index].mode;
     E.total_s = (double)en_program_seconds(&ps[index]);
     E.render_pos_s = 0.0;
+
+    if (en_audio_can_stream()) return stream_start(true, E.total_s);
 
     en_render_init(&E.rnd, EN_RATES[0], ps[index].segs[0].noise, 1);
     return start_next_chunk(true);
@@ -406,6 +548,8 @@ bool en_engine_play_user(const en_user_program_t *up)
     for (int i = 0; i < up->n_segs; i++)
         E.total_s += (double)up->segs[i].seconds;
     E.render_pos_s = 0.0;
+
+    if (en_audio_can_stream()) return stream_start(true, E.total_s);
 
     en_render_init(&E.rnd, EN_RATES[0], up->segs[0].noise, 1);
     return start_next_chunk(true);
@@ -461,6 +605,15 @@ void en_engine_live_adjust(double d_beat, double d_carrier)
         E.plan = p;
 
     E.source = EN_SRC_LIVE;
+
+    if (en_audio_can_stream()) {
+        /* Nothing to re-render: publishing the new target is enough, and the
+           renderer's control-rate interpolation glides to it. */
+        stream_publish_from_state();
+        E.retune_at_ms = 0;
+        E.retuning = false;
+        return;
+    }
     E.retune_at_ms = en_sys_millis() + EN_RETUNE_SETTLE_MS;
 }
 
@@ -472,6 +625,11 @@ void en_engine_live_reset(void)
     if (en_plan_loop(E.live_beat, E.live_carrier, EN_RATES, EN_RATES_COUNT,
                      EN_TARGET_BYTES, &p))
         E.plan = p;
+    if (en_audio_can_stream()) {
+        stream_publish_from_state();
+        E.retune_at_ms = 0;
+        return;
+    }
     E.retune_at_ms = en_sys_millis() + EN_RETUNE_SETTLE_MS;
 }
 
@@ -482,6 +640,19 @@ bool en_engine_is_retuning(void) { return E.retuning || E.retune_at_ms != 0; }
 void en_engine_tick(void)
 {
     en_audio_tick();
+
+    /* A stream needs no lookahead, no chunking and no re-arming: the audio
+       thread pulls what it needs. Only the sleep timer still applies. */
+    if (en_audio_can_stream()) {
+        if (E.sleep_timer_s && !E.sleep_firing && en_engine_is_active()) {
+            uint32_t el = (en_sys_millis() - E.sleep_started_ms) / 1000u;
+            if (el >= E.sleep_timer_s) {
+                E.sleep_firing = true;
+                en_audio_stop(8000);
+            }
+        }
+        return;
+    }
 
     /* A settled live-tune gesture becomes a re-render. The currently playing
        loop is left alone until the new one is ready, so retuning is never a

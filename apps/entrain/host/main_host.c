@@ -30,8 +30,19 @@
 #include "../platform/sys.h"
 #include "../platform/audio.h"
 
+#ifdef __linux__
+#include <fcntl.h>
+#include <errno.h>
+#endif
+
 #define W EN_SCREEN_W
 #define H EN_SCREEN_H
+
+/* Provided only by the N31 Linux backend. Declared weak at file scope — a
+   block-scope weak attribute is quietly ignored by some GCC versions — so the
+   desktop build, which links a different backend, still resolves to NULL. */
+void en_audio_linux_set_device(int card, int device) __attribute__((weak));
+void en_audio_linux_force_null(int on) __attribute__((weak));
 
 /* ---- headless display ---------------------------------------------------- */
 
@@ -97,6 +108,85 @@ static int write_bmp(const char *path)
     return 1;
 }
 
+/* ---- physical buttons over evdev ------------------------------------------
+ *
+ * The N31 kernel exposes n31-buttons and the PMIC buttons as keyboards, and
+ * there is no touchscreen device at all yet, so this is the only way to drive
+ * the UI on the device.
+ *
+ * The event struct is declared by hand rather than pulled from <linux/input.h>
+ * on purpose. musl uses a 64-bit time_t, so its struct timeval is 16 bytes,
+ * while the kernel writes input_event with 32-bit time fields on arm32. Using
+ * the system struct would misparse every event by eight bytes — silently, and
+ * in a way that looks like the buttons simply do not work. */
+
+#ifdef __linux__
+
+struct en_input_event {
+    uint32_t tv_sec;
+    uint32_t tv_usec;
+    uint16_t type;
+    uint16_t code;
+    int32_t  value;
+};
+
+#define EN_EV_KEY 0x01
+
+#define EN_MAX_INPUT_FDS 8
+static int s_input_fd[EN_MAX_INPUT_FDS];
+static int s_input_count;
+static int s_trace_keys;
+
+static void input_open_all(void)
+{
+    for (int i = 0; i < 32 && s_input_count < EN_MAX_INPUT_FDS; i++) {
+        char path[64];
+        snprintf(path, sizeof path, "/dev/input/event%d", i);
+        int fd = open(path, O_RDONLY | O_NONBLOCK);
+        if (fd >= 0) s_input_fd[s_input_count++] = fd;
+    }
+    printf("entrain-host: %d input device(s)\n", s_input_count);
+}
+
+/* Key codes as the kernel defines them. Which of these n31-buttons actually
+   emits is what --trace-keys is for. */
+#define EN_KEY_ESC        1
+#define EN_KEY_VOLUMEDOWN 114
+#define EN_KEY_VOLUMEUP   115
+#define EN_KEY_POWER      116
+#define EN_KEY_BACKKEY    158
+#define EN_KEY_PLAYPAUSE  164
+#define EN_KEY_HOMEPAGE   172
+#define EN_KEY_NEXTSONG   163
+#define EN_KEY_PREVSONG   165
+
+static void input_poll(void)
+{
+    struct en_input_event ev;
+    for (int i = 0; i < s_input_count; i++) {
+        while (read(s_input_fd[i], &ev, sizeof ev) == (ssize_t)sizeof ev) {
+            if (ev.type != EN_EV_KEY || ev.value != 1) continue;   /* press only */
+            if (s_trace_keys)
+                printf("key %u down (event%d)\n", ev.code, i);
+            switch (ev.code) {
+            case EN_KEY_VOLUMEUP:   en_ui_key(EN_KEY_VOL_UP);     break;
+            case EN_KEY_VOLUMEDOWN: en_ui_key(EN_KEY_VOL_DOWN);   break;
+            case EN_KEY_PLAYPAUSE:
+            case EN_KEY_NEXTSONG:   en_ui_key(EN_KEY_PLAY_PAUSE); break;
+            case EN_KEY_HOMEPAGE:
+            case EN_KEY_BACKKEY:
+            case EN_KEY_ESC:        en_ui_key(EN_KEY_BACK);       break;
+            default: break;
+            }
+        }
+    }
+}
+
+#else
+static void input_open_all(void) {}
+static void input_poll(void) {}
+#endif
+
 /* ---- main ---------------------------------------------------------------- */
 
 static void pump(int frames)
@@ -116,7 +206,16 @@ static void usage(void)
            "  --fbdev PATH   framebuffer device (default /dev/fb0)\n"
            "  --drm PATH     DRM card (default /dev/dri/card0)\n"
            "  --evdev PATH   touch device for fbdev/drm backends\n"
-           "  --first-run    show the headphone notice\n", W, H);
+           "  --first-run    show the headphone notice\n"
+           "  --buttons      drive the UI from /dev/input (no touchscreen yet)\n"
+           "  --trace-keys   print every key code, to find out what the buttons send\n"
+           "  --demo N       walk through every screen, N seconds each\n"
+           "  --screen NAME  start on a named screen (library, now-playing, ...)\n"
+           "  --tab N        Library tab: 0 presets, 1 programs, 2 custom\n"
+           "  --preset N     start playing preset N\n"
+           "  --program N    start playing program N\n"
+           "  --card C [D]   ALSA card and device (default 0 0)\n"
+           "  --null-audio   keep time but open no PCM device\n", W, H);
 }
 
 int main(int argc, char **argv)
@@ -127,6 +226,12 @@ int main(int argc, char **argv)
     const char *drm_path = "/dev/dri/card0";
     const char *evdev_path = getenv("ENTRAIN_EVDEV");
     int first_run = 0;
+    int use_buttons = 0;
+    int demo_seconds = 0;
+    int start_program = -1;
+    int start_preset = -1;
+    int start_tab = -1;
+    const char *start_screen = NULL;
 
     for (int i = 1; i < argc; i++) {
         int has = i + 1 < argc;
@@ -136,6 +241,26 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--drm") && has) drm_path = argv[++i];
         else if (!strcmp(argv[i], "--evdev") && has) evdev_path = argv[++i];
         else if (!strcmp(argv[i], "--first-run")) first_run = 1;
+        else if (!strcmp(argv[i], "--buttons")) use_buttons = 1;
+        else if (!strcmp(argv[i], "--trace-keys")) {
+            use_buttons = 1;
+#ifdef __linux__
+            s_trace_keys = 1;
+#endif
+        }
+        else if (!strcmp(argv[i], "--demo") && has) demo_seconds = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--program") && has) start_program = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--preset") && has) start_preset = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--tab") && has) start_tab = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--screen") && has) start_screen = argv[++i];
+        else if (!strcmp(argv[i], "--null-audio")) {
+            if (en_audio_linux_force_null) en_audio_linux_force_null(1);
+        }
+        else if (!strcmp(argv[i], "--card") && has) {
+            int c = atoi(argv[++i]);
+            int d = (i + 1 < argc && argv[i + 1][0] != '-') ? atoi(argv[++i]) : 0;
+            if (en_audio_linux_set_device) en_audio_linux_set_device(c, d);
+        }
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             usage();
             return 0;
@@ -196,9 +321,25 @@ int main(int argc, char **argv)
 #endif
 
     if (first_run) en_ui_set_first_run(true);
+    if (use_buttons) input_open_all();
     en_ui_init();
+
+    if (start_tab >= 0) en_ui_set_tab(start_tab);
+    if (start_preset >= 0)  en_engine_play_preset(start_preset);
+    if (start_program >= 0) en_engine_play_program(start_program);
+    if (start_preset >= 0 || start_program >= 0) en_ui_goto(EN_SCREEN_NOW, false);
+    if (start_screen) {
+        for (int sc = 0; sc < EN_SCREEN_COUNT; sc++) {
+            if (!strcmp(start_screen, en_ui_screen_name((en_screen_t)sc))) {
+                en_ui_goto((en_screen_t)sc, false);
+                break;
+            }
+        }
+    }
+
     printf("entrain-host: %s backend, %dx%d, audio via %s\n",
            backend, W, H, en_audio_backend_name());
+    fflush(stdout);
 
     /* ---- screenshot mode ---- */
     if (shot_dir) {
@@ -233,7 +374,26 @@ int main(int argc, char **argv)
     }
 
     /* ---- interactive ---- */
+    static const en_screen_t WALK[] = {
+        EN_SCREEN_LIBRARY, EN_SCREEN_NOW, EN_SCREEN_TUNE,
+        EN_SCREEN_TIMER, EN_SCREEN_SETTINGS
+    };
+    uint32_t next_walk = en_sys_millis() + (uint32_t)demo_seconds * 1000u;
+    unsigned walk_i = 0;
+
     while (!en_sys_exit_requested()) {
+        if (use_buttons) input_poll();
+
+        /* With no touchscreen on this port, a timed walk is the only way to
+           see every screen. It is a diagnostic, not a feature. */
+        if (demo_seconds > 0 && en_sys_millis() >= next_walk) {
+            next_walk = en_sys_millis() + (uint32_t)demo_seconds * 1000u;
+            walk_i = (walk_i + 1) % (sizeof WALK / sizeof WALK[0]);
+            en_ui_goto(WALK[walk_i], true);
+            printf("screen: %s\n", en_ui_screen_name(WALK[walk_i]));
+            fflush(stdout);
+        }
+
         en_ui_tick();
         uint32_t wait = lv_timer_handler();
         if (wait == LV_NO_TIMER_READY) wait = 8;

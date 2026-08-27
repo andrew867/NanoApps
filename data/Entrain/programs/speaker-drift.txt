@@ -1,0 +1,7 @@
+# Isochronic, so it works without headphones.
+
+name    Speaker Drift
+mode    isochronic
+carrier 180
+
+seg     8    8    1200     # 20 min steady at the alpha/theta border

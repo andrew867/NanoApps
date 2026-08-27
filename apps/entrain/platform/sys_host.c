@@ -20,6 +20,38 @@ static bool     s_exit;
 static char     s_cache[512];
 static char     s_programs[512];
 
+/* Read a small sysfs value. Returns -1 if the file is not there, which is the
+   normal case on a desktop and the signal to fall back. */
+static long read_sysfs_long(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    long v = -1;
+    if (fscanf(f, "%ld", &v) != 1) v = -1;
+    fclose(f);
+    return v;
+}
+
+static bool read_sysfs_str(const char *path, char *out, size_t cap)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    bool ok = fgets(out, (int)cap, f) != NULL;
+    fclose(f);
+    if (ok) {
+        size_t n = strlen(out);
+        while (n && (out[n - 1] == '\n' || out[n - 1] == '\r')) out[--n] = 0;
+    }
+    return ok;
+}
+
+/* The N31 kernel exposes d1830-battery and s5l8740-backlight. Both are found
+   by probing rather than hardcoded, so the same binary still runs on a
+   desktop where neither exists. */
+#define EN_BATTERY_CAPACITY "/sys/class/power_supply/d1830-battery/capacity"
+#define EN_BATTERY_STATUS   "/sys/class/power_supply/d1830-battery/status"
+#define EN_BACKLIGHT_DIR    "/sys/class/backlight/s5l8740-backlight"
+
 static uint64_t now_us(void)
 {
     struct timeval tv;
@@ -35,17 +67,63 @@ uint32_t en_sys_millis(void)
 
 int en_sys_battery_percent(void)
 {
-    /* Drift down one percent a minute from 87, wrapping, so the readout moves
-       during a long session and layout bugs in the header show up. */
+    long v = read_sysfs_long(EN_BATTERY_CAPACITY);
+    if (v >= 0) return v > 100 ? 100 : (int)v;
+
+    /* No battery here — a desktop. Drift down one percent a minute from 87 so
+       the readout still moves and layout bugs in the header show up. */
     uint32_t mins = en_sys_millis() / 60000u;
-    int v = 87 - (int)(mins % 80u);
-    return v < 7 ? v + 80 : v;
+    int f = 87 - (int)(mins % 80u);
+    return f < 7 ? f + 80 : f;
 }
 
-bool en_sys_battery_charging(void) { return false; }
+bool en_sys_battery_charging(void)
+{
+    char st[32];
+    if (read_sysfs_str(EN_BATTERY_STATUS, st, sizeof st))
+        return strcmp(st, "Charging") == 0 || strcmp(st, "Full") == 0;
+    return false;
+}
 
-void en_sys_wake_lock(bool on) { (void)on; }
-void en_sys_backlight(int percent) { (void)percent; }
+void en_sys_wake_lock(bool on)
+{
+    /* Nothing to hold on Linux: there is no OS idle timer competing for the
+       panel here. The app's own blank timer is the only thing that dims it. */
+    (void)on;
+}
+
+void en_sys_backlight(int percent)
+{
+    static long max_bright = -2;
+    char path[256];
+
+    if (max_bright == -2) {
+        snprintf(path, sizeof path, "%s/max_brightness", EN_BACKLIGHT_DIR);
+        max_bright = read_sysfs_long(path);
+    }
+    if (max_bright < 0) return;          /* no backlight: a desktop */
+
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+
+    /* bl_power first: 0 is FB_BLANK_UNBLANK, 4 is FB_BLANK_POWERDOWN. Turning
+       the backlight off this way leaves the compositor running, which is the
+       whole point of the blank-while-playing feature. */
+    snprintf(path, sizeof path, "%s/bl_power", EN_BACKLIGHT_DIR);
+    FILE *f = fopen(path, "w");
+    if (f) { fprintf(f, "%d\n", percent == 0 ? 4 : 0); fclose(f); }
+
+    if (percent == 0) return;
+
+    snprintf(path, sizeof path, "%s/brightness", EN_BACKLIGHT_DIR);
+    f = fopen(path, "w");
+    if (f) {
+        long v = (max_bright * percent) / 100;
+        if (v < 1) v = 1;
+        fprintf(f, "%ld\n", v);
+        fclose(f);
+    }
+}
 
 static const char *base_dir(void)
 {
@@ -74,6 +152,12 @@ const char *en_sys_cache_dir(void)
 
 const char *en_sys_programs_dir(void)
 {
+    /* ENTRAIN_PROGRAMS lets this point at the iPod's mounted volume, which is
+       read-only — hence a separate variable from ENTRAIN_HOME, which has to be
+       somewhere writable. */
+    const char *env = getenv("ENTRAIN_PROGRAMS");
+    if (env && *env) return env;
+
     if (!s_programs[0]) {
         ensure_dir(base_dir());
         snprintf(s_programs, sizeof s_programs, "%s/programs", base_dir());

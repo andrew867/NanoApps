@@ -358,6 +358,65 @@ static void test_loop_seams(void)
     }
 }
 
+/* A preset that asks for a noise bed must actually get one. The renderer used
+   to take its noise kind from en_render_init rather than from the segment, so
+   a pink-bed preset rendered through a NONE generator and the bed was silent
+   while the level said otherwise. */
+static void test_noise_bed(void)
+{
+    section("noise beds actually produce noise");
+
+    const uint32_t sr = 11025;
+    const uint32_t frames = sr * 2;
+    int16_t *pcm = malloc(frames * 2 * sizeof *pcm);
+
+    en_noise_kind_t kinds[] = { EN_NOISE_WHITE, EN_NOISE_PINK, EN_NOISE_BROWN };
+    const char *names[] = { "white", "pink", "brown" };
+
+    for (int k = 0; k < 3; k++) {
+        en_render_t r;
+        /* Deliberately initialise with the WRONG kind: the segment must win. */
+        en_render_init(&r, sr, EN_NOISE_NONE, 1);
+
+        en_segment_t seg;
+        memset(&seg, 0, sizeof seg);
+        seg.sample_rate = sr;
+        seg.mode = EN_MODE_BINAURAL;
+        seg.noise = kinds[k];
+        seg.frames = frames;
+        seg.start.carrier_hz = 200.0;
+        seg.start.beat_hz = 10.0;
+        seg.start.tone_level = 0.0;    /* noise only, so it is measurable */
+        seg.start.noise_level = 0.5;
+        seg.end = seg.start;
+        en_render_segment(&r, &seg, pcm);
+
+        int peak = peak_abs(pcm, frames);
+        printf("  %-6s bed peak %d\n", names[k], peak);
+        CHECK(peak > 500, "%s bed is silent (peak %d) - the segment's kind "
+              "was ignored", names[k], peak);
+    }
+
+    /* And NONE must stay silent even when a level is set. */
+    en_render_t r;
+    en_render_init(&r, sr, EN_NOISE_PINK, 1);
+    en_segment_t seg;
+    memset(&seg, 0, sizeof seg);
+    seg.sample_rate = sr;
+    seg.mode = EN_MODE_BINAURAL;
+    seg.noise = EN_NOISE_NONE;
+    seg.frames = frames;
+    seg.start.carrier_hz = 200.0;
+    seg.start.beat_hz = 10.0;
+    seg.start.tone_level = 0.0;
+    seg.start.noise_level = 0.5;
+    seg.end = seg.start;
+    en_render_segment(&r, &seg, pcm);
+    CHECK(peak_abs(pcm, frames) == 0, "EN_NOISE_NONE produced sound");
+
+    free(pcm);
+}
+
 /* ---- 6. phase continuity across a glide --------------------------------- */
 
 static void test_glide(void)
@@ -628,6 +687,7 @@ int main(void)
     test_beat_accuracy();
     test_clicks();
     test_loop_seams();
+    test_noise_bed();
     test_glide();
     test_levels();
     test_wav_header();

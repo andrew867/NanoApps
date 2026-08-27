@@ -273,6 +273,17 @@ bool en_audio_queue(const char *key, const int16_t *pcm,
     return true;
 }
 
+/* This backend plays buffers, not a continuous feed, so the engine takes the
+   submit/queue path. */
+bool en_audio_can_stream(void) { return false; }
+
+bool en_audio_start_stream(uint32_t sample_rate, en_audio_pull_fn pull,
+                           void *ctx)
+{
+    (void)sample_rate; (void)pull; (void)ctx;
+    return false;
+}
+
 bool en_audio_wants_next(void)
 {
     return g_cur.valid && !g_cur.loop && !g_next.valid && !g_stopping;

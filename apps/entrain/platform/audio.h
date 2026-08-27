@@ -62,6 +62,29 @@ bool en_audio_wants_next(void);
    returns a large value for one. */
 double en_audio_remaining(void);
 
+/* ---- streaming, where the platform has a real PCM sink -------------------
+
+   The two-slot model above exists because RetailOS can only be handed a file.
+   A Linux target with ALSA has no such limit: it can be fed samples forever.
+   Where that is true the engine skips the whole render-to-file path and
+   generates straight into the sink, which removes every seam, every cache
+   file, and the 1 MiB ceiling along with them.
+
+   The pull callback runs on the audio thread. It must not allocate, block, or
+   touch LVGL. */
+
+typedef uint32_t (*en_audio_pull_fn)(int16_t *dst, uint32_t frames, void *ctx);
+
+/* True when en_audio_start_stream is usable. Backends that can only play
+   files return false and the engine uses submit/queue instead. */
+bool en_audio_can_stream(void);
+
+/* Begin pulling. Replaces anything already playing. Returns false if the sink
+   could not be opened, in which case nothing is playing and the caller should
+   say so rather than pretending. */
+bool en_audio_start_stream(uint32_t sample_rate, en_audio_pull_fn pull,
+                           void *ctx);
+
 /* Fade out over `fade_ms` and stop. Passing 0 stops immediately; anything the
    user can hear should pass at least 1000. */
 void en_audio_stop(uint32_t fade_ms);

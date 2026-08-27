@@ -1,0 +1,173 @@
+# Makefile.n31 — cross-build Entrain for the N31 Linux port on iPod nano 7G.
+#
+# Produces a fully static ARM musl ELF: the device boots a 26 MB initramfs with
+# essentially no shared libraries, so anything dynamic is a non-starter.
+#
+#   make -f Makefile.n31            build build-n31/entrain
+#   make -f Makefile.n31 push       build, scp to /tmp, chmod
+#   make -f Makefile.n31 run        push, then run it on the device
+#
+# Target facts this file encodes, all read off the device rather than assumed:
+#   * /dev/fb0 is 240x432, 32 bpp, stride 960 — the same geometry and pixel
+#     format as the RetailOS build, so ui.c is used unchanged.
+#   * The CPU reports vfpv3/vfpv4 and NO neon, so no NEON anywhere.
+#   * The toolchain is arm-linux-musleabi — a SOFT-FLOAT ABI. Hardware FP
+#     instructions are still used via -mfloat-abi=softfp; -mfloat-abi=hard
+#     would produce a binary that cannot call its own libc.
+#   * ALSA is card 0 device 0 (nano7gaudio / cs42l81-hifi-0), driven through
+#     tinyalsa compiled straight in.
+
+IPOD_ROOT ?= /mnt/c/src/ipod/artifacts/linux-n31
+TOOLCHAIN ?= $(IPOD_ROOT)/tinyalsa-build/arm-linux-musleabi-cross
+TINYALSA  ?= $(IPOD_ROOT)/tinyalsa-build/tinyalsa-2.0.0
+SSH_KEY   ?= $(IPOD_ROOT)/n31_id
+DEVICE    ?= root@192.168.7.2
+
+CROSS   := $(TOOLCHAIN)/bin/arm-linux-musleabi-
+CC      := $(CROSS)gcc
+AR      := $(CROSS)ar
+STRIP   := $(CROSS)strip
+
+CORE    := ../core
+LVGL    ?= ../../../lvgl
+BUILD   := build-n31
+
+# Cortex-A8, Thumb-2, hardware FP but soft-float ABI, and no NEON.
+ARCH_FLAGS := -mcpu=cortex-a8 -mthumb -mfpu=vfpv3-d16 -mfloat-abi=softfp
+
+CFLAGS  := -O2 -g0 -std=gnu99 $(ARCH_FLAGS) \
+           -ffunction-sections -fdata-sections \
+           -Wall -Wextra -Wno-unused-parameter
+LDFLAGS := -static -Wl,--gc-sections
+LDLIBS  := -lm -lpthread
+
+LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_n31.h\" \
+             -I$(LVGL) -I$(LVGL)/src -I$(LVGL)/include -I$(LVGL)/..
+TA_CFLAGS := -I$(TINYALSA)/include
+
+CORE_SRCS := $(CORE)/osc.c $(CORE)/noise.c $(CORE)/render.c \
+             $(CORE)/program.c $(CORE)/wavout.c
+
+APP_SRCS  := main_host.c ../ui.c ../engine.c \
+             ../platform/audio_linux.c ../platform/sys_host.c $(CORE_SRCS)
+
+# tinyalsa is five files with no dependencies, which is exactly why it is used
+# here instead of alsa-lib: it compiles straight into the static binary.
+TA_SRCS   := $(TINYALSA)/src/pcm.c $(TINYALSA)/src/pcm_hw.c \
+             $(TINYALSA)/src/pcm_plugin.c $(TINYALSA)/src/mixer.c \
+             $(TINYALSA)/src/mixer_hw.c $(TINYALSA)/src/mixer_plugin.c \
+             $(TINYALSA)/src/snd_card_plugin.c $(TINYALSA)/src/limits.c
+
+# LVGL, minus every platform this target will never be.
+LV_SRCS := $(shell find $(LVGL)/src -name '*.c' \
+             -not -name 'lv_freertos.c' -not -name 'lv_cmsis_rtos2.c' \
+             -not -name 'lv_mqx.c'      -not -name 'lv_rtthread.c' \
+             -not -name 'lv_windows.c'  -not -name 'lv_sdl2.c' \
+             -not -path '*/drivers/nuttx/*'    -not -path '*/drivers/qnx/*' \
+             -not -path '*/drivers/uefi/*'     -not -path '*/drivers/windows/*' \
+             -not -path '*/drivers/wayland/*'  -not -path '*/drivers/x11/*' \
+             -not -path '*/drivers/libinput/*' -not -path '*/drivers/opengles/*' \
+             -not -path '*/drivers/sdl/*'      -not -path '*/drivers/display/drm/*' \
+             2>/dev/null)
+
+LV_OBJS := $(patsubst $(LVGL)/%.c,$(BUILD)/lvgl/%.o,$(LV_SRCS))
+TA_OBJS := $(patsubst $(TINYALSA)/%.c,$(BUILD)/tinyalsa/%.o,$(TA_SRCS))
+
+.PHONY: all push push-programs run run-bg log stop fbcon-off fbcon-on clean toolchain-check
+
+all: $(BUILD)/entrain
+
+toolchain-check:
+	@test -x $(CC) || { echo "no cross gcc at $(CC)"; exit 1; }
+	@test -d $(TINYALSA)/src || { echo "no tinyalsa at $(TINYALSA)"; exit 1; }
+	@$(CC) -dumpmachine
+
+$(BUILD):
+	@mkdir -p $(BUILD)
+
+$(BUILD)/lvgl/%.o: $(LVGL)/%.c lv_conf_n31.h
+	@mkdir -p $(dir $@)
+	@$(CC) $(CFLAGS) -w $(LV_CFLAGS) -c -o $@ $<
+
+$(BUILD)/tinyalsa/%.o: $(TINYALSA)/%.c
+	@mkdir -p $(dir $@)
+	@$(CC) $(CFLAGS) -w $(TA_CFLAGS) -c -o $@ $<
+
+$(BUILD)/liblvgl_n31.a: $(LV_OBJS)
+	@echo "  AR  $@"
+	@$(AR) crs $@ $^
+
+$(BUILD)/libtinyalsa_n31.a: $(TA_OBJS)
+	@echo "  AR  $@"
+	@$(AR) crs $@ $^
+
+$(BUILD)/entrain: $(APP_SRCS) $(BUILD)/liblvgl_n31.a $(BUILD)/libtinyalsa_n31.a | $(BUILD)
+	$(CC) $(CFLAGS) $(LV_CFLAGS) $(TA_CFLAGS) $(LDFLAGS) -o $@ $(APP_SRCS) \
+	      $(BUILD)/liblvgl_n31.a $(BUILD)/libtinyalsa_n31.a $(LDLIBS)
+	@$(STRIP) $@
+	@echo "=== $@ ===" && ls -l $@ && file $@ 2>/dev/null || true
+
+# The key lives on a Windows-mounted path, which shows as 0777 under WSL, and
+# ssh refuses a world-readable private key. Stage a 0600 copy outside that
+# mount once, and use it from then on.
+KEY := $(HOME)/.ssh/entrain-n31-key
+
+$(KEY): $(SSH_KEY)
+	@mkdir -p $(dir $(KEY))
+	@cp $(SSH_KEY) $(KEY)
+	@chmod 600 $(KEY)
+
+SSH = ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i $(KEY)
+SCP = scp -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i $(KEY)
+
+# dropbear on the device has no sftp-server, so scp cannot be used. Piping
+# through ssh needs nothing on the far side but a shell.
+push: $(BUILD)/entrain $(KEY)
+	$(SSH) $(DEVICE) 'cat > /tmp/entrain' < $(BUILD)/entrain
+	$(SSH) $(DEVICE) 'chmod +x /tmp/entrain && ls -l /tmp/entrain'
+
+# Sample user programs, so the Custom tab has something real to list.
+PROGRAM_SRC := ../../../data/Entrain/programs
+
+push-programs: $(KEY)
+	$(SSH) $(DEVICE) 'mkdir -p /tmp/entrain-data/programs'
+	@for f in $(PROGRAM_SRC)/*.txt; do \
+	    b=`basename $$f`; \
+	    echo "  $$b"; \
+	    $(SSH) $(DEVICE) "cat > /tmp/entrain-data/programs/$$b" < $$f; \
+	done
+
+# The framebuffer console (vtcon1) is bound and paints text over /dev/fb0, so
+# it has to be unbound first or it fights us for the panel. Rebound afterwards
+# so the device is left as it was found.
+fbcon-off: $(KEY)
+	-$(SSH) $(DEVICE) 'echo 0 > /sys/class/vtconsole/vtcon1/bind 2>/dev/null; true'
+
+fbcon-on: $(KEY)
+	-$(SSH) $(DEVICE) 'echo 1 > /sys/class/vtconsole/vtcon1/bind 2>/dev/null; true'
+
+# ENTRAIN_HOME keeps prefs on the writable rootfs; /mnt/disk is mounted
+# read-only. ENTRAIN_PROGRAMS is separate so it can point at that volume.
+ENV := ENTRAIN_HOME=/tmp/entrain-data ENTRAIN_PROGRAMS=/tmp/entrain-data/programs
+
+run: stop push fbcon-off
+	-$(SSH) $(DEVICE) '$(ENV) /tmp/entrain --backend fbdev --buttons $(RUNARGS)'
+	@$(MAKE) -f Makefile.n31 fbcon-on
+
+# Same, but detached with a log, which is what you want when the point is to
+# look at the screen rather than at a terminal.
+run-bg: stop push fbcon-off
+	$(SSH) $(DEVICE) 'killall entrain 2>/dev/null; sleep 1; \
+	  $(ENV) /tmp/entrain --backend fbdev --buttons $(RUNARGS) \
+	  > /tmp/entrain.log 2>&1 < /dev/null & sleep 3; cat /tmp/entrain.log'
+
+log: $(KEY)
+	-$(SSH) $(DEVICE) 'cat /tmp/entrain.log'
+
+# busybox on this initramfs has no killall or pkill on PATH, so the pid has to
+# come out of ps.
+stop: $(KEY)
+	-@$(SSH) $(DEVICE) 'for p in $$(ps | grep "[e]ntrain" | while read pid rest; do echo $$pid; done); do kill -9 $$p 2>/dev/null; done; sleep 1; true'
+
+clean:
+	rm -rf $(BUILD)

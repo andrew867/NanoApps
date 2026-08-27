@@ -1,0 +1,10 @@
+# Entrain user program.
+# Everything but a seg line is optional; see apps/entrain/README.md.
+
+name    Evening Slide
+mode    binaural
+carrier 200
+
+seg     10   7    600      # 10 min, alpha down to the theta border
+seg     7    4    900      # 15 min into theta
+seg     4    2    900      # 15 min into delta

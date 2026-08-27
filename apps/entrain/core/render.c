@@ -68,6 +68,14 @@ static void render_inner(en_render_t *r, const en_segment_t *seg, int16_t *out,
     double tone_level = seg->start.tone_level;
     double noise_level = seg->start.noise_level;
 
+    /* The segment decides the noise kind, not whoever called en_render_init.
+       Without this a preset with a pink bed renders through whatever generator
+       the renderer happened to be initialised with — and if that was NONE, the
+       bed is silent while the level says otherwise. Re-seed only on a real
+       change, so a steady render keeps one continuous noise stream. */
+    if (seg->noise != r->noise.kind)
+        en_noise_init(&r->noise, seg->noise, 0x9E3779B9u);
+
     for (uint32_t i = 0; i < n; i += EN_CTRL_BLOCK) {
         uint32_t block = n - i;
         if (block > EN_CTRL_BLOCK) block = EN_CTRL_BLOCK;
