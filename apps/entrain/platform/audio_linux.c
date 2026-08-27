@@ -27,6 +27,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <time.h>
+#include <errno.h>
 
 #include <tinyalsa/asoundlib.h>
 
@@ -101,8 +102,12 @@ static int pcm_try_open(uint32_t rate)
     cfg.stop_threshold = 0;
     cfg.silence_threshold = 0;
 
+    /* Non-blocking on purpose. The writer paces itself against the monotonic
+       clock, so it never needs the sink to block — and a blocking write into a
+       driver that is still being brought up is a good way to end up stuck in
+       an uninterruptible wait that nothing can clear. */
     struct pcm *p = pcm_open((unsigned)s_card, (unsigned)s_device,
-                             PCM_OUT, &cfg);
+                             PCM_OUT | PCM_NONBLOCK, &cfg);
     if (!p) return 0;
     if (!pcm_is_ready(p)) {
         pcm_close(p);
@@ -202,11 +207,15 @@ static void *writer(void *arg)
         if (!produce()) continue;
 
         if (s_pcm) {
-            if (pcm_writei(s_pcm, s_mix, EN_PERIOD_FRAMES) < 0) {
-                /* An underrun, or a codec that has gone away. Re-prepare once;
-                   if the device is truly gone, drop to the null sink rather
-                   than spinning on a dead handle. */
-                if (pcm_prepare(s_pcm) < 0) {
+            int rc = pcm_writei(s_pcm, s_mix, EN_PERIOD_FRAMES);
+            if (rc < 0) {
+                /* With a non-blocking handle, "buffer full" is the normal
+                   case whenever we are slightly ahead, and it is not an
+                   error — the pacing below absorbs it. Anything else is an
+                   underrun or a codec that has gone away: re-prepare once,
+                   and if that fails drop to the null sink rather than
+                   spinning on a dead handle. */
+                if (rc != -EAGAIN && pcm_prepare(s_pcm) < 0) {
                     pcm_close(s_pcm);
                     s_pcm = NULL;
                     s_null_sink = 1;

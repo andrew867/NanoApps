@@ -66,4 +66,10 @@ void en_ui_set_first_run(bool first_run);
    way to reach a tab to look at it. */
 void en_ui_set_tab(int tab);
 
+/* Suppress the blank-while-playing timer. Useful while bringing a device up:
+   a screen that goes dark after thirty seconds is indistinguishable from an
+   app that has crashed, and on a port with no working touchscreen there may be
+   nothing able to wake it again. */
+void en_ui_set_blanking(bool enabled);
+
 #endif /* ENTRAIN_UI_H */

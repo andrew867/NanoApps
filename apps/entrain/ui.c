@@ -138,6 +138,7 @@ static int s_prog_cycle = -1;
 /* screen blanking */
 static uint32_t s_last_touch_ms;
 static bool     s_blanked;
+static bool     s_blanking_allowed = true;
 
 static const uint32_t SLEEP_CHOICES[] = { 0, 15 * 60, 30 * 60, 45 * 60,
                                           60 * 60, 90 * 60 };
@@ -315,7 +316,7 @@ static void wake_screen(void)
 
 static void blank_tick(void)
 {
-    if (!P.blank_while_playing || P.blank_delay_s <= 0) {
+    if (!s_blanking_allowed || !P.blank_while_playing || P.blank_delay_s <= 0) {
         if (s_blanked) wake_screen();
         return;
     }
@@ -1320,6 +1321,12 @@ static void build_first_run(void)
 void en_ui_set_first_run(bool first_run)
 {
     P.seen_first_run = first_run ? 0 : 1;
+}
+
+void en_ui_set_blanking(bool enabled)
+{
+    s_blanking_allowed = enabled;
+    if (!enabled) wake_screen();
 }
 
 void en_ui_set_tab(int tab)

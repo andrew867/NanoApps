@@ -132,20 +132,41 @@ struct en_input_event {
 
 #define EN_EV_KEY 0x01
 
-#define EN_MAX_INPUT_FDS 8
+/* One slot per /dev/input/eventN, indexed by N, so a device that disappears
+   and comes back at the same number refills its own slot. */
+#define EN_MAX_INPUT_FDS 16
 static int s_input_fd[EN_MAX_INPUT_FDS];
-static int s_input_count;
 static int s_trace_keys;
+static uint32_t s_last_scan_ms;
 
-static void input_open_all(void)
+/* How often to look for devices that have appeared since the last scan. Cheap:
+   a handful of open() calls on a machine with three input nodes. */
+#define EN_INPUT_RESCAN_MS 2000
+
+static void input_scan(int first_time)
 {
-    for (int i = 0; i < 32 && s_input_count < EN_MAX_INPUT_FDS; i++) {
+    int total = 0, opened = 0;
+    for (int i = 0; i < EN_MAX_INPUT_FDS; i++) {
+        if (s_input_fd[i] >= 0) { total++; continue; }
         char path[64];
         snprintf(path, sizeof path, "/dev/input/event%d", i);
         int fd = open(path, O_RDONLY | O_NONBLOCK);
-        if (fd >= 0) s_input_fd[s_input_count++] = fd;
+        if (fd >= 0) {
+            s_input_fd[i] = fd;
+            total++;
+            opened++;
+            if (!first_time) printf("input: event%d appeared\n", i);
+        }
     }
-    printf("entrain-host: %d input device(s)\n", s_input_count);
+    if (first_time)  printf("entrain-host: %d input device(s)\n", total);
+    else if (opened) printf("input: %d device(s) open\n", total);
+    s_last_scan_ms = en_sys_millis();
+}
+
+static void input_open_all(void)
+{
+    for (int i = 0; i < EN_MAX_INPUT_FDS; i++) s_input_fd[i] = -1;
+    input_scan(1);
 }
 
 /* Key codes, decoded from the capability bitmaps in
@@ -188,8 +209,28 @@ static int debounced(uint16_t code)
 static void input_poll(void)
 {
     struct en_input_event ev;
-    for (int i = 0; i < s_input_count; i++) {
-        while (read(s_input_fd[i], &ev, sizeof ev) == (ssize_t)sizeof ev) {
+
+    /* Pick up anything that has appeared since the last look. The PMIC buttons
+       were re-registered twice inside one session while their driver was being
+       worked on; without this the app goes on polling a node the kernel has
+       already torn down, and every press after that lands nowhere. */
+    if (en_sys_millis() - s_last_scan_ms >= EN_INPUT_RESCAN_MS) input_scan(0);
+
+    for (int i = 0; i < EN_MAX_INPUT_FDS; i++) {
+        if (s_input_fd[i] < 0) continue;
+
+        for (;;) {
+            ssize_t n = read(s_input_fd[i], &ev, sizeof ev);
+            if (n != (ssize_t)sizeof ev) {
+                /* Anything but "nothing to read" means the node has gone.
+                   Drop it; the next scan reopens it if it comes back. */
+                if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    printf("input: event%d went away (errno %d)\n", i, errno);
+                    close(s_input_fd[i]);
+                    s_input_fd[i] = -1;
+                }
+                break;
+            }
             if (ev.type != EN_EV_KEY || ev.value != 1) continue;   /* press only */
             if (s_trace_keys)
                 printf("key %u down (event%d)\n", ev.code, i);
@@ -246,6 +287,7 @@ static void usage(void)
            "  --demo N       walk through every screen, N seconds each\n"
            "  --screen NAME  start on a named screen (library, now-playing, ...)\n"
            "  --tab N        Library tab: 0 presets, 1 programs, 2 custom\n"
+           "  --exit-after N quit after N seconds, so a test run cleans up\n"
            "  --preset N     start playing preset N\n"
            "  --program N    start playing program N\n"
            "  --card C [D]   ALSA card and device (default 0 0)\n"
@@ -265,6 +307,8 @@ int main(int argc, char **argv)
     int start_program = -1;
     int start_preset = -1;
     int start_tab = -1;
+    int exit_after = 0;
+    int no_blank = 0;
     const char *start_screen = NULL;
 
     for (int i = 1; i < argc; i++) {
@@ -291,6 +335,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--preset") && has) start_preset = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--tab") && has) start_tab = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--screen") && has) start_screen = argv[++i];
+        else if (!strcmp(argv[i], "--exit-after") && has) exit_after = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--no-blank")) no_blank = 1;
         else if (!strcmp(argv[i], "--null-audio")) {
             if (en_audio_linux_force_null) en_audio_linux_force_null(1);
         }
@@ -310,6 +356,11 @@ int main(int argc, char **argv)
     }
     if (shot_dir && !backend) backend = "headless";
     if (!backend) backend = "sdl";
+
+    /* Line-buffer stdout. Redirected to a file it would otherwise be block
+       buffered, and a diagnostic that only appears once 4 KB has accumulated
+       is indistinguishable from one that never fired. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
 
     lv_init();
     lv_tick_set_cb(en_sys_millis);
@@ -362,6 +413,7 @@ int main(int argc, char **argv)
     if (use_buttons) input_open_all();
     en_ui_init();
 
+    if (no_blank) en_ui_set_blanking(false);
     if (start_tab >= 0) en_ui_set_tab(start_tab);
     if (start_preset >= 0)  en_engine_play_preset(start_preset);
     if (start_program >= 0) en_engine_play_program(start_program);
@@ -419,7 +471,14 @@ int main(int argc, char **argv)
     uint32_t next_walk = en_sys_millis() + (uint32_t)demo_seconds * 1000u;
     unsigned walk_i = 0;
 
+    uint32_t deadline = exit_after > 0
+                      ? en_sys_millis() + (uint32_t)exit_after * 1000u : 0;
+
     while (!en_sys_exit_requested()) {
+        if (deadline && en_sys_millis() >= deadline) {
+            printf("exit-after %ds reached\n", exit_after);
+            break;
+        }
         if (use_buttons) input_poll();
 
         /* With no touchscreen on this port, a timed walk is the only way to
