@@ -284,6 +284,8 @@ static const fmt_case_t FMT_CASES[] = {
     { "s32s16.wav",  "32000 16 st" },
     { "s22s16.wav",  "22050 16 st" },
     { "s16s16.wav",  "16000 16 st" },
+    { "s11s16.wav",  "11025 16 st" },
+    { "s08s16.wav",  " 8000 16 st" },
     { "s44m16.wav",  "44100 16 mono" },
     { "s44s08.wav",  "44100  8 st" },
     { "s44s24.wav",  "44100 24 st" },
@@ -747,8 +749,13 @@ static void test_latency(void)
 
 /* ---- T7: does loadFile buffer the whole file? ---------------------------- */
 
+/* Static RE of SoundEffectDescriptor::loadFile (VA 0x08417f78) shows a hard
+ * reject of any load over 1 MiB. These bracket that boundary: sz1023k should
+ * load, sz1025k should come back rc=1. If it does, the constant is confirmed
+ * and the whole preset budget follows from it. */
 static const char *SIZE_CASES[] = {
-    "t1s.wav", "sz01m.wav", "sz04m.wav", "sz08m.wav", "loop100.wav", "sz32m.wav"
+    "t1s.wav", "szhalf.wav", "sz0900k.wav", "sz1023k.wav", "sz1025k.wav",
+    "sz04m.wav", "loop783.wav"
 };
 #define N_SIZE_CASES ((int)(sizeof SIZE_CASES / sizeof SIZE_CASES[0]))
 
@@ -825,20 +832,20 @@ static void test_subrange(void)
     lg("file can hold every segment and");
     lg("we seek instead of re-render.");
     lg("");
-    lg("loop100.wav, 44-byte header,");
-    lg("44100*4 B/s. Window = 10s in,");
-    lg("5s long.");
+    lg("sz0900k.wav, 44-byte header,");
+    lg("44100*4 B/s. Window = 2s in,");
+    lg("2s long.");
     lg("");
 
     const uint32_t hdr = 44;
     const uint32_t bps = 44100u * 4u;
-    uint32_t off = hdr + bps * 10u;
-    uint32_t len = bps * 5u;
+    uint32_t off = hdr + bps * 2u;
+    uint32_t len = bps * 2u;
 
     chk("sub ctor");
     sfx_ctor(g_desc_a);
     chk("sub load");
-    int rc = sfx_load(g_desc_a, SPIKE_DIR "loop100.wav", VOL_MAIN, off, len);
+    int rc = sfx_load(g_desc_a, SPIKE_DIR "sz0900k.wav", VOL_MAIN, off, len);
     chk("sub fields");
     hb_trace_log("SPK8", off, (uint32_t)rc);
 

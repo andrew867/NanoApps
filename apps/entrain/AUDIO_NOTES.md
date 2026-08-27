@@ -1,282 +1,326 @@
 # Entrain — Phase 0 audio capability notes
 
 What the iPod nano 7G's OS audio path can and cannot do, and what that forces
-on the design of a real-time entrainment tone player.
+on the design of an entrainment tone player.
 
-**Status of this document: partial.** Every claim below is tagged with how it
-was established. Nothing here was measured on hardware yet — no iPod was
-attached to the development machine during Phase 0, so the questions that need
-a device are marked `OPEN` and are answered by `harnesses/audio_spike`, which
-is written, builds clean (14 KB), and is ready to run.
+**How these answers were obtained.** No iPod was attached during Phase 0, so
+nothing here is a device measurement. Most of it is instead **static
+disassembly of RetailOS 1.1.2** (`osos.live.bin`, `39A10023`, flat load base
+`0x08000000`, so VA = file offset + `0x08000000`), which turned out to answer
+more, and more precisely, than the on-device probe would have. Every claim
+cites the virtual address it came from so it can be re-checked.
+
+`harnesses/audio_spike` is written, builds clean, and now serves a second
+purpose: several of its tests are framed as **predictions** that either confirm
+the disassembly or refute it.
 
 | Tag | Meaning |
 | --- | --- |
-| `SOURCE` | Directly stated by, or plainly readable from, code in this repo |
-| `INFERRED` | Follows from the source with a stated argument; high confidence |
-| `OPEN` | Needs the device. The harness test that settles it is named |
+| `DISASM` | Read directly out of RetailOS 1.1.2 machine code, with the VA cited |
+| `SOURCE` | Stated by code in this repo |
+| `INFERRED` | Follows from the above with a stated argument |
+| `OPEN` | Still needs the device. The harness test that settles it is named |
 
 ---
 
-## The API we have
+## Headline: loads are capped at 1 MiB
 
-`sdk/hb_audio.c` wraps four firmware entry points in the OS's sound-effect
-player, the thing that plays the volume beep and the shake chime:
+`SoundEffectDescriptor::loadFile` (VA `0x08417f78`) at VA `0x08418018`:
 
-```c
-sfxDesc::ctor      (0x08417efc)  desc -> desc
-sfxDesc::loadFile  (0x08417f78)  (desc, path, volumeId, offset, size) -> int rc
-sfxPlayer::instance(0x08417eb8)  () -> player
-sfxPlayer::play    (0x0841828c)  (player, desc, callback, cbdata) -> void
+```
+ldr   r0, [sp, #12]          ; byte count to load
+cmp.w r0, #1048576           ; 1 MiB
+bls   continue
+movs  r5, #1                 ; -> return 1
+b     bail
 ```
 
-The descriptor is 0x78 bytes. Four fields are identified; **0x74 of the 0x78
-bytes are unmapped**, which is where most of the open questions live.
+`DISASM`. **Any load over 1,048,576 bytes is rejected outright with rc=1.**
 
-| Offset | Name | Known values |
+This is the single most consequential fact in Phase 0. The brief's primary
+asset — a 100-second 44.1 kHz stereo loop, 17.6 MB — **cannot be loaded at
+all**. The whole preset budget has to be rebuilt around this number, and it is
+rebuilt below. It survives, but only because sample rate is a free variable.
+
+Harness **T7** brackets the constant with a 1,047,596-byte file (predict: loads)
+and a 1,049,644-byte file (predict: rc=1). If those two come back as predicted,
+the constant is confirmed on hardware.
+
+---
+
+## The descriptor, from the constructor
+
+`SoundEffectDescriptor::ctor` (VA `0x08417efc`) initialises all 0x78 bytes.
+`DISASM`. The SDK knew four fields; this is the rest of the map that matters:
+
+| Offset | Ctor default | What it is |
 | --- | --- | --- |
-| 0x24 | volume | `0..0x7fff` |
-| 0x51 | playmode | `1` = play. Other values unknown |
-| 0x52 | flags | `0` = none. Other bits unknown |
-| 0x54 | next-sfx | pointer, always set to `NULL` by the SDK |
+| 0x00 | `0x087ae660` | vtable |
+| 0x04 / 0x08 | 0 / 0 | decoded PCM buffer pointer (both slots) |
+| 0x0C | 0 | decoded buffer size |
+| 0x10 | 0 | container-type enum, set by `loadFile` |
+| **0x14** | **44100** | **sample rate**, overwritten from the decoded stream |
+| **0x18** | **1** | **channel count**, overwritten from the decoded stream |
+| **0x1C** | **16** | **bits per sample — `loadFile` hard-writes 16 here** |
+| 0x20 | 1024 | frame/block size |
+| 0x24 | 0x7fff | volume (this is the one the SDK sets) |
+| 0x28 | 1000 | — |
+| 0x51 | 0 | "playmode" — **never read by `play()`** |
+| 0x52 | 0 | flags — bit `0x04` and bit `0x02` are read by `play()` |
+| 0x54 | 0 | the SDK calls this "next sfx" — **never read by `play()`** |
+| **0x58 / 0x5C / 0x60** | **0x7fff / 0 / 0** | **volume-envelope triple**, skipped when 0x58 == 0x7fff |
+| 0x68 / 0x6C | −1 / −1 | routing ids, consulted under flags bit 0x04 |
+| 0x74 | heap ptr | 8-byte lock/mutex object |
 
-Two details in that table are the most interesting things in the whole spike,
-and both are currently thrown away by the SDK:
+Two corrections to the SDK's picture:
 
-- **`play()` takes a callback and a cbdata.** The SDK passes `NULL, NULL`. If
-  that is a completion callback, gapless chaining becomes straightforward.
-- **The descriptor has a `next` pointer.** A "next" field in a playable object
-  is the signature of an intrusive queue. If the player follows it, we get
-  gapless sequencing for free — and a self-referential `next` might give an
-  infinite loop for free.
-
-Neither is proven. Both are cheap to test, and `harnesses/audio_spike` T3b and
-T5 test exactly them.
+- **`0x54` is not a chain pointer.** It is zeroed by the constructor and never
+  read by `play()`. My first pass through the disassembly appeared to find list
+  splices writing to `[rX, #84]` — those turned out to be the ASCII bytes of the
+  error strings being mis-decoded as Thumb. There is **no evidence of descriptor
+  chaining**, so the "free gapless sequencing" idea is dead.
+- **`0x58/0x5C/0x60` is a real volume envelope** the SDK never touches, and it
+  looks like mixer-side fades for free. See "what to try next".
 
 ---
 
 ## Question by question
 
-### 0. Does the mixer preserve left/right? `OPEN` — this one is make-or-break
+### 1. What formats load? `DISASM` in part, `OPEN` on the accepted list
 
-Not on the original question list, but it outranks all of them: **if the SFX
-path downmixes to mono, binaural mode is impossible**, not merely degraded. A
-binaural beat exists only as the difference between what each ear receives.
+- **Bit depth is not a variable.** `loadFile` writes a literal 16 to `desc+0x1C`
+  (VA `0x08418094`). Everything is converted to 16-bit. `DISASM`
+- **Sample rate and channel count come from the decoded stream** and are stored
+  to `desc+0x14` / `desc+0x18` (VA `0x08418090`, `0x08418098`). `DISASM`
+  A channel count that propagates end to end is good evidence that **stereo is
+  carried, not downmixed** — see question 0.
+- **It is not a WAV loader.** `loadFile` gets a parser from a factory and calls
+  through a vtable, then maps a container enum through four accepted values
+  (2, 0, 5, 4 → stored at `desc+0x10`), rejecting anything else with
+  *"SoundEffectDescriptor::loadFile Format not supported/recognized"* (string at
+  VA `0x0866f9c0`). Type 4 gets an extra packet-table walk, which is what a
+  compressed format needs. `DISASM`
+- **Which rates are accepted is still `OPEN`**, and it is now the most important
+  open question in the project — see the budget below. Harness **T1**, which now
+  includes 11025 Hz and 8000 Hz cases specifically because of this.
 
-This path exists to play system beeps. Nothing guarantees it is stereo, and
-nothing in the SDK comments mentions channels at all.
+### 2. Does play block? `INFERRED` → no
 
-- Harness: **T0**, plays `lr.wav` — 440 Hz left only, gap, 880 Hz right only.
-- If it downmixes: binaural mode is cut from v1; **isochronic** (single carrier,
-  amplitude-gated) and **monaural** (both tones both ears) still work correctly
-  on a mono path, and isochronic is the speaker-friendly mode anyway. The UI
-  should then not offer a binaural toggle rather than offering a broken one.
+Three converging arguments. `hb_audio_play_wav` returns `pthread_create`'s
+result (`SOURCE`). The SDK's job struct comments that the descriptor "must
+outlive playback" — only true of a call that already returned (`SOURCE`). And
+`sfxPlayer::play` ends by calling `voice->start()` and immediately unlocking and
+returning `void` (VA `0x08418300`, `DISASM`). It hands off to the mixer.
 
-### 1. What WAV formats load? `OPEN`
+Confirmed on device by **T2**.
 
-Nothing in the repo documents sample rate, bit depth, or channel count — the
-SDK header calls them "handled by opaque OS pointers", and the only known-good
-files are the OS's own `Resources/Sounds/*.wav`, whose headers we cannot read
-without a device.
+### 3. Can we tell when playback finishes? `DISASM` → yes, the callback is real
 
-- Harness: **T1** loads eleven containers (44.1/48/32/22.05/16 kHz, 16/8/24-bit,
-  float32, mono, `WAVE_FORMAT_EXTENSIBLE`, and a file with a `LIST` chunk ahead
-  of `data`) and reports `loadFile` rc for each. `LIST` is included because a
-  chunk-walking bug is the single commonest reason a hand-rolled parser rejects
-  a valid WAV, and our own writer must avoid tripping it.
-- **Accepted ≠ played at the stated rate.** A loader that ignores the header
-  rate plays a 48 kHz file 8.8% fast. **T2** measures true output rate by timing
-  a file of exactly known duration, which catches that.
+`sfxPlayer::play(player, desc, cb, cbdata)` at VA `0x084182f0`:
 
-Working assumption until measured: **44.1 kHz, 16-bit, stereo, PCM, canonical
-44-byte header**. It is what the hardware natively runs and what the renderer
-targets; if T1 says otherwise, only `wavout.c` changes.
+```
+cmp.w r9, #0          ; r9 = cb
+beq   skip
+ldr   r2, [sp, #12]   ; cbdata (the saved 4th argument)
+mov   r1, r9          ; cb
+mov   r0, r7          ; the voice
+blx   0x0862dfd4      ; voice->setCallback(cb, cbdata)
+skip:
+mov   r0, r7
+blx   0x08630154      ; voice->start()
+```
 
-### 2. Does play block or return immediately? `INFERRED` — returns immediately
+`DISASM`. **The callback argument the SDK always passes as NULL is a real,
+plain `(function, context)` pair**, registered on the voice immediately before
+it starts. It is not a C++ member thunk — there is no `this`-adjustment and no
+second pointer — so passing an ordinary C function is safe.
 
-Two independent arguments from `sdk/hb_audio.c`:
+That is the completion signal Phase 0 was looking for, and it means the design
+does not have to fall back to blind timing. What remains `OPEN` is only *when*
+it fires (end-of-buffer, or every buffer) and its exact argument order —
+harness **T3b** timestamps it against a 5.000 s file, and **T3** independently
+watches all 0x78 descriptor bytes as a cross-check.
 
-1. `hb_audio_play_wav` returns the result of `pthread_create`. It is
-   non-blocking by construction. `SOURCE`
-2. The worker calls `sfxPlayer::play` and immediately returns, and the job
-   struct carries the comment *"the descriptor must outlive playback"*. A
-   descriptor only needs to outlive a call that has already returned. So
-   `sfxPlayer::play` hands the descriptor to an OS audio task and returns.
-   `INFERRED`, high confidence.
+### 4. Queue, cut off, or overlap? `DISASM` → up to 8 voices, they mix
 
-Confirmed by **T2**, which times call→return against a 5.000 s file.
+`play()` acquires a voice from a pool via VA `0x0804d1bc`, and bails silently if
+it gets NULL. That routine:
 
-### 3. Can we tell when playback finishes? `OPEN` — two candidates
+- scans **8 voice slots**, taking the first idle one;
+- if all 8 are busy, scores every voice (VA `0x0863028c`) and **steals the
+  highest-scoring one** — an LRU/priority victim;
+- bumps a 16-bit counter at `voice+0x5C` on each busy voice (VA `0x0862e024`,
+  which is a three-instruction increment, *not* a stop).
 
-No callback, status field, or completion API is exposed today. Two places to
-look, both tested:
+`DISASM`. So: **two sounds started together mix, they do not cut**. Cut-off only
+happens at the ninth simultaneous voice, which we will never approach.
 
-- **The `play()` callback slot.** Harness **T3b** passes a real function pointer
-  that timestamps itself. If it fires at ~5000 ms on a 5 s file, we have a true
-  completion signal. If it reboots, the argument is not a plain C callback (a
-  C++ member thunk, say) and the idea is dead — the trace ring records how far
-  we got either way.
-- **The descriptor.** Harness **T3** polls all 0x78 bytes for 9 s across a 5 s
-  playback and reports, per byte, its first and last change time. A byte that
-  flips at ~5000 ms is the completion marker. This is the highest-value single
-  test in the harness: it either hands us a poll-based "is it done" or proves
-  none exists.
+This is the good news that rescues the seam problem — see below.
 
-If both come up empty, completion must be **timed**. We render the audio
-ourselves, so we know each file's duration to the sample; `hb_time_uptime_ms()`
-gives us the clock. That is workable — see the fallback ladder below.
+### 5. Is there a loop flag? `DISASM` → no, and `0x51` is dead
 
-### 4. Does a second call queue, cut off, or overlap? `OPEN`
+`play()` never reads `desc+0x51` ("playmode") and never reads `desc+0x54`
+("next"). It reads only `desc+0x52`, twice: bit `0x04` gates a routing branch
+involving `desc+0x6C`, and bit `0x02` posts event id 1250. Neither is a loop.
+`DISASM`
 
-`SOURCE`: the SDK header says *"Single-shot only: the descriptor is a static
-buffer. Don't call again until the previous sound has finished."* That is a
-constraint on the SDK's one static descriptor, **not** a statement about the
-player. With two descriptors the behaviour is unknown.
+**There is no loop flag on this path.** Looping must be re-issued by us. The
+harness keeps its T5 sweep anyway — it is cheap, and a mode byte consumed
+further down the mixer would not show up in `play()` — but the expectation is
+now negative, and the design does not depend on it.
 
-`INFERRED`, weak: a system-beep player probably has one voice, so cut-off is
-the most likely answer.
+### 6. Latency? `OPEN`, but the shape is known
 
-- Harness: **T4** plays a 4 s left-only tone, waits 1.5 s, then starts a
-  right-only tone **on a second descriptor** — cut / mix / queue are trivially
-  distinguishable by ear. It then repeats the test reusing one descriptor.
+`loadFile` reserves 20,992 bytes of stack (VA `0x08417f7e`) and does a full
+decode into a fresh heap buffer, so **load cost scales with file size** and is
+the dominant term. `DISASM`. `play()` itself is a lock, a pool scan, three
+virtual calls and an unlock — microseconds. The practical consequence: **do the
+`loadFile` early, keep the `play()` for the moment you need the sound.**
+Harness **T6** puts numbers on it.
 
-This determines whether crossfaded loop joins are possible at all. If the
-player mixes, seams can be hidden with an overlap; if it cuts, they cannot.
+### 7. Whole file into RAM? `DISASM` → yes, ×1.2 plus 8 KB
 
-### 5. Is there a loop flag? `OPEN` — three candidates
+At VA `0x084180ea`:
 
-- `playmode` (0x51) is an enum whose only known value is `1 = play`. An enum
-  with a named value implies siblings. **T5** sweeps it one deliberate tap at a
-  time, tracing before each attempt so a reboot is still attributable.
-- `flags` (0x52), swept bit by bit the same way.
-- **`next` (0x54)** — the most promising. **T5** loads a second descriptor,
-  points A's `next` at B, and plays A; then tries A→A. If the player follows the
-  chain, we have gapless sequencing, and possibly a free infinite loop.
+```
+buffer = max(fileSize * 1.2, 8192) & ~3  +  8192      ; the 1.2 is an f64 constant
+                                                       ; at VA 0x08418284
+desc+0x0C = buffer size
+desc+0x08 = desc+0x04 = alloc(buffer)                  ; VA 0x0842d694
+```
 
-T5 is the risky screen. Every probe is a separate deliberate tap, every one is
-traced first, and there is a SILENCE button as an escape hatch in case a
-self-chain does loop forever.
+`DISASM`. The entire file is decoded into one heap allocation, and the previous
+buffer is freed first (VA `0x08418030`). So at the 1 MiB ceiling a single sound
+costs roughly **1.26 MB of the shared OS heap**.
 
-### 6. Latency from call to first sample? `OPEN`
+`hb_heap.h` warns that the OS's panicking allocator *reboots the device* when an
+allocation fails, and `0x0842d694` sits right beside the allocator it names.
+**Entrain must call `hb_os_heap_largest()` and refuse to load if headroom is
+thin**, rather than letting a failed allocation take the device down.
 
-Not directly observable — nothing reports "first sample out". Contributors we
-can measure separately, in **T6**: pthread spawn, `ctor`, `loadFile` (which does
-the file read, on a ~21 KB stack), `setfields`, and `play`. The best proxy for
-actual audio onset is T3's *first* descriptor-byte change time.
+### 8. Does `(offset, size)` give a window into a file? `DISASM` → yes
 
-Latency matters less here than in most audio apps — nothing is triggered by a
-gesture in real time. It matters in exactly one place: the size of the join
-when one loop hands over to the next.
+`loadFile`'s 4th and 5th arguments, which the SDK hardcodes to zero:
 
-### 7. Max file size; does it stream or load whole? `OPEN`
+- `size` (5th, read at VA `0x08417f8a`) **replaces the stat'd file length** at VA
+  `0x0841800e` — and is then subject to the same 1 MiB cap;
+- `offset` (4th, held in `fp`) is forwarded to the parser's open call at VA
+  `0x08418070`.
 
-`SOURCE`: `loadFile` takes `(offset, size)` beyond the path, which is how you
-reference a region inside a resource bundle. That hints the loader may
-reference rather than copy — but hints are not answers.
+`DISASM`. **A byte window into a larger file is a real capability.** Whether the
+parser treats the offset as a raw byte seek or expects a container header there
+is `OPEN` — harness **T8**.
 
-- Harness: **T7** loads 176 KB / 1 MB / 4 MB / 8 MB / 17.6 MB / 32 MB files and
-  reports, for each, `hb_os_heap_free()` before and after plus the load time.
-  A heap delta tracking file size means the whole file is buffered in RAM (and
-  there is a hard ceiling); a small flat delta means it streams off disk.
-- Harness: **T8** passes a non-zero `(offset, size)` — a 5 s window ten seconds
-  into the 100 s loop. If a window plays, **one rendered file can hold every
-  segment of a program and we seek instead of re-rendering**, which would be a
-  significant architectural simplification.
+### 0. Does the mixer preserve L/R? `INFERRED` → probably, still `OPEN`
 
-The number that matters: our primary asset is a **17.6 MB** 100-second loop
-(100 s × 44100 × 4 B). If loads are whole-file into a shared OS heap, that is a
-lot to hold, and `hb_os_heap_largest()` becomes a real constraint we must check
-at runtime before rendering.
+Not on the original list, but it outranks the rest: if the path downmixes,
+**binaural is impossible, not degraded**, since the beat exists only as the
+difference between the ears.
+
+The evidence is now encouraging rather than unknown: the descriptor carries a
+channel count that `loadFile` populates from the stream (`desc+0x18`), and a
+mono-only path would not need the field. But a channel count in a descriptor is
+not proof that the mixer keeps the channels apart. Harness **T0** settles it in
+ten seconds with headphones on. Isochronic and monaural modes work correctly
+either way.
 
 ---
 
-## What this forces on the architecture
+## What this forces on the design
 
-### Render-then-play, not stream
+### The preset budget, rebuilt around 1 MiB
 
-There is no PCM callback, no ring buffer, and no streaming entry point in the
-SDK — `SOURCE`, and confirmed by reading every audio symbol in `sdk/`. "Real
-time" on this device therefore means **render a file, then hand it to the OS**.
-The brief already anticipates this and the design follows it:
+Bit depth is fixed at 16 and stereo is required for binaural, so the only free
+variable is **sample rate**, and it buys loop length directly:
 
-- **Steady presets → one seamlessly-looping WAV.** Zero CPU while playing.
-- **Programs that ramp → a chain of segments**, phase carried across joins.
-- Render segment N+1 while N plays; cache by realised parameters.
+| Sample rate | Bytes/s | Max loop in 1 MiB | Nyquist |
+| --- | --- | --- | --- |
+| 44100 | 176,400 | 5.94 s | 22.05 kHz |
+| 22050 | 88,200 | 11.89 s | 11.02 kHz |
+| 11025 | 44,100 | 23.78 s | 5.51 kHz |
+| 8000 | 32,000 | 32.77 s | 4.00 kHz |
 
-### The loop-length math holds, and it is exact
+Carriers live at 100–400 Hz and the renderer emits pure sines, so **11025 Hz is
+already luxurious** — its Nyquist is more than an order of magnitude above the
+highest carrier. Dropping the rate costs nothing audible and quadruples the loop
+length. This is why T1's low-rate cases matter more than anything else it tests.
 
-Verified numerically against the generated corpus, not just on paper. For the
-Schumann preset at `SR = 44100`, `T = 100 s`:
+### The beat math still comes out exact
+
+The brief's rule — *pick T from the beat, nudge the carrier, never the beat,
+and display the realised beat* — is what makes the cap survivable. For a beat
+`b = p/q` in lowest terms we need integer cycle counts and an integer sample
+count, i.e. `Δn / T = b` with `T · SR` integral. Worked for Schumann:
 
 ```
-f_L = 200.00 Hz -> 20000 cycles in T   (integer)
-f_R = 207.83 Hz -> 20783 cycles in T   (integer)
-beat = 7.83 Hz exactly, T*SR = 4410000 samples (integer)
+SR = 11025, N = 122500 samples  ->  T = 100/9 s exactly
+n_L = 2222 cycles ->  f_L = 199.98 Hz
+n_R = 2309 cycles ->  f_R = 207.81 Hz
+beat = 87 cycles / (100/9 s) = 7.830000000 Hz   EXACTLY
+file = 490,044 bytes — less than half the cap
 ```
 
-No carrier nudge was even needed for this one. Measured on the rendered file,
-the last-sample → first-sample step is `[466, 485]` (L, R) against a typical
-adjacent-sample step of `[467, 484]` — the wrap is **indistinguishable from an
-interior step**, which is precisely the click test the host suite will assert.
+Verified against the rendered file, not just on paper: the last-sample →
+first-sample step is `[1863, 1935]` (L, R) against a typical interior step of
+`[1839, 1909]` — the wrap is continuous, which is the click test the host suite
+will assert. The file is `wavs/loop783.wav`.
 
-This confirms the rule from the brief and it is the rule `render.c` implements:
-**pick `T` from the beat first, then nudge the carrier, never the beat**, and
-store and display the *realised* frequencies.
+For contrast, the same preset at 44.1 kHz needs `N = 259078` — a 1,036,356-byte
+file, **within 12 KB of the hard cap** and needing a 1.25 MB heap allocation.
+That is the fallback if T1 says low rates are refused, and it is uncomfortable.
 
-### The gapless fallback ladder
+### Seams: overlap, don't chain
 
-We do not yet know whether gapless is achievable. The design must therefore not
-depend on it. In descending order of quality, with the trigger for each:
+Assembling the picture: no loop flag, no descriptor chaining, but a **real
+completion callback** and a **mixer that sums up to 8 voices**. So the loop
+strategy is:
 
-1. **Chained descriptors** (T5 `next` works) — true gapless. Pre-load B, point
-   A→B. Best case; also likely gives looping via a self-chain.
-2. **Completion-signalled re-arm** (T3 or T3b finds a signal) — pre-load the
-   next descriptor fully while the current one plays, then issue only the
-   `play()` call on completion. The gap is one `play()` call, likely low
-   single-digit ms. Inaudible under a tone, and maskable.
-3. **Timed re-arm** (no signal at all) — we know the duration to the sample,
-   so schedule the next `play()` at `T − ε` off `hb_time_uptime_ms()`. Drift and
-   scheduling jitter give a small gap *or* a small overlap. Mitigation: render
-   loops with a short (~20 ms) equal-power crossfade region at the seam so a few
-   ms either way is masked. **This is the fallback we should assume when
-   estimating quality**, and it is good enough to ship.
-4. **Worst case** — the player cuts off, loads are slow, and a seam is audible.
-   Then: make `T` long (the beat math already forces ≥ 100 s), and render the
-   loop to fade to true zero at both ends so the seam is a brief silence rather
-   than a click. A 30 ms dip every 100 s is not premium, but it is honest and
-   it is not a click.
+1. Render the loop with a short (~20 ms) equal-power crossfade region at its
+   ends.
+2. Keep two descriptors. While A plays, B is already `loadFile`d — the expensive
+   step is done well in advance.
+3. Fire B from A's completion callback, or a few ms early off
+   `hb_time_uptime_ms()`. **Because voices mix, a few ms of overlap is not a
+   glitch** — it is the crossfade doing its job. Undershoot is the only bad
+   case, so deliberately overlap.
 
-Rungs 1 and 2 are worth having; **rung 3 is the one to build against**, so that
-whatever the harness reports, v1 ships.
+Loops are now ~12–24 s rather than 100 s, so seams arrive far more often and
+this has to be right. The saving grace is that mixing makes overlap safe, which
+is exactly the property the 100-second design would not have needed and this one
+does. Render with ~3 dB of headroom so two overlapping voices cannot clip.
 
 ### Two constraints that reach into the UI
 
-- **The MIPI-activity rule.** `sdk/hb_audio.c` carries a FIXME: calling the four
+- **The MIPI-activity rule.** `sdk/hb_audio.c` carries a FIXME: calling the
   audio steps back to back without display activity between them *reboots the
-  device*, and empirically only a scale-3 text draw was reliable. `SOURCE`.
-  Note that `apps/files/files.c` calls `hb_audio_play_wav` from an LVGL app with
-  no such interleaving and it works — because the LVGL runtime is compositing
-  continuously and supplying the traffic. **Consequence for Entrain: the
-  screen-blank-during-playback feature must blank the *backlight*
-  (`hb_brightness_power(false)`), never stop the LVGL render loop.** Killing
-  rendering to save battery could take the audio subsystem down with it. This
-  needs an explicit on-device check before that feature ships.
-- **Never leave audio running after exit.** If a loop or chain mode is found,
-  there is no known stop API. Exit must cut playback — currently only possible
-  by starting something short and silent, if cut-off is the semantic (T4). If
-  T4 says "queue" and T5 says "loops forever", we need a stop primitive before
-  shipping loop mode at all.
+  device* (`SOURCE`). `apps/files/files.c` gets away with it because LVGL
+  composites continuously and supplies the traffic. **Consequence: blank the
+  backlight (`hb_brightness_power(false)`), never stop the LVGL render loop.**
+  Killing rendering to save battery could take audio down with it. Needs an
+  explicit on-device check before that feature ships.
+- **Heap discipline.** Every load allocates 1.2× the file plus 8 KB from the
+  shared OS heap through an allocator that panics on failure. Check
+  `hb_os_heap_largest()` before loading, keep files well under the cap (the
+  490 KB Schumann preset is a good model), and free promptly.
 
-### Follow-up for the SDK, not a v1 blocker
+### Follow-ups for the SDK — additive, and not v1 blockers
 
-The README invites SDK expansion. Three additive candidates, all deliberately
-out of scope for v1:
+The disassembly makes three of these concrete rather than speculative:
 
-- `hb_audio_loadfile_range(desc, path, vol, offset, size)` — exposing the two
-  args the SDK currently hardcodes to zero (pending T8).
-- `hb_audio_play_cb(desc, cb, cbdata)` — exposing the callback slot (pending T3b).
-- A real streaming path. Would require finding the OS's PCM sink below the SFX
-  player and is a reverse-engineering project of its own. **v1 does not wait on
-  it.**
+- `hb_audio_play_cb(desc, cb, cbdata)` — expose the callback slot. **The
+  disassembly says this works**; it just needs the on-device confirmation from
+  T3b.
+- `hb_audio_loadfile_range(desc, path, vol, offset, size)` — expose the two
+  arguments hardcoded to zero.
+- `hb_audio_set_envelope(desc, ...)` — `desc+0x58/0x5C/0x60`, skipped when
+  `0x58 == 0x7fff`, is passed to the voice at VA `0x08418328` and looks like a
+  mixer-side volume ramp. If it is, **the 1–2 s raised-cosine start/stop fades
+  could be done by the mixer instead of baked into the PCM**, which would also
+  give a clean way to stop audio on exit. Worth a probe.
+
+The SDK is not widened in v1: `apps/entrain/platform/audio_device.c` calls the
+firmware directly, the same way the harness does, and the wrappers get proposed
+upstream once the device confirms them.
 
 ---
 
@@ -284,14 +328,26 @@ out of scope for v1:
 
 ```bash
 cd harnesses/audio_spike
-python3 gen_spike_wavs.py        # writes ./wavs/, ~43 MB, 22 files
+python3 gen_spike_wavs.py        # writes ./wavs/, 27 files, ~23 MB
 # copy ./wavs/ to the iPod main volume as /WAV/spike/
 cd ../.. && ./start run audio_spike
 ```
 
 Headphones on — T0 and T4 are judged by ear. Results print to the screen and to
 the DRAM trace ring, so `./start trace` recovers them even if a probe reboots
-the device. T5 is the risky screen; read its notes above before using it.
+the device.
 
-When the numbers come back, this document gets rewritten with `OPEN` replaced by
-measurements, and that is what the rest of the app is built against.
+**Predictions to check first**, since these are what the design now rests on:
+
+| Test | Prediction |
+| --- | --- |
+| T7 | `sz1023k.wav` loads; `sz1025k.wav` returns rc=1 |
+| T7 | heap delta ≈ 1.2 × file size + 8 KB |
+| T1 | `s11s16.wav` and `s08s16.wav` load — **the one that matters most** |
+| T3b | the callback fires, once, at ≈ 5000 ms |
+| T4 | A and B play **together**; neither is cut |
+| T5 | no playmode or flags value produces a loop |
+| T0 | left tone then right tone, not both in both cups |
+
+A refutation of any of these is more valuable than a confirmation, and this
+document gets rewritten around it.

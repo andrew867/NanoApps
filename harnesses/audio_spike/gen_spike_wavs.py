@@ -160,6 +160,11 @@ def build(out_dir, big):
     emit("s32s16.wav", gen_stereo_s16(32000, 5.0, 440, 880), 32000, 2, 16)
     emit("s22s16.wav", gen_stereo_s16(22050, 5.0, 440, 880), 22050, 2, 16)
     emit("s16s16.wav", gen_stereo_s16(16000, 5.0, 440, 880), 16000, 2, 16)
+    # Low rates matter more than anything else here: loadFile caps a load at
+    # 1 MiB, so the loop length we can ship is set by the lowest rate the
+    # decoder accepts. 200 Hz carriers need nothing above ~8 kHz.
+    emit("s11s16.wav", gen_stereo_s16(11025, 5.0, 440, 880), 11025, 2, 16)
+    emit("s08s16.wav", gen_stereo_s16(8000, 5.0, 440, 880), 8000, 2, 16)
     emit("s44m16.wav", gen_mono_s16(44100, 5.0, 440), 44100, 1, 16)
     emit("s44s08.wav", s16_to_u8(base44), 44100, 2, 8)
     emit("s44s24.wav", s16_to_s24(base44), 44100, 2, 24)
@@ -187,18 +192,33 @@ def build(out_dir, big):
     #     at the seam and a click means the player restarted badly.
     emit("seam1s.wav", gen_stereo_s16(44100, 1.0, 200, 210), 44100, 2, 16)
 
-    # --- the real thing: a 100 s Schumann loop (7.83 Hz beat, 200 Hz carrier
-    #     nudged to land on an integer cycle count over T=100 s).
-    #     f_L = 200.00 Hz (20000 cycles), f_R = 207.83 Hz (20783 cycles).
-    emit("loop100.wav", gen_stereo_s16(44100, 100.0, 200.0, 207.83), 44100, 2, 16)
+    # --- the real thing. loadFile refuses anything over 1 MiB, so the 100 s
+    #     44.1k loop is impossible; this is the shipping shape instead.
+    #     SR=11025, N=122500 samples -> T = 100/9 s exactly.
+    #     n_L=2222 cycles -> 199.98 Hz, n_R=2309 -> 207.81 Hz.
+    #     Beat = 87 cycles / (100/9 s) = 7.83 Hz EXACTLY, in 490 KB.
+    emit("loop783.wav", gen_stereo_s16(11025, 100.0 / 9.0, 2222 * 9 / 100.0,
+                                       2309 * 9 / 100.0), 11025, 2, 16)
+    # Same preset at 44.1k, to show what the cap costs if low rates are refused:
+    # T is forced down to 5.875 s and the file lands within 12 KB of the limit.
+    emit("loop783_44k.wav", gen_stereo_s16(44100, 259078 / 44100.0,
+                                           2000 * 44100 / 259078.0,
+                                           2046 * 44100 / 259078.0), 44100, 2, 16)
 
     # --- T7: size ladder. Content is a quiet 100 Hz tone; only the byte
     #     count matters. 44.1k/16/stereo = 176400 B/s.
-    ladder = [("sz01m.wav", 1.0), ("sz04m.wav", 4.0), ("sz08m.wav", 8.0)]
+    # Static RE of SoundEffectDescriptor::loadFile says loads over 1 MiB are
+    # rejected outright. Bracket that boundary tightly so the run either
+    # confirms the constant or refutes it, then a couple of coarse probes.
+    ladder = [("szhalf.wav", 512 * 1024),
+              ("sz0900k.wav", 900 * 1024),
+              ("sz1023k.wav", 1023 * 1024),      # just under 1 MiB -> expect ok
+              ("sz1025k.wav", 1025 * 1024),      # just over  1 MiB -> expect rc=1
+              ("sz04m.wav", 4 * 1024 * 1024)]
     if big:
-        ladder.append(("sz32m.wav", 32.0))
-    for name, mb in ladder:
-        secs = (mb * 1024 * 1024) / 176400.0
+        ladder.append(("sz32m.wav", 32 * 1024 * 1024))
+    for name, nbytes in ladder:
+        secs = nbytes / 176400.0
         emit(name, gen_stereo_s16(44100, secs, 100, 100, amp=0.2), 44100, 2, 16)
 
     return made
