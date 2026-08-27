@@ -31,7 +31,11 @@ typedef enum {
     EN_KEY_VOL_UP = 0,
     EN_KEY_VOL_DOWN,
     EN_KEY_PLAY_PAUSE,
-    EN_KEY_BACK          /* home / escape */
+    EN_KEY_BACK,         /* home / escape */
+    /* Start the next program and show it. Exists so a device with no working
+       touchscreen can still get at more than whatever launched first; the
+       N31 Linux port maps its home button to this. */
+    EN_KEY_NEXT_PROGRAM
 } en_key_t;
 
 void en_ui_key(en_key_t key);

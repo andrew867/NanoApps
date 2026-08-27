@@ -131,6 +131,10 @@ static lv_obj_t *s_vol_slider, *s_vol_lbl;
 static lv_obj_t *s_blank_lbl;
 static lv_obj_t *s_motion_sw, *s_blankplay_sw;
 
+/* Which program the next-program key will start. Begins at -1 so the first
+   press plays program 0 rather than program 1. */
+static int s_prog_cycle = -1;
+
 /* screen blanking */
 static uint32_t s_last_touch_ms;
 static bool     s_blanked;
@@ -1420,6 +1424,21 @@ void en_ui_key(en_key_t key)
         if (s_current == EN_SCREEN_LIBRARY) en_sys_request_exit();
         else en_ui_goto(EN_SCREEN_LIBRARY, true);
         break;
+    case EN_KEY_NEXT_PROGRAM: {
+        int n = 0;
+        en_programs(&n);
+        if (n <= 0) break;
+        s_prog_cycle = (s_prog_cycle + 1) % n;
+        if (en_engine_play_program(s_prog_cycle)) {
+            P.last_source = EN_SRC_PROGRAM;
+            P.last_index = s_prog_cycle;
+            prefs_save();
+            en_engine_set_sleep_timer((uint32_t)P.sleep_timer_s);
+            s_tab = 1;
+            en_ui_goto(EN_SCREEN_NOW, true);
+        }
+        break;
+    }
     }
 }
 

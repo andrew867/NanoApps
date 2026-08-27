@@ -148,8 +148,13 @@ static void input_open_all(void)
     printf("entrain-host: %d input device(s)\n", s_input_count);
 }
 
-/* Key codes as the kernel defines them. Which of these n31-buttons actually
-   emits is what --trace-keys is for. */
+/* Key codes, decoded from the capability bitmaps in
+   /proc/bus/input/devices rather than assumed:
+
+     n31-buttons       KEY=1010 0 1c0000 0 0 0  ->  114 115 116 164 172
+     n31-pmic-buttons  KEY=1010 0 100000 0 0 0  ->  116 164 172
+
+   POWER is deliberately not mapped; that one belongs to the system. */
 #define EN_KEY_ESC        1
 #define EN_KEY_VOLUMEDOWN 114
 #define EN_KEY_VOLUMEUP   115
@@ -160,6 +165,26 @@ static void input_open_all(void)
 #define EN_KEY_NEXTSONG   163
 #define EN_KEY_PREVSONG   165
 
+/* Both input nodes declare PLAYPAUSE and HOMEPAGE, so one physical press can
+   surface on both and be handled twice. Anything closer together than this is
+   the same press. */
+#define EN_KEY_DEBOUNCE_MS 250
+
+static int s_home_cycles;
+
+/* True if this code arrived too soon after the last one to be a new press. */
+static int debounced(uint16_t code)
+{
+    static uint16_t last_code;
+    static uint32_t last_ms;
+    uint32_t now = en_sys_millis();
+
+    if (code == last_code && now - last_ms < EN_KEY_DEBOUNCE_MS) return 1;
+    last_code = code;
+    last_ms = now;
+    return 0;
+}
+
 static void input_poll(void)
 {
     struct en_input_event ev;
@@ -168,6 +193,8 @@ static void input_poll(void)
             if (ev.type != EN_EV_KEY || ev.value != 1) continue;   /* press only */
             if (s_trace_keys)
                 printf("key %u down (event%d)\n", ev.code, i);
+            if (debounced(ev.code)) continue;
+
             switch (ev.code) {
             case EN_KEY_VOLUMEUP:   en_ui_key(EN_KEY_VOL_UP);     break;
             case EN_KEY_VOLUMEDOWN: en_ui_key(EN_KEY_VOL_DOWN);   break;
@@ -175,7 +202,12 @@ static void input_poll(void)
             case EN_KEY_NEXTSONG:   en_ui_key(EN_KEY_PLAY_PAUSE); break;
             case EN_KEY_HOMEPAGE:
             case EN_KEY_BACKKEY:
-            case EN_KEY_ESC:        en_ui_key(EN_KEY_BACK);       break;
+            case EN_KEY_ESC:
+                /* Home means "go back" on a device you can touch. With no
+                   touchscreen there is nowhere useful to go back to, so on
+                   this port it steps through the programs instead. */
+                en_ui_key(s_home_cycles ? EN_KEY_NEXT_PROGRAM : EN_KEY_BACK);
+                break;
             default: break;
             }
         }
@@ -183,6 +215,7 @@ static void input_poll(void)
 }
 
 #else
+static int s_home_cycles;
 static void input_open_all(void) {}
 static void input_poll(void) {}
 #endif
@@ -208,6 +241,7 @@ static void usage(void)
            "  --evdev PATH   touch device for fbdev/drm backends\n"
            "  --first-run    show the headphone notice\n"
            "  --buttons      drive the UI from /dev/input (no touchscreen yet)\n"
+           "  --home-cycles  home steps through the programs instead of going back\n"
            "  --trace-keys   print every key code, to find out what the buttons send\n"
            "  --demo N       walk through every screen, N seconds each\n"
            "  --screen NAME  start on a named screen (library, now-playing, ...)\n"
@@ -242,6 +276,10 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--evdev") && has) evdev_path = argv[++i];
         else if (!strcmp(argv[i], "--first-run")) first_run = 1;
         else if (!strcmp(argv[i], "--buttons")) use_buttons = 1;
+        else if (!strcmp(argv[i], "--home-cycles")) {
+            use_buttons = 1;
+            s_home_cycles = 1;
+        }
         else if (!strcmp(argv[i], "--trace-keys")) {
             use_buttons = 1;
 #ifdef __linux__
