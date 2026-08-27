@@ -1,0 +1,72 @@
+# Makefile.host — build Entrain's DSP and UI on a Linux desktop.
+#
+# core/ is pure C99 with no LVGL and no SDK, so it compiles here unchanged and
+# can be tested, and listened to, without an iPod attached.
+#
+#   make -f Makefile.host test        run the unit tests
+#   make -f Makefile.host wav         build the offline renderer
+#   make -f Makefile.host run         build and run the UI at 240x432
+#
+# The UI target needs LVGL. It uses the same checkout ./start pins for the
+# device build (../../../lvgl), so there is nothing extra to fetch.
+
+CC      ?= cc
+CORE    := ../core
+LVGL    ?= ../../../lvgl
+BUILD   := build
+
+CORE_SRCS := $(CORE)/osc.c $(CORE)/noise.c $(CORE)/render.c \
+             $(CORE)/program.c $(CORE)/wavout.c
+
+WARN    := -Wall -Wextra -Wshadow -Wpointer-arith -Wcast-qual -Wstrict-prototypes
+CFLAGS  ?= -O2 -g -std=c99 $(WARN)
+LDLIBS  := -lm
+
+.PHONY: all test wav run clean
+
+all: test
+
+$(BUILD):
+	@mkdir -p $(BUILD)
+
+# ---- unit tests ------------------------------------------------------------
+
+$(BUILD)/tests: tests.c $(CORE_SRCS) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+test: $(BUILD)/tests
+	@./$(BUILD)/tests
+
+# ---- offline renderer ------------------------------------------------------
+# Render any preset or program to a .wav so it can be listened to on real
+# speakers, or dropped straight onto the iPod.
+
+$(BUILD)/entrain-wav: wavtool.c $(CORE_SRCS) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+wav: $(BUILD)/entrain-wav
+	@echo "built $(BUILD)/entrain-wav — try: ./$(BUILD)/entrain-wav --list"
+
+# ---- the UI ----------------------------------------------------------------
+# LVGL v9 on the Linux framebuffer or DRM, forced to 240x432 so what you see
+# here is exactly what the device gets.
+
+LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_host.h\" \
+             -I$(LVGL) -I$(LVGL)/src -I$(LVGL)/../
+LV_SRCS   := $(shell find $(LVGL)/src -name '*.c' \
+               -not -path '*/osal/lv_freertos.c' \
+               -not -path '*/osal/lv_cmsis*' \
+               -not -path '*/osal/lv_mqx*' \
+               -not -path '*/osal/lv_rtthread*' \
+               -not -path '*/osal/lv_windows*' \
+               -not -path '*/libs/*' \
+               2>/dev/null) $(LVGL)/src/lv_init.c
+
+$(BUILD)/entrain-host: main_host.c audio_host.c $(CORE_SRCS) | $(BUILD)
+	$(CC) $(CFLAGS) $(LV_CFLAGS) -o $@ $^ $(LV_SRCS) $(LDLIBS) -lpthread
+
+run: $(BUILD)/entrain-host
+	./$(BUILD)/entrain-host
+
+clean:
+	rm -rf $(BUILD)
