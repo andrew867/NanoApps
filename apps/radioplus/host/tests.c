@@ -930,6 +930,49 @@ static void test_sidecar(void)
     CHECK(strstr(whole, "\"duration_ms\":1500") != 0, "duration not written");
 }
 
+static void test_settings(void)
+{
+    section("settings");
+
+    en_settings_t a;
+    en_settings_default(&a);
+    CHECK(a.live_seconds == 30, "default live buffer");
+    CHECK(a.rds_on, "RDS should default on");
+
+    snprintf(a.region, sizeof a.region, "%s", "Japan");
+    a.khz = 82500;
+    a.rds_on = false;
+    a.live_seconds = 60;
+
+    char buf[1024];
+    uint32_t n = en_settings_save(&a, buf, sizeof buf);
+    CHECK(n > 0, "save overflowed");
+    printf("  %s\n", buf);
+
+    en_settings_t b;
+    CHECK(en_settings_load(&b, buf, n), "load failed");
+    CHECK(strcmp(b.region, "Japan") == 0, "region lost: %s", b.region);
+    CHECK(b.khz == 82500, "frequency lost");
+    CHECK(!b.rds_on, "RDS flag lost");
+    CHECK(b.live_seconds == 60, "buffer size lost");
+
+    /* Stored by name, so adding a row to the region table cannot silently
+       change which band an existing settings file selects. */
+    CHECK(strstr(buf, "\"Japan\"") != 0, "region should be stored by name");
+
+    /* A file from an older build is missing fields rather than wrong, and a
+       missing field has to keep its default - a zero live buffer would be a bug
+       that looked like a setting. */
+    const char *partial = "{\"version\":1,\"region\":\"Europe\"}";
+    en_settings_t c;
+    CHECK(en_settings_load(&c, partial, (uint32_t)strlen(partial)),
+          "partial load failed");
+    CHECK(strcmp(c.region, "Europe") == 0, "region not read");
+    CHECK(c.live_seconds == 30,
+          "a missing field should keep its default, got %u", c.live_seconds);
+    CHECK(c.rds_on, "a missing flag should keep its default");
+}
+
 int main(void)
 {
     printf("Radio+ core tests\n");
@@ -953,6 +996,7 @@ int main(void)
     test_wav();
     test_presets();
     test_sidecar();
+    test_settings();
 
     printf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

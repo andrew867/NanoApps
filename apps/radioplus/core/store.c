@@ -335,6 +335,61 @@ bool en_presets_load(en_presets_t *p, const char *json, uint32_t len)
     return true;
 }
 
+/* ---- settings ------------------------------------------------------------ */
+
+void en_settings_default(en_settings_t *s)
+{
+    if (!s) return;
+    copy_str(s->region, sizeof s->region, "Americas");
+    s->khz = 0;                 /* 0 means "the bottom of whatever band" */
+    s->rds_on = true;
+    s->live_seconds = 30;
+}
+
+uint32_t en_settings_save(const en_settings_t *s, char *buf, uint32_t cap)
+{
+    if (!s || !buf) return 0;
+
+    en_json_t j;
+    en_json_init(&j, buf, cap);
+    en_json_obj_open(&j, 0);
+    en_json_uint(&j, "version", 1);
+    en_json_str(&j, "region", s->region);
+    en_json_uint(&j, "khz", s->khz);
+    en_json_bool(&j, "rds", s->rds_on);
+    en_json_uint(&j, "live_seconds", s->live_seconds);
+    en_json_obj_close(&j);
+    return en_json_done(&j);
+}
+
+bool en_settings_load(en_settings_t *s, const char *json, uint32_t len)
+{
+    if (!s || !json || !len) return false;
+
+    /* Defaults first, then whatever the file happens to carry. A file from an
+       older build is missing fields rather than wrong, and missing should mean
+       default rather than zero - a zero live buffer would be a bug that looked
+       like a setting. */
+    en_settings_default(s);
+
+    const char *end = json + len;
+    uint32_t n = 0;
+
+    const char *v = find_key(json, end, "region");
+    if (v) read_str(v, end, s->region, sizeof s->region);
+
+    v = find_key(json, end, "khz");
+    if (v && read_uint(v, end, &n)) s->khz = n;
+
+    v = find_key(json, end, "rds");
+    if (v) s->rds_on = (*v == 't');
+
+    v = find_key(json, end, "live_seconds");
+    if (v && read_uint(v, end, &n) && n) s->live_seconds = (uint8_t)n;
+
+    return true;
+}
+
 /* ---- the sidecar --------------------------------------------------------- */
 
 static void write_decoded(en_json_t *j, const en_rds_t *r)

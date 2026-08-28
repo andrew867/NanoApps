@@ -85,6 +85,31 @@ void    en_preset_sort(en_presets_t *p);
 uint32_t en_presets_save(const en_presets_t *p, char *buf, uint32_t cap);
 bool     en_presets_load(en_presets_t *p, const char *json, uint32_t len);
 
+/* ---- settings ------------------------------------------------------------ */
+
+/*
+ * What the app remembers between runs. Small on purpose: a settings file is a
+ * thing users edit and copy between devices, and every field in it is one more
+ * thing that can be stale or wrong.
+ *
+ * The region is stored by name rather than by index, because an index means a
+ * settings file written by one build selects a different band in the next one
+ * if the table ever gains a row.
+ */
+typedef struct {
+    char     region[24];
+    uint32_t khz;            /* where to come back to */
+    bool     rds_on;
+    uint8_t  live_seconds;   /* how much live buffer to allocate */
+} en_settings_t;
+
+void     en_settings_default(en_settings_t *s);
+uint32_t en_settings_save(const en_settings_t *s, char *buf, uint32_t cap);
+
+/* Missing fields keep their defaults rather than becoming zero, so a settings
+   file written by an older build still loads. */
+bool     en_settings_load(en_settings_t *s, const char *json, uint32_t len);
+
 /* ---- the RDS sidecar ----------------------------------------------------- */
 
 /*

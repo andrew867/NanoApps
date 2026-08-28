@@ -30,6 +30,8 @@ rp_model_t rp_model;
 static char s_home[256];
 static char s_rec_dir[320];
 static char s_presets_path[320];
+static char s_settings_path[320];
+static en_settings_t s_settings;
 
 /* The recording in progress, and its sidecar. */
 static FILE    *s_sidecar;
@@ -57,6 +59,8 @@ static void paths_init(void)
     mkdir(s_rec_dir, 0755);
 
     snprintf(s_presets_path, sizeof s_presets_path, "%s/presets.json", s_home);
+    snprintf(s_settings_path, sizeof s_settings_path, "%s/settings.json",
+             s_home);
 }
 
 static void presets_load(void)
@@ -88,6 +92,40 @@ static void presets_save(void)
     if (!n) return;
 
     FILE *f = fopen(s_presets_path, "wb");
+    if (!f) return;
+    fwrite(buf, 1, n, f);
+    fclose(f);
+}
+
+static void settings_load(void)
+{
+    en_settings_default(&s_settings);
+
+    FILE *f = fopen(s_settings_path, "rb");
+    if (!f) return;
+    static char buf[2048];
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    en_settings_load(&s_settings, buf, (uint32_t)n);
+}
+
+static void settings_save(void)
+{
+    /* Called whenever something worth remembering changes. Writing a few
+       hundred bytes on a retune is cheaper than losing the station on a flat
+       battery. */
+    if (rp_model.region)
+        snprintf(s_settings.region, sizeof s_settings.region, "%s",
+                 rp_model.region->name);
+    s_settings.khz = rp_model.khz;
+    s_settings.rds_on = rp_model.rds_on;
+
+    char buf[2048];
+    uint32_t n = en_settings_save(&s_settings, buf, sizeof buf);
+    if (!n) return;
+
+    FILE *f = fopen(s_settings_path, "wb");
     if (!f) return;
     fwrite(buf, 1, n, f);
     fclose(f);
@@ -136,7 +174,14 @@ static void bring_up(void)
 {
     paths_init();
 
-    rp_model.region = en_region_find("Americas");
+    settings_load();
+
+    /* The region is stored by name, so a settings file survives the table
+       gaining a row. An unknown name falls back rather than failing. */
+    rp_model.region = en_region_find(s_settings.region);
+    if (!rp_model.region) rp_model.region = en_region_find("Americas");
+
+    rp_model.rds_on = s_settings.rds_on;
     en_rds_init(&rp_model.rds, rp_model.region ? rp_model.region->rbds : true);
 
     en_tuner_err_t te = en_tuner_init();
@@ -148,29 +193,30 @@ static void bring_up(void)
     if (rp_model.tuner_ok) {
         en_tuner_power(true);
         en_tuner_set_region(rp_model.region);
-        en_tuner_rds_enable(true);
-        rp_model.rds_on = true;
+        en_tuner_rds_enable(rp_model.rds_on);
     }
 
     /* Capture is started with the tuner rather than with the record button:
        the SoC side of IIS2 is clocked by the capture PCM, so nothing is
        audible until this is open. It is how the radio makes sound, not just
        how it is recorded. */
-    en_cap_err_t ce = en_cap_start(30);
+    en_cap_err_t ce = en_cap_start(s_settings.live_seconds);
     rp_model.capture_ok = (ce == EN_CAP_OK);
     rp_model.capture_backend = en_cap_backend();
 
     presets_load();
     library_scan();
 
-    /* Start on the first preset if there is one - resuming where you were is
-       better than landing on the bottom of the band. */
-    if (rp_model.presets.count) {
-        rp_model.khz = rp_model.presets.list[0].khz;
-        if (rp_model.tuner_ok) en_tuner_tune(rp_model.khz);
-    } else if (rp_model.region) {
-        rp_model.khz = rp_model.region->low_khz;
-    }
+    /* Come back to where you were. Failing that the first preset, and failing
+       that the bottom of the band - landing on a remembered station is the
+       whole point of remembering one. */
+    uint32_t start = s_settings.khz;
+    if (!start || !en_region_on_grid(rp_model.region, start))
+        start = rp_model.presets.count ? rp_model.presets.list[0].khz
+                                       : (rp_model.region ? rp_model.region->low_khz : 0);
+
+    rp_model.khz = start;
+    if (rp_model.tuner_ok && start) en_tuner_tune(start);
 }
 
 /* ---- the sidecar ---------------------------------------------------------- */
@@ -272,6 +318,7 @@ void rp_act_tune(uint32_t khz)
 {
     rp_model.khz = khz;
     if (rp_model.tuner_ok) en_tuner_tune(khz);
+    settings_save();
 
     /* A new station is a new set of RDS state; carrying the old name over a
        retune is worse than showing nothing for a second. */
@@ -393,4 +440,5 @@ void rp_act_set_region(const en_region_t *rg)
         rp_act_tune(en_region_step(rg, rp_model.khz, true));
 
     presets_save();
+    settings_save();
 }

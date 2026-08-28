@@ -36,6 +36,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include "../core/fmreg.h"
@@ -94,6 +96,33 @@ static en_tuner_err_t attr_read(const char *name, char *buf, size_t n)
     return EN_TUNER_OK;
 }
 
+/* ---- bringing the controller up ------------------------------------------ */
+
+/*
+ * FM rides on hci0, and the driver answers ENETDOWN while it is down. The
+ * device rootfs has no hciconfig, btmgmt or rfkill to bring it up with, so the
+ * app does it directly - this is precisely what hciconfig hci0 up performs.
+ *
+ * Doing it here rather than in a launcher means the radio works when started by
+ * hand, from a menu, or on boot, instead of only through one script.
+ */
+#define BT_AF_BLUETOOTH 31
+#define BT_PROTO_HCI    1
+#define BT_HCIDEVUP     _IOW('H', 201, int)
+
+static bool hci_up(void)
+{
+    int fd = socket(BT_AF_BLUETOOTH, SOCK_RAW, BT_PROTO_HCI);
+    if (fd < 0) return false;
+
+    int r = ioctl(fd, BT_HCIDEVUP, 0);
+    int err = errno;
+    close(fd);
+
+    /* Already up is the common case and is success, not failure. */
+    return r == 0 || err == EALREADY || err == EBUSY;
+}
+
 /* ---- finding the device -------------------------------------------------- */
 
 /* The driver binds under /sys/devices somewhere that depends on how the
@@ -142,9 +171,14 @@ en_tuner_err_t en_tuner_init(void)
 
     /* hci0 has to be up before anything works, because FM_RDS_Command rides on
        it. Say so plainly rather than letting every later call fail. */
+    /* The controller existing is not the same as it being usable, so bring it
+       up rather than reporting on it. If it is missing entirely the driver has
+       not bound and there is nothing to do about that here. */
     bool hci = access("/sys/class/bluetooth/hci0", F_OK) == 0;
+    if (hci) hci = hci_up();
+
     snprintf(s_desc, sizeof s_desc, "bcm2078-bt at %s%s",
-             s_dir, hci ? "" : "  (hci0 down - run n31-bt-up)");
+             s_dir, hci ? "" : "  (no hci0 - is bluetooth loaded?)");
 
     return hci ? EN_TUNER_OK : EN_TUNER_NOT_READY;
 }

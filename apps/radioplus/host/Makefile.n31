@@ -95,13 +95,14 @@ SSH = ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o ConnectTimeout=8 
 # through ssh needs nothing on the far side but a shell.
 push: $(APP) $(KEY)
 	@$(SSH) $(DEVICE) 'cat > /tmp/radioplus && chmod +x /tmp/radioplus' < $(APP)
-	@echo "pushed to $(DEVICE):/tmp/radioplus"
+	@$(SSH) $(DEVICE) 'cat > /tmp/radioplus-start && chmod +x /tmp/radioplus-start' < radioplus-start
+	@echo "pushed $(DEVICE):/tmp/radioplus and /tmp/radioplus-start"
 
 stop: $(KEY)
 	-@$(SSH) $(DEVICE) 'for p in $$(ps | grep "[r]adioplus" | while read pid rest; do echo $$pid; done); do kill -9 $$p 2>/dev/null; done; sleep 1; true'
 
 run: stop push
-	@$(SSH) $(DEVICE) 'RADIOPLUS_HOME=/tmp/radioplus /tmp/radioplus 2>&1 | head -40'
+	@$(SSH) $(DEVICE) '/tmp/radioplus-start 2>&1 | head -40'
 
 clean:
 	rm -rf $(BUILD)
