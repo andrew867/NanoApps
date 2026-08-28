@@ -387,9 +387,9 @@ The function around it:
 
 ```
 854ce54: ldr  r0,[pc]        -> global 0x0896dd00 ; deref, bail if null
-854ce5c: ldr  r0,[pc]        -> template 0x08d09f74
+854ce5c: ldr  r0,[pc]        -> buffer 0x08d09f74 (RAM, not firmware data)
 854ce5e: ldrd r1,r2,[r0]     \
-854ce62: ldr  r0,[r0,#8]      >  12 bytes of canned payload onto the stack
+854ce62: ldr  r0,[r0,#8]      >  12 bytes of live payload onto the stack
 854ce64: strd r1,r2,[sp]     /
 854ce68: add.w r2, sp, #1     ; payload pointer, one byte in
 854ce6c: ldrb.w r1,[sp]       ; that first byte is the payload LENGTH
@@ -413,9 +413,18 @@ What the site is still worth:
   neighbourhood to search for the real send.
 - It gives the **command shape**: `(opcode, length, payload)` with the length as
   a leading byte of the buffer.
-- It names two data anchors: a readiness global at **`0x0896dd00`** (checked
-  non-null before anything is attempted) and a canned 12-byte command template
-  at **`0x08d09f74`**.
+- It names two anchors, and bounds-checking them corrected a second reading.
+  Both are runtime state rather than firmware constants:
+  - **`0x0896dd00`** — in the image, but all zeros, so BSS. This is the global
+    checked non-null before anything is attempted: a handle populated when the
+    FM stack comes up.
+  - **`0x08d09f74`** — **outside the image entirely**, so a RAM address. Not a
+    canned command template as first written up, but a live buffer built at run
+    time. Which means the payload cannot be recovered statically at all, and the
+    command shape has to come from the register table or from the device.
+
+  Cheap habit worth keeping: an address that looks like firmware data is worth
+  checking against the image bounds before any claim is built on it.
 
 ## Where this leaves the two builds
 
