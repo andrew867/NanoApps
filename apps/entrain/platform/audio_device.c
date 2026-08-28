@@ -54,12 +54,17 @@ typedef void *(*sfx_player_inst_t)(void);
 typedef void  (*sfx_player_play_t)(void *player, void *desc,
                                    void *cb, void *cbdata);
 
-/* Start the next buffer this early, in ms. The join is a level bump rather
-   than a gap: the voice pool mixes, and both buffers carry the same waveform
-   at the same absolute phase, so a brief overlap sums to the same signal a
-   little louder — which the 3 dB of render headroom absorbs. A gap, by
-   contrast, would be an audible hole. Better early than late. */
-#define REARM_LEAD_MS 120
+/* Load the next buffer this long before the current one ends. Loading is the
+   expensive step — it reads and decodes the whole file — so doing it ahead of
+   the boundary leaves only the cheap play() call to happen on it.
+
+   Note this is a PRELOAD lead, not a playback lead. An earlier version started
+   the next copy 120 ms early on the theory that overlapping the same waveform
+   is harmless. It is not: restarting a loop early puts the new copy at phase
+   zero while the old one is still 120 ms from its end, so the two are at
+   unrelated phases and the sum comb-filters — which is exactly the "stops and
+   fades in suddenly, not phase consistent" artefact heard on the device. */
+#define PRELOAD_LEAD_MS 900
 
 /* Refuse to load if the OS heap could not take the loader's copy. The loader
    allocates 1.2x the file plus 8 KB through an allocator that panics rather
@@ -80,6 +85,7 @@ static uint8_t  g_desc_b[0x80];
 static uint8_t *g_desc_playing = g_desc_a;
 
 static clip_t   g_cur, g_next;
+static bool     g_preloaded;       /* the spare descriptor holds the next clip */
 static uint32_t g_started_ms;
 static uint32_t g_elapsed_ms;      /* accumulated across re-arms */
 static bool     g_paused;
@@ -187,17 +193,41 @@ static bool play_desc(uint8_t *desc)
     return true;
 }
 
-/* Load into the descriptor that is NOT playing, then swap. Loading is the
-   expensive step and doing it ahead of time is what keeps the join cheap. */
-static bool arm_and_play(const clip_t *c)
+static uint8_t *spare_desc(void)
 {
-    uint8_t *spare = (g_desc_playing == g_desc_a) ? g_desc_b : g_desc_a;
-    if (!load_clip(spare, c)) return false;
+    return (g_desc_playing == g_desc_a) ? g_desc_b : g_desc_a;
+}
+
+/* Load into the descriptor that is NOT playing. Safe to call well before the
+   boundary; that is the whole point. */
+static bool preload(const clip_t *c)
+{
+    if (g_preloaded) return true;
+    if (!load_clip(spare_desc(), c)) return false;
+    g_preloaded = true;
+    return true;
+}
+
+/* Play whatever is already loaded in the spare descriptor and make it current.
+   Nothing here touches the filesystem, so it is cheap enough to sit exactly on
+   the boundary. */
+static bool play_preloaded(void)
+{
+    uint8_t *spare = spare_desc();
+    if (!g_preloaded) return false;
     if (!play_desc(spare)) return false;
     g_desc_playing = spare;
+    g_preloaded = false;
     g_started_ms = hb_time_uptime_ms();
     g_state = EN_AUDIO_PLAYING;
     return true;
+}
+
+static bool arm_and_play(const clip_t *c)
+{
+    g_preloaded = false;
+    if (!preload(c)) return false;
+    return play_preloaded();
 }
 
 /* ---- the interface ------------------------------------------------------- */
@@ -245,6 +275,7 @@ bool en_audio_submit(const char *key, const int16_t *pcm,
 
     g_cur = c;
     g_next.valid = false;
+    g_preloaded = false;
     g_paused = false;
     g_stopping = false;
     g_elapsed_ms = 0;
@@ -337,9 +368,16 @@ void en_audio_tick(void)
     if (!dur) return;
 
     uint32_t played = hb_time_uptime_ms() - g_started_ms;
-    if (played + REARM_LEAD_MS < dur) return;
 
-    /* The current buffer is about to end. */
+    /* Well before the boundary: get the next buffer decoded and sitting in the
+       spare descriptor, so the boundary itself costs only a play() call. */
+    if (!g_stopping && !g_preloaded && played + PRELOAD_LEAD_MS >= dur) {
+        if (g_cur.loop)            preload(&g_cur);
+        else if (g_next.valid)     preload(&g_next);
+    }
+
+    if (played < dur) return;        /* not yet: no early start, no overlap */
+
     g_elapsed_ms += dur;
 
     if (g_stopping) {
@@ -349,11 +387,11 @@ void en_audio_tick(void)
     }
 
     if (g_cur.loop) {
-        arm_and_play(&g_cur);          /* the same file again: the seam */
+        if (!play_preloaded()) arm_and_play(&g_cur);
     } else if (g_next.valid) {
         g_cur = g_next;
         g_next.valid = false;
-        arm_and_play(&g_cur);
+        if (!play_preloaded()) arm_and_play(&g_cur);
     } else {
         g_cur.valid = false;
         g_state = EN_AUDIO_IDLE;       /* ran dry: the program is over */

@@ -37,6 +37,24 @@ static btn_map_t s_buttons[] = {
 
 static bool s_shut_down;
 
+/* RetailOS acts on the play/pause button itself, before any homebrew app sees
+   it: pressing play while Entrain is open starts the Music app underneath us.
+   We cannot stop the OS from handling the button, but we can undo what it did.
+   hb_media talks to the same system player, so if it has started, pause it.
+   Entrain owns the audio output while it is on screen — two things playing at
+   once is never what the user meant. */
+static uint32_t s_media_check_ms;
+
+static void suppress_os_media(void)
+{
+    uint32_t now = hb_time_uptime_ms();
+    if (now - s_media_check_ms < 250) return;    /* 4 Hz is plenty */
+    s_media_check_ms = now;
+
+    if (hb_media_state() == 0)                   /* 0 = playing */
+        hb_media_set_paused(true);
+}
+
 static void poll_buttons(void)
 {
     for (int i = 0; i < N_BUTTONS; i++) {
@@ -53,6 +71,7 @@ static void frame(void)
     if (s_shut_down) return;
 
     poll_buttons();
+    suppress_os_media();
     en_ui_tick();
 
     /* Home from the Library asks to leave. The resident performs the actual

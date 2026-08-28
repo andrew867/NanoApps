@@ -871,6 +871,137 @@ static void test_subrange(void)
     lg_warn("tap to return to menu");
 }
 
+/* ---- T9: PCM straight from RAM, no file ---------------------------------- *
+ *
+ * The descriptor is not just a handle to a file. loadFile fills in a decoded
+ * PCM buffer pointer and a format, and sfxPlayer::play hands the descriptor to
+ * a voice which reads those fields - the voice keeps the DESCRIPTOR pointer
+ * (voice+0x78), not a copy of the audio.
+ *
+ * Read out of RetailOS 1.1.2: voice::setSource at VA 0x0862fd24, and the
+ * container-type jump table it dispatches on (desc+0x10):
+ *
+ *   desc+0x04 / +0x08   decoded PCM buffer
+ *   desc+0x0C           its length in bytes
+ *   desc+0x10           container type. Type 0 computes framesPerPacket = 1
+ *                       and bytesPerFrame = (bits/8) * channels, which is
+ *                       linear PCM and nothing else
+ *   desc+0x14/18/1C     sample rate, channels, bits
+ *   desc+0x38 / +0x3C   leading/trailing trim, subtracted from the frame count
+ *
+ * If that reading is right, filling those in by hand plays arbitrary PCM with
+ * no file, no FAT write, and no 1 MiB loader ceiling - and if the voice reads
+ * the buffer as it goes rather than copying it, double-buffering underneath a
+ * playing voice gives real streaming.
+ *
+ * This is the test that decides whether Entrain can generate audio live on
+ * RetailOS instead of rendering files first. */
+
+#define T9_RATE     22050u
+#define T9_SECONDS  3u
+#define T9_FRAMES   (T9_RATE * T9_SECONDS)
+
+static int16_t *g_t9_pcm;
+
+/* A 220 / 227 Hz pair, one per ear, so a working result is unmistakable: two
+   clear tones beating seven times a second. A cheap triangle rather than a
+   sine table - this is a plumbing test, not an audio-quality one. */
+static void t9_fill(int16_t *dst, uint32_t frames, uint32_t rate,
+                    uint32_t phase_l_start, uint32_t phase_r_start)
+{
+    uint32_t pl = phase_l_start, pr = phase_r_start;
+    uint32_t step_l = (uint32_t)(220.0 * 4294967296.0 / (double)rate);
+    uint32_t step_r = (uint32_t)(227.0 * 4294967296.0 / (double)rate);
+    for (uint32_t i = 0; i < frames; i++) {
+        int32_t l = (int32_t)((pl >> 16) & 0xFFFF) - 32768;
+        int32_t r = (int32_t)((pr >> 16) & 0xFFFF) - 32768;
+        l = (l < 0) ? (-l - 16384) : (16384 - l);
+        r = (r < 0) ? (-r - 16384) : (16384 - r);
+        dst[2 * i + 0] = (int16_t)l;
+        dst[2 * i + 1] = (int16_t)r;
+        pl += step_l;
+        pr += step_r;
+    }
+}
+
+static void test_raw_pcm(void)
+{
+    log_clear("T9 PCM FROM RAM");
+    lg("No file at all: allocate a buffer,");
+    lg("fill it, point the descriptor at it,");
+    lg("and play.");
+    lg("");
+    lg("If this works the render-to-WAV path");
+    lg("goes away and streaming is possible.");
+    lg("");
+
+    uint32_t bytes = T9_FRAMES * 4u;
+
+    char buf[48], *p = buf;
+    p = app_str(p, "need "); p = app_u32(p, bytes >> 10);
+    p = app_str(p, "K, largest free ");
+    p = app_u32(p, hb_os_heap_largest() >> 10);
+    app_str(p, "K");
+    lg(buf);
+
+    if (!g_t9_pcm) g_t9_pcm = (int16_t *)hb_os_alloc(bytes);
+    if (!g_t9_pcm) {
+        lg_warn("alloc failed - not enough heap");
+        lg_warn("tap to return to menu");
+        return;
+    }
+    t9_fill(g_t9_pcm, T9_FRAMES, T9_RATE, 0, 0);
+    hb_trace_log("SPK9", (uint32_t)(uintptr_t)g_t9_pcm, bytes);
+
+    chk("t9 ctor");
+    sfx_ctor(g_desc_a);
+
+    /* Everything loadFile would have filled in, filled in by hand. */
+    chk("t9 fields");
+    *(volatile uint32_t *)(g_desc_a + 0x04) = (uint32_t)(uintptr_t)g_t9_pcm;
+    *(volatile uint32_t *)(g_desc_a + 0x08) = (uint32_t)(uintptr_t)g_t9_pcm;
+    *(volatile uint32_t *)(g_desc_a + 0x0C) = bytes;
+    g_desc_a[0x10] = 0;                                   /* linear PCM */
+    *(volatile uint32_t *)(g_desc_a + 0x14) = T9_RATE;
+    *(volatile uint32_t *)(g_desc_a + 0x18) = 2;          /* channels */
+    *(volatile uint32_t *)(g_desc_a + 0x1C) = 16;         /* bits */
+    *(volatile uint32_t *)(g_desc_a + 0x38) = 0;          /* no leading trim */
+    *(volatile uint32_t *)(g_desc_a + 0x3C) = 0;          /* no trailing trim */
+    sfx_fields(g_desc_a, 0x5000, 1, 0, (void *)0);
+
+    chk("t9 play");
+    bool ok = sfx_play(g_desc_a, (void *)0, (void *)0);
+    hb_trace_log("SPK9", 0x9AA9, ok ? 1u : 0u);
+
+    p = buf;
+    p = app_str(p, "play() returned ");
+    app_str(p, ok ? "true" : "FALSE");
+    lg(buf);
+    lg("");
+    lg_warn("LISTEN: two tones, one per ear,");
+    lg_warn("beating 7 times a second, 3s.");
+    lg("");
+    lg("silence -> the voice does not read");
+    lg("  desc+0x04, or type 0 is not LPCM");
+    lg("noise   -> right path, wrong format");
+    lg("  fields (try bits / channels)");
+
+    wait_ms(6000, "t9 playing");
+
+    /* The streaming question: refill the SAME buffer with a different phase and
+       play again without touching the pointer. If the voice reads the buffer
+       live rather than copying it at play time, swapping underneath a playing
+       voice will work too, which is what real streaming needs. */
+    lg("");
+    lg("refilled same buffer, playing again");
+    t9_fill(g_t9_pcm, T9_FRAMES, T9_RATE, 0x40000000u, 0);
+    chk("t9 replay");
+    sfx_play(g_desc_a, (void *)0, (void *)0);
+    wait_ms(5000, "t9 replay");
+
+    lg_warn("tap to return to menu");
+}
+
 /* ---- menu ---------------------------------------------------------------- */
 
 typedef void (*test_fn_t)(void);
@@ -891,6 +1022,7 @@ static const menu_item_t MENU[] = {
     { "T6  LATENCY",        test_latency },
     { "T7  SIZE + HEAP",    test_size },
     { "T8  SUBRANGE",       test_subrange },
+    { "T9  PCM FROM RAM",   test_raw_pcm },
 };
 #define N_MENU ((int)(sizeof MENU / sizeof MENU[0]))
 

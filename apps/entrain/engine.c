@@ -353,9 +353,17 @@ static bool start_next_chunk(bool first)
     seg.end.tone_level = 0.8;
     seg.end.noise_level = nl1;
 
-    /* Program chunks are never cached: they are unique to their position in
-       the timeline and there is no point filling the disk with them. */
-    if (!job_start(&seg, false, first, "", t0)) return false;
+    /* Alternate between two keys. A program chunk is not worth caching — it is
+       unique to its position in the timeline — but it does need a name of its
+       own, because the backend skips rewriting a file that is already the right
+       size and consecutive chunks are the same length. Sharing one name meant
+       chunk N+1 was never written and the descriptor played chunk N again. Two
+       names suffice: only two chunks are ever live. */
+    static int chunk_parity;
+    const char *chunk_key = chunk_parity ? "chunk1" : "chunk0";
+    chunk_parity ^= 1;
+
+    if (!job_start(&seg, false, first, chunk_key, t0)) return false;
     E.render_pos_s = t0 + dur;
     return true;
 }
