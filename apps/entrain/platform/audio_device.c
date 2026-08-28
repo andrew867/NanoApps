@@ -72,7 +72,8 @@ typedef struct {
     uint8_t  desc[0x80];
     int16_t *pcm;
     uint32_t capacity;      /* bytes allocated */
-    uint32_t frames;
+    uint32_t frames;        /* the whole buffer, crossfade tail included */
+    uint32_t advance;       /* how far to move before the next one starts */
     uint32_t rate;
     bool     loop;
     bool     ready;
@@ -90,10 +91,12 @@ static en_audio_state_t g_state = EN_AUDIO_IDLE;
 
 /* ---- helpers ------------------------------------------------------------- */
 
+/* The advance, not the buffer length: the tail past it is the crossfade
+   partner for whatever plays next, and is meant to overlap it. */
 static uint32_t slot_ms(const slot_t *s)
 {
     if (!s->ready || !s->rate) return 0;
-    return (uint32_t)(((uint64_t)s->frames * 1000ull) / s->rate);
+    return (uint32_t)(((uint64_t)s->advance * 1000ull) / s->rate);
 }
 
 static uint32_t os_volume(void)
@@ -123,12 +126,13 @@ static bool slot_reserve(slot_t *s, uint32_t bytes)
 }
 
 static void slot_fill(slot_t *s, const int16_t *pcm, uint32_t frames,
-                      uint32_t rate, bool loop)
+                      uint32_t advance, uint32_t rate, bool loop)
 {
     uint32_t words = frames * 2u;
     for (uint32_t i = 0; i < words; i++) s->pcm[i] = pcm[i];
 
     s->frames = frames;
+    s->advance = (advance && advance <= frames) ? advance : frames;
     s->rate = rate;
     s->loop = loop;
     s->ready = true;
@@ -199,7 +203,8 @@ void en_audio_shutdown(void)
 }
 
 bool en_audio_submit(const char *key, const int16_t *pcm,
-                     uint32_t frames, uint32_t sample_rate, bool loop)
+                     uint32_t frames, uint32_t advance_frames,
+                     uint32_t sample_rate, bool loop)
 {
     (void)key;                    /* nothing on disk left to key */
     if (!pcm || !frames) return false;
@@ -210,7 +215,7 @@ bool en_audio_submit(const char *key, const int16_t *pcm,
         g_state = EN_AUDIO_FAILED;
         return false;
     }
-    slot_fill(&g_slot[0], pcm, frames, sample_rate, loop);
+    slot_fill(&g_slot[0], pcm, frames, advance_frames, sample_rate, loop);
 
     g_slot[1].ready = false;
     g_pending = -1;
@@ -226,14 +231,15 @@ bool en_audio_submit(const char *key, const int16_t *pcm,
 }
 
 bool en_audio_queue(const char *key, const int16_t *pcm,
-                    uint32_t frames, uint32_t sample_rate)
+                    uint32_t frames, uint32_t advance_frames,
+                    uint32_t sample_rate)
 {
     (void)key;
     if (!pcm || !frames) return false;
 
     int idx = (g_playing == 0) ? 1 : 0;
     if (!slot_reserve(&g_slot[idx], frames * 4u)) return false;
-    slot_fill(&g_slot[idx], pcm, frames, sample_rate, false);
+    slot_fill(&g_slot[idx], pcm, frames, advance_frames, sample_rate, false);
     g_pending = idx;
     return true;
 }

@@ -19,6 +19,16 @@
 /* Program fades. Long enough to be a fade rather than a switch. */
 #define EN_PROGRAM_FADE_S 2.0
 
+/* Crossfade tail on a looped buffer, in milliseconds.
+ *
+ * A join can only be timed to the UI tick, and a tone with a 16 ms hole in it
+ * clicks. So a loop buffer carries this much extra past its wrap point,
+ * repeating what the loop opens with and fading out, while the head fades in.
+ * The gains are linear and sum to one — correct here because the two are the
+ * same signal, not independent ones — so overlapping them cannot comb-filter
+ * and a few milliseconds either way costs only a slight amplitude ripple. */
+#define EN_LOOP_XFADE_MS 60
+
 /* How long the live-tune gesture must be still before the re-render starts.
    Re-rendering on every pixel of a drag would thrash; waiting for the gesture
    to settle costs nothing because the old loop is still playing. */
@@ -27,6 +37,7 @@
 typedef struct {
     int16_t *buf;
     uint32_t frames;      /* total frames this job will produce */
+    uint32_t advance;     /* where the next buffer takes over; 0 = all of it */
     uint32_t done;        /* frames rendered so far */
     uint32_t rate;
     bool     active;
@@ -181,11 +192,20 @@ static bool job_start(const en_segment_t *seg, bool loop, bool first,
     job_cancel();
     if (seg->frames == 0) return false;
 
-    E.job.buf = en_sys_alloc(seg->frames * 4u);
+    /* A looped buffer is longer than its loop: the extra is the crossfade tail
+       that overlaps the next pass. */
+    uint32_t xfade = 0;
+    if (loop) {
+        xfade = (uint32_t)(((uint64_t)seg->sample_rate * EN_LOOP_XFADE_MS) / 1000u);
+        if (xfade > seg->frames / 4u) xfade = seg->frames / 4u;
+    }
+
+    E.job.buf = en_sys_alloc((seg->frames + xfade) * 4u);
     if (!E.job.buf) return false;
 
     E.job.seg = *seg;
-    E.job.frames = seg->frames;
+    E.job.frames = seg->frames + xfade;
+    E.job.advance = loop ? seg->frames : 0;
     E.job.done = 0;
     E.job.rate = seg->sample_rate;
     E.job.loop = loop;
@@ -201,6 +221,24 @@ static bool job_start(const en_segment_t *seg, bool loop, bool first,
            to be quick, not smooth. */
         en_render_init(&E.rnd, seg->sample_rate, seg->noise, 1);
         en_render_loop(&E.rnd, seg, E.job.buf);
+
+        /* Append the crossfade tail. The loop is periodic, so what follows its
+           last sample is its own first sample — copy the head past the end,
+           fading it down while fading the head up. Read each frame before
+           writing either copy, since the source is the head itself. */
+        uint32_t n = seg->frames;
+        uint32_t x = E.job.frames - n;
+        for (uint32_t i = 0; i < x; i++) {
+            int32_t l = E.job.buf[2 * i + 0];
+            int32_t r = E.job.buf[2 * i + 1];
+            /* out = 1 - i/x, in = i/x; they sum to exactly one */
+            int32_t gi = (int32_t)((i * 4096u) / x);        /* 0 .. 4096 */
+            int32_t go = 4096 - gi;
+            E.job.buf[2 * (n + i) + 0] = (int16_t)((l * go) >> 12);
+            E.job.buf[2 * (n + i) + 1] = (int16_t)((r * go) >> 12);
+            E.job.buf[2 * i + 0]       = (int16_t)((l * gi) >> 12);
+            E.job.buf[2 * i + 1]       = (int16_t)((r * gi) >> 12);
+        }
         E.job.done = E.job.frames;
     }
     return true;
@@ -238,10 +276,11 @@ static void job_finish(void)
                             E.job.program_t0, E.total_s);
 
     if (E.job.first)
-        en_audio_submit(E.job.key, E.job.buf, E.job.frames, E.job.rate,
-                        E.job.loop);
+        en_audio_submit(E.job.key, E.job.buf, E.job.frames, E.job.advance,
+                        E.job.rate, E.job.loop);
     else
-        en_audio_queue(E.job.key, E.job.buf, E.job.frames, E.job.rate);
+        en_audio_queue(E.job.key, E.job.buf, E.job.frames, E.job.advance,
+                       E.job.rate);
 
     job_cancel();
     E.retuning = false;
@@ -254,6 +293,8 @@ static void job_step(void)
 {
     if (!E.job.active) return;
 
+    /* Only non-looped jobs are sliced; a loop is rendered whole in job_start,
+       tail included, and arrives here already complete. */
     uint32_t left = E.job.frames - E.job.done;
     if (left == 0) { job_finish(); return; }
 

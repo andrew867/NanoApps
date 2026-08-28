@@ -306,16 +306,20 @@ bool en_audio_start_stream(uint32_t sample_rate, en_audio_pull_fn pull,
    backend satisfies audio.h in full. */
 
 bool en_audio_submit(const char *key, const int16_t *pcm,
-                     uint32_t frames, uint32_t sample_rate, bool loop)
+                     uint32_t frames, uint32_t advance_frames,
+                     uint32_t sample_rate, bool loop)
 {
-    (void)key; (void)pcm; (void)frames; (void)sample_rate; (void)loop;
+    (void)key; (void)pcm; (void)frames; (void)advance_frames;
+    (void)sample_rate; (void)loop;
     return false;
 }
 
 bool en_audio_queue(const char *key, const int16_t *pcm,
-                    uint32_t frames, uint32_t sample_rate)
+                    uint32_t frames, uint32_t advance_frames,
+                    uint32_t sample_rate)
 {
-    (void)key; (void)pcm; (void)frames; (void)sample_rate;
+    (void)key; (void)pcm; (void)frames; (void)advance_frames;
+    (void)sample_rate;
     return false;
 }
 

@@ -47,13 +47,26 @@ void en_audio_shutdown(void);
    returns; the caller may free it afterwards.
 
    Returns false if the buffer could not be accepted (no heap, disk full). */
+/* `advance_frames` is how far to move before the NEXT buffer starts, which is
+   not necessarily the whole buffer. A buffer may carry a short crossfade tail
+   past its advance point: the tail repeats what the following buffer opens
+   with, faded out, while that one fades in, and the two gains sum to one.
+
+   That exists because a join can only be timed to the granularity of the UI
+   tick, and a tone with a 16 ms hole in it clicks. Overlapping identical
+   content cannot comb-filter, so being a few milliseconds early or late costs
+   a slight amplitude ripple instead of an artefact.
+
+   Pass 0 to mean "the whole buffer", which is the plain no-crossfade case. */
 bool en_audio_submit(const char *key, const int16_t *pcm,
-                     uint32_t frames, uint32_t sample_rate, bool loop);
+                     uint32_t frames, uint32_t advance_frames,
+                     uint32_t sample_rate, bool loop);
 
 /* Set the follow-on buffer, replacing any previously queued one. Only
    meaningful after a submit with loop=false. */
 bool en_audio_queue(const char *key, const int16_t *pcm,
-                    uint32_t frames, uint32_t sample_rate);
+                    uint32_t frames, uint32_t advance_frames,
+                    uint32_t sample_rate);
 
 /* True when the next slot is empty and the engine should render into it. */
 bool en_audio_wants_next(void);

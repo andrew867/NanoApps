@@ -25,7 +25,8 @@
 
 typedef struct {
     int16_t *pcm;
-    uint32_t frames;
+    uint32_t frames;        /* the whole buffer, crossfade tail included */
+    uint32_t advance;       /* where the next buffer takes over */
     uint32_t rate;
     bool     loop;
 } slot_t;
@@ -106,9 +107,11 @@ static void advance(int16_t *l, int16_t *r)
     s_pos++;
     s_played++;
 
-    if (s_pos >= s_cur.frames) {
+    if (s_pos >= s_cur.advance) {
         if (s_cur.loop) {
-            s_pos = 0;                 /* the seam */
+            /* Wrap at the advance. The tail past it is the crossfade partner
+               for the head, and playing it here instead would be a dip. */
+            s_pos = 0;
         } else if (s_next.pcm) {
             /* Hand over to the queued chunk. On this platform the join is
                sample-exact; on the device it is a short crossfade. */
@@ -276,7 +279,8 @@ static int16_t *copy_pcm(const int16_t *pcm, uint32_t frames)
 }
 
 bool en_audio_submit(const char *key, const int16_t *pcm,
-                     uint32_t frames, uint32_t sample_rate, bool loop)
+                     uint32_t frames, uint32_t advance_frames,
+                     uint32_t sample_rate, bool loop)
 {
     (void)key;   /* the host streams from memory; nothing to cache */
     if (!pcm || !frames) return false;
@@ -289,6 +293,8 @@ bool en_audio_submit(const char *key, const int16_t *pcm,
     slot_free(&s_next);
     s_cur.pcm = copy;
     s_cur.frames = frames;
+    s_cur.advance = (advance_frames && advance_frames <= frames)
+                  ? advance_frames : frames;
     s_cur.rate = sample_rate;
     s_cur.loop = loop;
     s_pos = 0;
@@ -305,7 +311,8 @@ bool en_audio_submit(const char *key, const int16_t *pcm,
 }
 
 bool en_audio_queue(const char *key, const int16_t *pcm,
-                    uint32_t frames, uint32_t sample_rate)
+                    uint32_t frames, uint32_t advance_frames,
+                    uint32_t sample_rate)
 {
     (void)key;
     if (!pcm || !frames) return false;
@@ -317,6 +324,8 @@ bool en_audio_queue(const char *key, const int16_t *pcm,
     slot_free(&s_next);
     s_next.pcm = copy;
     s_next.frames = frames;
+    s_next.advance = (advance_frames && advance_frames <= frames)
+                   ? advance_frames : frames;
     s_next.rate = sample_rate;
     s_next.loop = false;
     pthread_mutex_unlock(&s_lock);
@@ -349,7 +358,7 @@ double en_audio_remaining(void)
     pthread_mutex_lock(&s_lock);
     if (!s_cur.pcm || !s_cur.rate)   v = 0.0;
     else if (s_cur.loop)             v = 1e9;
-    else v = (double)(s_cur.frames - s_pos) / (double)s_cur.rate;
+    else v = (double)(s_cur.advance - s_pos) / (double)s_cur.rate;
     pthread_mutex_unlock(&s_lock);
     return v;
 }
