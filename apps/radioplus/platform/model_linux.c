@@ -53,7 +53,9 @@ static uint32_t now_ms(void)
 static void paths_init(void)
 {
     const char *h = getenv("RADIOPLUS_HOME");
-    if (!h || !*h) h = "/tmp/radioplus";
+    /* Not /tmp/radioplus: that is where the binary is pushed, and mkdir then
+       fails because the path is already a file. */
+    if (!h || !*h) h = "/tmp/radioplus.d";
     snprintf(s_home, sizeof s_home, "%s", h);
     mkdir(s_home, 0755);
 

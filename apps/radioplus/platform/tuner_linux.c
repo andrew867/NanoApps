@@ -45,6 +45,7 @@
 static char s_dir[256];          /* the sysfs directory holding fm_power */
 static bool s_ready;
 static char s_desc[416];   /* holds the sysfs path plus a note */
+static int  s_hci_state;
 
 /* ---- sysfs plumbing ------------------------------------------------------ */
 
@@ -110,17 +111,32 @@ static en_tuner_err_t attr_read(const char *name, char *buf, size_t n)
 #define BT_PROTO_HCI    1
 #define BT_HCIDEVUP     _IOW('H', 201, int)
 
-static bool hci_up(void)
+/* Why it could not be raised, for the message. The three cases want different
+   things done about them and lumping them together sends people to the wrong
+   place. */
+typedef enum {
+    HCI_IS_UP = 0,
+    HCI_NO_SOCKETS,      /* kernel has the device but no AF_BLUETOOTH */
+    HCI_DOWN             /* sockets exist; the controller refused to come up */
+} hci_state_t;
+
+static hci_state_t hci_up(void)
 {
     int fd = socket(BT_AF_BLUETOOTH, SOCK_RAW, BT_PROTO_HCI);
-    if (fd < 0) return false;
+    if (fd < 0) {
+        /* Observed on this device: hci0 is registered through serdev, but
+           AF_BLUETOOTH is absent from /proc/net/protocols, so there is no
+           socket to issue HCIDEVUP on and no userspace route to raise it. */
+        return HCI_NO_SOCKETS;
+    }
 
     int r = ioctl(fd, BT_HCIDEVUP, 0);
     int err = errno;
     close(fd);
 
     /* Already up is the common case and is success, not failure. */
-    return r == 0 || err == EALREADY || err == EBUSY;
+    if (r == 0 || err == EALREADY || err == EBUSY) return HCI_IS_UP;
+    return HCI_DOWN;
 }
 
 /* ---- finding the device -------------------------------------------------- */
@@ -174,13 +190,23 @@ en_tuner_err_t en_tuner_init(void)
     /* The controller existing is not the same as it being usable, so bring it
        up rather than reporting on it. If it is missing entirely the driver has
        not bound and there is nothing to do about that here. */
-    bool hci = access("/sys/class/bluetooth/hci0", F_OK) == 0;
-    if (hci) hci = hci_up();
+    /* The controller existing is not the same as it being usable. */
+    bool present = access("/sys/class/bluetooth/hci0", F_OK) == 0;
+    hci_state_t st = present ? hci_up() : HCI_DOWN;
 
-    snprintf(s_desc, sizeof s_desc, "bcm2078-bt at %s%s",
-             s_dir, hci ? "" : "  (no hci0 - is bluetooth loaded?)");
+    const char *why = "";
+    if (!present)
+        why = "  (no hci0: the Bluetooth driver did not bind)";
+    else if (st == HCI_NO_SOCKETS)
+        why = "  (hci0 is down and this kernel has no AF_BLUETOOTH to raise it)";
+    else if (st == HCI_DOWN)
+        why = "  (hci0 refused to come up)";
 
-    return hci ? EN_TUNER_OK : EN_TUNER_NOT_READY;
+    snprintf(s_desc, sizeof s_desc, "bcm2078-bt at %s%s", s_dir, why);
+
+    if (st == HCI_IS_UP) return EN_TUNER_OK;
+    s_hci_state = st;
+    return EN_TUNER_NOT_READY;
 }
 
 void en_tuner_shutdown(void)
@@ -404,7 +430,14 @@ const char *en_tuner_strerror(en_tuner_err_t e)
     switch (e) {
     case EN_TUNER_OK:          return "ok";
     case EN_TUNER_NO_DEVICE:   return "no tuner found";
-    case EN_TUNER_NOT_READY:   return "Bluetooth is down; FM rides on hci0";
+    case EN_TUNER_NOT_READY:
+        /* The fix differs per case, so the message does too. */
+        if (s_hci_state == 1)
+            return "hci0 is down and this kernel has no Bluetooth sockets to "
+                   "raise it. FM rides on hci0, so the tuner cannot answer "
+                   "until the driver brings it up or the kernel gains "
+                   "AF_BLUETOOTH.";
+        return "Bluetooth is down; FM rides on hci0";
     case EN_TUNER_UNSUPPORTED: return "not supported on this platform";
     default:                   return "failed";
     }

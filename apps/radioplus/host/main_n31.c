@@ -53,6 +53,111 @@ static void on_signal(int sig)
     s_quit = 1;
 }
 
+/*
+ * Buttons.
+ *
+ * There is no touchscreen on this device - /proc/bus/input/devices lists
+ * n31-buttons, an accelerometer and n31-pmic-buttons and nothing else - so an
+ * interface that can only be tapped cannot be driven at all.
+ *
+ * Read straight from evdev rather than through an LVGL keypad group: the
+ * screens are positioned rather than laid out in a focus order, and inventing
+ * one purely so a generic focus mechanism has something to walk would be more
+ * machinery than the four actions actually wanted.
+ */
+#define KEY_VOLUMEDOWN   114
+#define KEY_VOLUMEUP     115
+#define KEY_MENU         139
+#define KEY_BACK         158
+#define KEY_NEXTSONG     163
+#define KEY_PLAYPAUSE    164
+#define KEY_PREVIOUSSONG 165
+
+#define MAX_KEY_FDS 4
+static int s_key_fd[MAX_KEY_FDS];
+static int s_key_fds;
+
+/* struct input_event, without pulling in linux/input.h - it collides with some
+   libc headers on this toolchain. Layout is time, type, code, value. */
+struct rp_input_event {
+    long     sec;
+    long     usec;
+    uint16_t type;
+    uint16_t code;
+    int32_t  value;
+};
+
+static void open_keys(void)
+{
+    for (int i = 0; i < 12 && s_key_fds < MAX_KEY_FDS; i++) {
+        char path[64];
+        snprintf(path, sizeof path, "/dev/input/event%d", i);
+
+        int fd = open(path, O_RDONLY | O_NONBLOCK);
+        if (fd < 0) continue;
+
+        /* Ask which EVENT TYPES the device reports, not which key codes.
+           EVIOCGBIT(EV_KEY) returns the key bitmap, and reading only its first
+           word tests keys 0 to 31 - which these devices do not have. Their keys
+           are volume and transport, at 114 and above, so a device full of
+           exactly the keys wanted looked like a device with none. */
+        unsigned long types = 0;
+        int req = (int)(0x80000000u | ((sizeof types) << 16) | ('E' << 8)
+                        | 0x20);              /* EVIOCGBIT(0, ...) */
+        if (ioctl(fd, req, &types) >= 0 && (types & (1u << 1))) {   /* EV_KEY */
+            s_key_fd[s_key_fds++] = fd;
+            printf("radioplus: keys on %s\n", path);
+            continue;
+        }
+        close(fd);
+    }
+    if (!s_key_fds) printf("radioplus: no key input found\n");
+}
+
+static void pump_keys(void)
+{
+    struct rp_input_event ev;
+
+    for (int i = 0; i < s_key_fds; i++) {
+        while (read(s_key_fd[i], &ev, sizeof ev) == (ssize_t)sizeof ev) {
+            if (ev.type != 1 || ev.value != 1) continue;   /* presses only */
+
+            switch (ev.code) {
+            case KEY_VOLUMEUP:
+            case KEY_NEXTSONG: {
+                /* Wraps, so one button reaches every screen rather than
+                   stopping at the end and needing the other one. */
+                int n = (int)rp_ui_current() + 1;
+                if (n > RP_SWIPE_COUNT - 1) n = 0;
+                rp_ui_show((rp_screen_t)n);
+                break;
+            }
+            case KEY_VOLUMEDOWN:
+            case KEY_PREVIOUSSONG: {
+                int n = (int)rp_ui_current() - 1;
+                if (n < 0) n = RP_SWIPE_COUNT - 1;
+                rp_ui_show((rp_screen_t)n);
+                break;
+            }
+            case KEY_PLAYPAUSE:
+                /* Exactly what the middle transport button does, so the key and
+                   the screen never disagree about what it means. */
+                if (rp_model.play_file || rp_model.behind_ms)
+                    rp_act_pause_toggle();
+                else
+                    rp_act_record_toggle();
+                break;
+            case KEY_MENU:
+            case KEY_BACK:
+                rp_ui_show(RP_SCREEN_NOW);
+                break;
+            default:
+                break;
+            }
+        }
+    }
+}
+
 /* The touch panel is not always the same event node, so it is found by asking
    rather than by hard-coding a number that a driver load order can change. */
 static const char *find_touch(void)
@@ -130,9 +235,11 @@ int main(int argc, char **argv)
             printf("radioplus: touch on %s\n", input);
         }
     } else {
-        printf("radioplus: no touch device found; display only\n");
+        printf("radioplus: no touch panel; buttons only\n");
     }
 #endif
+
+    open_keys();
 
     /* Brings the tuner and the capture up as a side effect of the first
        refresh, so the screens have something to draw before the first frame. */
@@ -146,6 +253,7 @@ int main(int argc, char **argv)
         printf("radioplus: %s\n", rp_model.tuner_note);
 
     while (!s_quit) {
+        pump_keys();
         rp_model_refresh();
         rp_ui_tick();
 

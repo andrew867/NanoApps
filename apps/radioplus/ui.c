@@ -488,7 +488,16 @@ static void refresh_now(void)
     }
     lv_label_set_text(s_pty, buf);
 
-    lv_label_set_text(s_rt, rp_model.rds.rt_valid ? rp_model.rds.rt : "");
+    /* With no tuner there is no radio text and never will be, so the space
+       says why instead of staying blank. A dead radio that explains nothing is
+       indistinguishable from a broken app. */
+    if (!rp_model.tuner_ok && rp_model.tuner_note) {
+        lv_label_set_text(s_rt, rp_model.tuner_note);
+        lv_obj_set_style_text_color(s_rt, lv_color_hex(C_TA), 0);
+    } else {
+        lv_label_set_text(s_rt, rp_model.rds.rt_valid ? rp_model.rds.rt : "");
+        lv_obj_set_style_text_color(s_rt, lv_color_hex(C_TEXT_DIM), 0);
+    }
 
     /* The meter. RSSI is reported over the full byte range but everything
        real lives in the bottom third, so the scale is compressed to where the
@@ -573,8 +582,16 @@ static void refresh_now(void)
         lv_label_set_text(s_live_lbl, buf);
     }
 
-    if (live) lv_obj_add_flag(s_live_btn, LV_OBJ_FLAG_HIDDEN);
-    else lv_obj_remove_flag(s_live_btn, LV_OBJ_FLAG_HIDDEN);
+    if (live || !rp_model.capture_ok)
+        lv_obj_add_flag(s_live_btn, LV_OBJ_FLAG_HIDDEN);
+    else
+        lv_obj_remove_flag(s_live_btn, LV_OBJ_FLAG_HIDDEN);
+
+    /* No capture means no buffer to scrub and nothing to record. The strip and
+       the record button are hidden rather than left as controls that quietly
+       do nothing when pressed. */
+    if (rp_model.capture_ok) lv_obj_remove_flag(s_bar_row, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(s_bar_row, LV_OBJ_FLAG_HIDDEN);
 
     /* Recording. The dot and the elapsed time appear together and only while
        recording; a permanent readout showing 0:00 would be noise. */
@@ -596,9 +613,17 @@ static void refresh_now(void)
     if (live) {
         lv_label_set_text(s_tl_lbl, LV_SYMBOL_PREV);
         lv_label_set_text(s_tr_lbl, LV_SYMBOL_NEXT);
-        lv_label_set_text(s_rec_btn_lbl,
-                          rp_model.recording ? "STOP" : "REC");
-        lv_obj_set_style_text_color(s_rec_btn_lbl, lv_color_hex(C_REC), 0);
+        if (rp_model.capture_ok) {
+            lv_label_set_text(s_rec_btn_lbl,
+                              rp_model.recording ? "STOP" : "REC");
+            lv_obj_set_style_text_color(s_rec_btn_lbl, lv_color_hex(C_REC), 0);
+        } else {
+            /* Greyed and inert, not hidden: the button leaving a hole would
+               make the row look broken rather than limited. */
+            lv_label_set_text(s_rec_btn_lbl, "REC");
+            lv_obj_set_style_text_color(s_rec_btn_lbl,
+                                        lv_color_hex(C_TEXT_MUTE), 0);
+        }
     } else {
         lv_label_set_text(s_tl_lbl, LV_SYMBOL_LEFT " 15");
         lv_label_set_text(s_tr_lbl, "15 " LV_SYMBOL_RIGHT);
