@@ -55,9 +55,11 @@
  *     lands, which took the gap from a frame period down to two or three
  *     milliseconds — under a cycle of the carrier.
  *
- *   - Blocks are rendered a whole block ahead, right after the previous one is
- *     armed, so the work never lands on a boundary and there is no rendering
- *     stage for anyone to look at.
+ *   - Blocks are built a slice per frame, starting a whole block ahead, so the
+ *     work never lands on a boundary and no single frame carries enough of it
+ *     to be seen. Rendering a block in one callback was tens of milliseconds
+ *     and hitched the UI every time — the visible rendering stage again, just
+ *     moved somewhere else.
  *
  * Pause and stop do not tear a block off mid-flight. The voice reads our buffer
  * live, so they write a short fade to zero into the part of it that has not
@@ -159,6 +161,17 @@
 #define SAFETY_FRAMES MS_FRAMES(SAFETY_MS)
 #define FADE_FRAMES   MS_FRAMES(FADE_MS)
 #define QUIET_FRAMES  MS_FRAMES(QUIET_MS)
+#define CHUNK_FRAMES  MS_FRAMES(CHUNK_MS)
+
+/* How much audio one tick will render.
+ *
+ * A block is a couple of seconds of lead time but only tens of milliseconds of
+ * work, so the work wants spreading rather than hurrying: rendering a whole
+ * block in one callback hitched the UI every time, which is the visible
+ * rendering stage this design exists to avoid. At this size a tick costs a few
+ * milliseconds and a block takes a dozen ticks to build - a fraction of the
+ * time available. */
+#define CHUNK_MS 300
 
 /* Nothing has run us for this long: the OS put another app in front. Whatever
    was sounding finished long ago and unheard, so start clean rather than
@@ -170,10 +183,17 @@ typedef void *(*sfx_player_inst_t)(void);
 typedef void  (*sfx_player_play_t)(void *player, void *desc,
                                    void *cb, void *cbdata);
 
+/* Stages of building a block. See build_step(). */
+#define BUILD_BODY 0        /* rendering the body, committed as it goes */
+#define BUILD_PEEK 1        /* rendering the slack to choose the cut */
+#define BUILD_TAIL 2        /* committing the tail the cut chose */
+
 typedef struct {
     uint8_t  desc[0x80];
     int16_t *pcm;
     uint32_t frames;        /* committed length, chosen by en_zero_cut */
+    uint32_t fill;          /* how much of the body is rendered so far */
+    uint8_t  stage;
     bool     ready;
 } block_t;
 
@@ -237,32 +257,81 @@ static uint32_t play_cursor(void)
     return MS_FRAMES(elapsed);
 }
 
-/* Render the next block and choose where to cut it.
+/* One slice of building a block. Returns true once the block is ready to arm.
  *
- * Two calls, one state. The first is a peek: it renders a block plus the slack
- * without moving the source on. The second asks for exactly the length the cut
- * chose and commits — and because the source had not moved, it re-renders the
- * identical samples that were measured. */
-static bool prepare(int idx)
+ * Only the slack is ever rendered twice, and only because the cut has to see it
+ * before deciding how much of it to keep: peeking renders without moving the
+ * source on, so committing afterwards re-renders the identical samples that
+ * were measured. The body needs no such thing - it is kept whatever the cut
+ * says - so it is committed as it goes. */
+static bool build_step(int idx)
 {
     block_t *b = &g_blk[idx];
+    if (b->ready) return true;
     if (!s_pull || s_source_done) return false;
 
-    uint32_t got = s_pull(b->pcm, CAP_FRAMES, 0, s_pull_ctx);
-    if (got == 0) { s_source_done = true; return false; }
+    if (b->stage == BUILD_BODY) {
+        uint32_t want = BLOCK_FRAMES - b->fill;
+        if (want > CHUNK_FRAMES) want = CHUNK_FRAMES;
 
-    uint32_t lo = (got > BLOCK_FRAMES) ? BLOCK_FRAMES : got;
-    uint32_t n  = en_zero_cut(b->pcm, lo, got);
-    if (n == 0 || n > got) n = got;
-
-    if (s_pull(b->pcm, n, n, s_pull_ctx) == 0) {
-        s_source_done = true;
+        uint32_t got = s_pull(b->pcm + (uint32_t)b->fill * 2u, want, want,
+                              s_pull_ctx);
+        if (got == 0) {
+            /* The program ended part-way through. Whatever is already rendered
+               is real audio and gets played; there is simply nothing to cut
+               against, so it stands as it is. */
+            s_source_done = true;
+            if (b->fill == 0) return false;
+            b->frames = b->fill;
+            b->ready = true;
+            return true;
+        }
+        b->fill += got;
+        if (b->fill >= BLOCK_FRAMES) b->stage = BUILD_PEEK;
         return false;
     }
 
-    b->frames = n;
+    if (b->stage == BUILD_PEEK) {
+        uint32_t got = s_pull(b->pcm + (uint32_t)BLOCK_FRAMES * 2u,
+                              SLACK_FRAMES, 0, s_pull_ctx);
+        if (got == 0) {
+            s_source_done = true;
+            b->frames = BLOCK_FRAMES;
+            b->ready = true;
+            b->stage = BUILD_BODY;
+            return true;
+        }
+        uint32_t n = en_zero_cut(b->pcm, BLOCK_FRAMES, BLOCK_FRAMES + got);
+        if (n < BLOCK_FRAMES || n > BLOCK_FRAMES + got) n = BLOCK_FRAMES + got;
+        b->frames = n;
+        b->stage = BUILD_TAIL;
+        return false;
+    }
+
+    /* BUILD_TAIL: commit exactly as much of the slack as the cut kept. */
+    uint32_t tail = b->frames - BLOCK_FRAMES;
+    if (tail && s_pull(b->pcm + (uint32_t)BLOCK_FRAMES * 2u, tail, tail,
+                       s_pull_ctx) == 0) {
+        s_source_done = true;
+        return false;
+    }
+    b->fill = 0;
+    b->stage = BUILD_BODY;
     b->ready = true;
     return true;
+}
+
+/* Build a whole block now, hitch and all. Only for the moment the user presses
+   play, where there is no lead time to spread the work over and a few tens of
+   milliseconds is the difference between starting and not. */
+static bool build_now(int idx)
+{
+    g_blk[idx].fill = 0;
+    g_blk[idx].stage = BUILD_BODY;
+    g_blk[idx].ready = false;
+    for (int guard = 0; guard < 64; guard++)
+        if (build_step(idx)) return true;
+    return false;
 }
 
 /* Ramp the head of a block up from silence, in place. Used on the first block
@@ -393,13 +462,15 @@ bool en_audio_start_stream(uint32_t sample_rate, en_audio_pull_fn pull,
     g_stopping = false;
     g_fade_in = true;
     g_blk[BLK_A].ready = g_blk[BLK_B].ready = false;
+    g_blk[BLK_A].stage = g_blk[BLK_B].stage = BUILD_BODY;
+    g_blk[BLK_A].fill  = g_blk[BLK_B].fill  = 0;
     g_pending = -1;
 
     /* Never the block that is sounding. The voice reads our buffer live — that
        is what makes the in-place pause fade work — so rendering into it would
        rewrite audio out from under the DAC. */
     int first = (g_playing == BLK_A) ? BLK_B : BLK_A;
-    if (!prepare(first)) { g_state = EN_AUDIO_FAILED; return false; }
+    if (!build_now(first)) { g_state = EN_AUDIO_FAILED; return false; }
     g_pending = first;
 
     /* If real audio is still sounding, its fade has to finish before new audio
@@ -510,12 +581,13 @@ void en_audio_tick(void)
         return;
     }
 
-    /* Render the next block as soon as there is a free one: a whole block of
-       lead time, so the work never lands on a boundary. This is why there is no
-       rendering stage to look at. */
+    /* Build the next block a slice per tick, starting as soon as there is a
+       free one. A block of lead time against a dozen ticks of work, so it is
+       always finished long before the boundary and no single frame carries
+       enough of it to be seen. */
     if (g_pending < 0 && !s_source_done) {
         int idx = (g_playing == BLK_A) ? BLK_B : BLK_A;
-        if (prepare(idx)) g_pending = idx;
+        if (build_step(idx)) g_pending = idx;
     }
 
     /* Hold until the sounding block is actually finished, to the millisecond.
@@ -543,10 +615,10 @@ void en_audio_tick(void)
         s_pull = (en_audio_pull_fn)0;
         g_state = EN_AUDIO_IDLE;        /* the program is over */
     } else {
-        /* The render did not get done in time — a very busy frame. Fill and arm
-           now; one late block is better than a dropout. */
+        /* The build did not finish in time — a very long stall. Finish it in
+           one go and arm; one hitched frame is better than a dropout. */
         int idx = (g_playing == BLK_A) ? BLK_B : BLK_A;
-        if (prepare(idx)) arm(idx);
+        if (build_now(idx)) arm(idx);
     }
 }
 
