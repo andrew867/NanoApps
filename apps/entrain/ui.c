@@ -302,18 +302,23 @@ void en_ui_goto(en_screen_t screen, bool animate)
 
 /* ---- screen blanking ----------------------------------------------------- */
 
-/* Blanking kills the backlight and nothing else. On the device, stopping the
-   render loop can take the audio subsystem down with it, so "blank" must never
-   mean "stop drawing" — see AUDIO_NOTES.md. */
+/* Idle dimming, not sleeping.
+ *
+ * Turning the backlight fully off also meant releasing the wake lock, and with
+ * that gone the OS stopped running the app - which stopped the audio, because
+ * the next buffer is rendered and armed from the frame callback. A sleep timer
+ * that silences the thing it is timing is not much use.
+ *
+ * So idle now dims to a low level and keeps the wake lock. That is most of the
+ * battery saving - the backlight dominates - without ever letting the app stop
+ * being run. */
+#define EN_DIM_PERCENT 8
 static void wake_screen(void)
 {
     s_last_touch_ms = en_sys_millis();
     if (s_blanked) {
         s_blanked = false;
         en_sys_backlight(100);
-        /* Take the idle-clock lock back now that the screen is meant to be
-           lit, so the OS does not dim it under a running program. */
-        en_sys_wake_lock(true);
     }
 }
 
@@ -330,11 +335,10 @@ static void blank_tick(void)
     uint32_t idle = (en_sys_millis() - s_last_touch_ms) / 1000u;
     if (!s_blanked && idle >= (uint32_t)P.blank_delay_s) {
         s_blanked = true;
-        /* Drop the wake lock FIRST. While it is held the OS idle clock keeps
-           being reset, and the backlight we just turned off comes straight
-           back on — which is exactly what the screen was seen doing. */
-        en_sys_wake_lock(false);
-        en_sys_backlight(0);
+        /* Dim, and keep the wake lock. Letting the OS put the app to sleep
+           would stop the frame callback, and the next audio buffer is armed
+           from there. */
+        en_sys_backlight(EN_DIM_PERCENT);
     }
 }
 
@@ -1091,8 +1095,8 @@ static void build_timer(void)
     }
 
     lv_obj_t *row = setting_row(s, 70 + 6 * (TAP_MIN + 1) + 10,
-                                "Blank screen",
-                                "Audio keeps running");
+                                "Dim when idle",
+                                "Stays awake so audio keeps running");
     s_blankplay_sw = lv_switch_create(row);
     lv_obj_set_size(s_blankplay_sw, 44, 26);
     lv_obj_set_pos(s_blankplay_sw, CONTENT_W - 44, 12);

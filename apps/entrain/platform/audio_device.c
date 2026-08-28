@@ -78,22 +78,31 @@
    memory of 44.1k for carriers that never go above a few hundred hertz. */
 #define DEVICE_RATE 22050u
 
-/* Window length. This is the app's worst-case response time to anything the
-   user does, and also how far ahead the engine renders. Short enough to feel
-   immediate, long enough that re-arming is two play() calls a second. */
-#define WINDOW_MS 500
+/* Overlap-add.
+ *
+ * Every buffer is twice the advance and carries a triangular window: it fades
+ * in across its first half and out across its second, so consecutive buffers
+ * overlap by a full advance and every sample of the output is the sum of
+ * exactly two ramps. Aligned, those sum to unity everywhere.
+ *
+ * That length is the whole point. A short crossfade only sums to unity when
+ * the two are perfectly aligned; start the next one late by d and the sum sits
+ * at 1 - d/overlap for the entire overlap. At 40 ms of overlap against a UI
+ * tick of 16 to 30 ms that was a 40 to 75 percent dip twice a second - an
+ * audible tremolo. At a one second overlap the same lateness costs about two
+ * percent, which is a fifth of a decibel.
+ *
+ * The advance is also the app's worst-case response time to anything the user
+ * does, so it should not grow without reason. */
+#define ADVANCE_MS 1000
 
-/* Crossfade between consecutive windows. Only has to cover UI-tick jitter. */
-#define XFADE_MS 40
-
-#define WINDOW_FRAMES ((DEVICE_RATE * WINDOW_MS) / 1000u)
-#define XFADE_FRAMES  ((DEVICE_RATE * XFADE_MS) / 1000u)
-#define BUFFER_FRAMES (WINDOW_FRAMES + XFADE_FRAMES)
+#define ADVANCE_FRAMES ((DEVICE_RATE * ADVANCE_MS) / 1000u)
+#define BUFFER_FRAMES  (ADVANCE_FRAMES * 2u)
 
 /* Longer than this since the last window started and we were not being run at
    all — the OS switched to another app. Restart cleanly rather than trying to
    catch up on audio nobody heard. */
-#define STARVED_MS (WINDOW_MS * 4)
+#define STARVED_MS (ADVANCE_MS * 4)
 
 typedef void *(*sfx_ctor_t)(void *self);
 typedef void *(*sfx_player_inst_t)(void);
@@ -122,9 +131,6 @@ static bool g_stopping;
 static int  g_volume = 45;
 static en_audio_state_t g_state = EN_AUDIO_IDLE;
 
-/* Scratch the engine renders into before the crossfade shaping is applied. */
-static int16_t *g_scratch;
-
 /* ---- helpers ------------------------------------------------------------- */
 
 static uint32_t os_volume(void)
@@ -145,46 +151,42 @@ static bool reserve(int16_t **pcm, uint32_t bytes)
 
 static bool buffers_ready(void)
 {
+    /* Two buffers and nothing else: the engine renders straight into the one
+       being prepared and the window is applied in place, so there is no third
+       scratch copy. */
     uint32_t bytes = BUFFER_FRAMES * 4u;
     if (!reserve(&g_win[0].pcm, bytes)) return false;
     if (!reserve(&g_win[1].pcm, bytes)) return false;
-    if (!reserve(&g_scratch, bytes)) return false;
     return true;
 }
 
-/* Ask the engine for the next stretch of audio and shape its ends so it
-   crossfades with its neighbours. The pull is asked for the whole buffer,
-   crossfade tail included, because the tail is real audio that the next window
-   will also carry — the two overlap rather than one being a copy. */
+/* Ask the engine for the next stretch of audio, straight into the buffer, then
+   apply the triangular window in place. */
 static bool fill_window(int idx)
 {
     window_t *w = &g_win[idx];
     if (!s_pull || s_source_done) return false;
 
-    /* Ask for the window plus the overlap, but tell the source to advance
-       only by the window: the overlap is real audio that the NEXT window also
-       carries, so it has to be produced twice. */
-    uint32_t got = s_pull(g_scratch, BUFFER_FRAMES, WINDOW_FRAMES, s_pull_ctx);
+    /* Two advances of audio, moving on by one. The second advance is the
+       overlap that the next buffer also carries, so the source renders those
+       frames twice - once as this buffer's falling half and once as the next
+       one's rising half. */
+    uint32_t got = s_pull(w->pcm, BUFFER_FRAMES, ADVANCE_FRAMES, s_pull_ctx);
     if (got == 0) { s_source_done = true; return false; }
 
+    /* Apply the triangular window: up across the first half, down across the
+       second. Its peak is at the advance point, which is exactly where the
+       neighbouring buffer's ramp crosses it, so the pair sums to unity. */
     for (uint32_t i = 0; i < BUFFER_FRAMES; i++) {
-        int32_t l = (i < got) ? g_scratch[2 * i + 0] : 0;
-        int32_t r = (i < got) ? g_scratch[2 * i + 1] : 0;
+        int32_t l = (i < got) ? w->pcm[2 * i + 0] : 0;
+        int32_t r = (i < got) ? w->pcm[2 * i + 1] : 0;
 
-        /* Linear gains summing to one with the neighbouring window. Correct
-           here because the overlap is the same signal in both, not two
-           independent ones. */
-        if (i < XFADE_FRAMES) {
-            int32_t g = (int32_t)((i * 4096u) / XFADE_FRAMES);
-            l = (l * g) >> 12;
-            r = (r * g) >> 12;
-        } else if (i >= WINDOW_FRAMES) {
-            int32_t g = 4096 - (int32_t)(((i - WINDOW_FRAMES) * 4096u) / XFADE_FRAMES);
-            l = (l * g) >> 12;
-            r = (r * g) >> 12;
-        }
-        w->pcm[2 * i + 0] = (int16_t)l;
-        w->pcm[2 * i + 1] = (int16_t)r;
+        int32_t g = (i < ADVANCE_FRAMES)
+                  ? (int32_t)((i * 4096u) / ADVANCE_FRAMES)
+                  : 4096 - (int32_t)(((i - ADVANCE_FRAMES) * 4096u) / ADVANCE_FRAMES);
+
+        w->pcm[2 * i + 0] = (int16_t)((l * g) >> 12);
+        w->pcm[2 * i + 1] = (int16_t)((r * g) >> 12);
     }
 
     w->frames = BUFFER_FRAMES;
@@ -221,7 +223,7 @@ static bool play_window(int idx)
     w->filled = false;
     g_playing = idx;
     g_started_ms = hb_time_uptime_ms();
-    g_frames_out += WINDOW_FRAMES;
+    g_frames_out += ADVANCE_FRAMES;
     g_state = EN_AUDIO_PLAYING;
     return true;
 }
@@ -368,7 +370,7 @@ void en_audio_tick(void)
         if (fill_window(idx)) g_filled_next = idx;
     }
 
-    if (elapsed < WINDOW_MS) return;
+    if (elapsed < ADVANCE_MS) return;
 
     if (g_stopping) {
         g_playing = -1;

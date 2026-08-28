@@ -417,6 +417,115 @@ static void test_noise_bed(void)
     free(pcm);
 }
 
+/* ---- overlap-add reconstruction ------------------------------------------
+ *
+ * The device plays a window at a time and overlap-adds consecutive windows,
+ * because nothing can silence a voice already sounding and the pool mixes
+ * rather than cuts. This checks the join maths, which has been wrong once
+ * already: a short crossfade only sums to unity when the two windows line up
+ * exactly, so a late tick turned into a 40% amplitude dip twice a second - an
+ * audible tremolo. Overlap-add with a full-advance triangle makes the same
+ * lateness cost d/advance instead of d/crossfade.
+ *
+ * The gain formula here mirrors audio_device.c exactly. */
+static int32_t ola_gain(uint32_t i, uint32_t advance)
+{
+    return (i < advance)
+         ? (int32_t)((i * 4096u) / advance)
+         : 4096 - (int32_t)(((i - advance) * 4096u) / advance);
+}
+
+static void test_overlap_add(void)
+{
+    section("overlap-add reconstruction");
+
+    const uint32_t sr = 22050;
+    const uint32_t advance = sr;          /* 1 s advance, 2 s buffers */
+    const uint32_t buflen = advance * 2;
+    const uint32_t total = advance * 6;
+
+    /* One continuous signal, the reference the joins must reproduce. */
+    int16_t *ref = malloc((size_t)total * 2 * sizeof *ref);
+    en_render_t r;
+    en_render_init(&r, sr, EN_NOISE_NONE, 1);
+    en_segment_t seg;
+    memset(&seg, 0, sizeof seg);
+    seg.sample_rate = sr;
+    seg.mode = EN_MODE_BINAURAL;
+    seg.noise = EN_NOISE_NONE;
+    seg.frames = total;
+    seg.start.carrier_hz = 200.0;
+    seg.start.beat_hz = 10.0;
+    seg.start.tone_level = 0.8;
+    seg.end = seg.start;
+    en_render_segment(&r, &seg, ref);
+
+    /* Now rebuild it the way the device does: windows of 2 x advance, each
+       triangular, summed at one advance apart. */
+    int32_t *acc = calloc((size_t)total * 2, sizeof *acc);
+    for (uint32_t start = 0; start + buflen <= total; start += advance) {
+        for (uint32_t i = 0; i < buflen; i++) {
+            int32_t g = ola_gain(i, advance);
+            acc[2 * (start + i) + 0] += (ref[2 * (start + i) + 0] * g) >> 12;
+            acc[2 * (start + i) + 1] += (ref[2 * (start + i) + 1] * g) >> 12;
+        }
+    }
+
+    /* Only the fully-covered interior is expected to reconstruct: the first
+       and last advance are covered by one window each, which is the app's
+       fade in and fade out. */
+    int worst = 0;
+    for (uint32_t i = advance; i < total - buflen; i++) {
+        for (int ch = 0; ch < 2; ch++) {
+            int d = acc[2 * i + ch] - ref[2 * i + ch];
+            if (d < 0) d = -d;
+            if (d > worst) worst = d;
+        }
+    }
+    printf("  aligned: worst reconstruction error %d of 32767\n", worst);
+    CHECK(worst <= 4, "overlap-add does not reconstruct (off by %d)", worst);
+
+    /* And the property that actually matters: being LATE must degrade
+       gently. Shift every other window by a plausible tick and measure the
+       amplitude dip. */
+    for (uint32_t late_ms = 16; late_ms <= 32; late_ms += 16) {
+        uint32_t d = (sr * late_ms) / 1000u;
+        memset(acc, 0, (size_t)total * 2 * sizeof *acc);
+        uint32_t k = 0;
+        for (uint32_t start = 0; start + buflen + d <= total; start += advance, k++) {
+            uint32_t at = start + ((k & 1) ? d : 0);
+            for (uint32_t i = 0; i < buflen; i++) {
+                int32_t g = ola_gain(i, advance);
+                acc[2 * (at + i) + 0] += (ref[2 * (at + i) + 0] * g) >> 12;
+                acc[2 * (at + i) + 1] += (ref[2 * (at + i) + 1] * g) >> 12;
+            }
+        }
+        /* Compare envelopes rather than samples: a shifted window reproduces
+           the same waveform at a slightly different gain. */
+        int peak_ref = 0, peak_min = 32767;
+        for (uint32_t i = advance * 2; i < total - buflen - d; i += advance / 4) {
+            int hi = 0, lo = 32767;
+            for (uint32_t j = i; j < i + advance / 4 && j < total; j++) {
+                int v = acc[2 * j] < 0 ? -acc[2 * j] : acc[2 * j];
+                if (v > hi) hi = v;
+                int w = ref[2 * j] < 0 ? -ref[2 * j] : ref[2 * j];
+                if (w > peak_ref) peak_ref = w;
+            }
+            (void)lo;
+            if (hi < peak_min) peak_min = hi;
+        }
+        int dip_pct = peak_ref ? 100 - (peak_min * 100) / peak_ref : 100;
+        printf("  %2u ms late: worst dip %d%%\n", late_ms, dip_pct);
+        /* The short-crossfade version dipped 40-75%% here. Anything in single
+           figures is inaudible. */
+        CHECK(dip_pct <= 12, "%u ms of lateness dips %d%% - that is audible",
+              late_ms, dip_pct);
+    }
+
+    free(acc);
+    free(ref);
+}
+
 /* ---- 6. phase continuity across a glide --------------------------------- */
 
 static void test_glide(void)
@@ -688,6 +797,7 @@ int main(void)
     test_clicks();
     test_loop_seams();
     test_noise_bed();
+    test_overlap_add();
     test_glide();
     test_levels();
     test_wav_header();
