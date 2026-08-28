@@ -17,6 +17,7 @@
 #include "../core/fmcmd.h"
 #include "../core/fmreg.h"
 #include "../core/rds.h"
+#include "../core/region.h"
 
 static int checks, failures;
 
@@ -631,6 +632,134 @@ static void test_rds_tuples(void)
     CHECK(n == 0, "no room means no groups");
 }
 
+/* ---- regions -------------------------------------------------------------- */
+
+static void test_regions(void)
+{
+    section("region band plans");
+
+    printf("  %u regions\n", en_region_count);
+    CHECK(en_region_count >= 5, "expected several regions, got %u",
+          en_region_count);
+
+    for (uint8_t i = 0; i < en_region_count; i++) {
+        const en_region_t *g = &en_regions[i];
+        printf("  %-11s %6u - %-6u kHz  step %3u  %-4s  %s\n",
+               g->name, g->low_khz, g->high_khz, g->step_khz,
+               g->rbds ? "RBDS" : "RDS",
+               g->deemph_75us ? "75us" : "50us");
+
+        CHECK(g->low_khz < g->high_khz, "%s has inverted edges", g->name);
+        CHECK(g->step_khz > 0, "%s has no channel spacing", g->name);
+
+        /* Every edge has to be expressible in the frequency register, which is
+           a 16-bit offset from 64 MHz. A band the tuner cannot reach would be
+           worse than not offering it. */
+        CHECK(g->low_khz >= EN_FM_BASE_KHZ,
+              "%s starts below the 64 MHz register base", g->name);
+        CHECK(g->high_khz - EN_FM_BASE_KHZ <= 65535,
+              "%s ends beyond the register range", g->name);
+
+        /* The band has to be a whole number of channels wide, or the top edge
+           is not a tunable channel. */
+        CHECK(((g->high_khz - g->low_khz) % g->step_khz) == 0,
+              "%s is not a whole number of channels wide", g->name);
+
+        CHECK(en_region_find(g->name) == g, "%s does not look up", g->name);
+    }
+    CHECK(en_region_find("Atlantis") == 0, "an unknown region must not match");
+
+    const en_region_t *am = en_region_find("Americas");
+    CHECK(am && am->rbds, "the Americas must decode RBDS");
+    CHECK(am && am->deemph_75us, "the Americas use 75 us de-emphasis");
+    CHECK(am && am->step_khz == 200, "the Americas use 200 kHz spacing");
+
+    const en_region_t *eu = en_region_find("Europe");
+    CHECK(eu && !eu->rbds, "Europe decodes RDS");
+    CHECK(eu && !eu->deemph_75us, "Europe uses 50 us de-emphasis");
+
+    /* On a 200 kHz plan the odd hundreds are not channels at all, which is the
+       thing that makes a grid check worth having. */
+    CHECK(en_region_on_grid(am, 98500), "98.5 is a valid US channel");
+    CHECK(!en_region_on_grid(am, 98600), "98.6 is not on a 200 kHz grid");
+    CHECK(en_region_on_grid(eu, 98600), "98.6 is a valid European channel");
+    CHECK(!en_region_on_grid(am, 120000), "out of band must not be on grid");
+
+    /* Stepping wraps at the edges rather than sticking. */
+    CHECK(en_region_step(am, 98500, true) == 98700, "step up wrong");
+    CHECK(en_region_step(am, 98500, false) == 98300, "step down wrong");
+    CHECK(en_region_step(am, 107900, true) == 87900, "step up should wrap");
+    CHECK(en_region_step(am, 87900, false) == 107900, "step down should wrap");
+    CHECK(en_region_on_grid(am, en_region_step(am, 98600, true)),
+          "stepping from off-grid must land on the grid");
+
+    const en_region_t *jp = en_region_find("Japan");
+    CHECK(jp && jp->low_khz == 76000, "Japan starts at 76 MHz");
+    CHECK(en_fm_khz_to_reg(76000) == 12000, "76 MHz should encode as 12000");
+
+    const en_region_t *oirt = en_region_find("OIRT");
+    CHECK(oirt && oirt->low_khz == 65000, "OIRT starts at 65 MHz");
+    CHECK(en_fm_khz_to_reg(65000) == 1000, "65 MHz should encode as 1000");
+}
+
+static void test_region_apply(void)
+{
+    section("applying a region");
+
+    uint8_t cmds[EN_REGION_CMDS][EN_FM_CMD_MAX];
+    uint8_t lens[EN_REGION_CMDS];
+    const en_region_t *am = en_region_find("Americas");
+
+    /* Existing contents that must survive: stereo auto-select in the control
+       register, and manual mute plus I2S routing in the audio register. */
+    uint8_t n = en_region_apply(am, 0x12, 0x0022, cmds, lens, EN_REGION_CMDS);
+    CHECK(n == EN_REGION_CMDS, "expected %u commands, got %u",
+          EN_REGION_CMDS, n);
+
+    for (uint8_t i = 0; i < n; i++) {
+        char label[32];
+        snprintf(label, sizeof label, "reg %02X", cmds[i][4]);
+        show(label, cmds[i], lens[i]);
+        CHECK(cmds[i][0] == 0x01 && cmds[i][1] == 0x15 && cmds[i][2] == 0xFC,
+              "command %u is not an FM_RDS_Command", i);
+        CHECK(cmds[i][5] == 0x00, "command %u should be a write", i);
+    }
+
+    /* Band select changed, everything else in the register preserved. */
+    CHECK(cmds[0][4] == 0x01, "first write should be I2C_FM_CTRL");
+    CHECK(cmds[0][6] == 0x12, "band select clobbered the stereo mode: %02x",
+          cmds[0][6]);
+
+    /* De-emphasis set for the Americas, mute and routing preserved. */
+    CHECK(cmds[1][4] == 0x05, "second write should be I2C_FM_AUDIO_CTRL");
+    CHECK(en_fm_get_u16(&cmds[1][6]) == 0x0062,
+          "de-emphasis clobbered the audio flags: %04x",
+          en_fm_get_u16(&cmds[1][6]));
+
+    /* Boundaries, upper then lower, in one write as the register requires. */
+    CHECK(cmds[2][4] == 0xFB, "third write should be the search boundary");
+    CHECK(en_fm_get_u16(&cmds[2][6]) == en_fm_khz_to_reg(107900),
+          "upper boundary wrong");
+    CHECK(en_fm_get_u16(&cmds[2][8]) == en_fm_khz_to_reg(87900),
+          "lower boundary wrong");
+
+    CHECK(cmds[3][4] == 0xFD, "fourth write should be the search step");
+    CHECK(en_fm_get_u16(&cmds[3][6]) == 200, "step wrong");
+
+    /* Europe clears the de-emphasis bit and leaves the rest alone. */
+    n = en_region_apply(en_region_find("Europe"), 0x13, 0x0062, cmds, lens,
+                        EN_REGION_CMDS);
+    CHECK(n == EN_REGION_CMDS, "Europe should apply too");
+    CHECK(cmds[0][6] == 0x12, "band select should have cleared bit 0");
+    CHECK(en_fm_get_u16(&cmds[1][6]) == 0x0022,
+          "de-emphasis should have cleared, leaving the rest");
+
+    /* All or nothing: too little room produces nothing at all rather than a
+       tuner left in neither region. */
+    CHECK(en_region_apply(am, 0, 0, cmds, lens, 2) == 0,
+          "a partial application must be refused");
+}
+
 int main(void)
 {
     printf("Radio+ core tests\n");
@@ -647,6 +776,9 @@ int main(void)
     test_rds_af();
     test_rds_robustness();
     test_rds_tuples();
+
+    test_regions();
+    test_region_apply();
 
     printf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
