@@ -1,0 +1,52 @@
+# Cross-build of the Radio+ Linux backend for the N31.
+#
+# Control goes through the bcm2078-bt driver sysfs interface and audio through
+# tinyalsa on hw:0,1 - nothing here opens a UART or builds an HCI packet, which
+# is the driver's job.
+#
+#   cd host && make -f Makefile.n31          compile-check everything
+#   cd host && make -f Makefile.n31 clean
+
+IPOD_ROOT ?= /mnt/c/src/ipod/artifacts/linux-n31
+TOOLCHAIN ?= $(IPOD_ROOT)/tinyalsa-build/arm-linux-musleabi-cross
+TINYALSA  ?= $(IPOD_ROOT)/tinyalsa-build/tinyalsa-2.0.0
+
+CC     := $(TOOLCHAIN)/bin/arm-linux-musleabi-gcc
+BUILD  := build-n31
+CORE   := ../core
+PLAT   := ../platform
+
+ARCH_FLAGS := -mcpu=cortex-a8 -mthumb -mfpu=vfpv3-d16 -mfloat-abi=softfp
+
+CFLAGS := -O2 -g0 -std=gnu99 $(ARCH_FLAGS) \
+          -ffunction-sections -fdata-sections \
+          -Wall -Wextra -Wshadow -Wno-unused-parameter \
+          -I$(TINYALSA)/include
+
+SRCS := $(CORE)/fmcmd.c $(CORE)/fmreg.c $(CORE)/rds.c $(CORE)/region.c \
+        $(CORE)/wav.c $(CORE)/store.c \
+        $(PLAT)/tuner_linux.c $(PLAT)/capture_linux.c
+
+OBJS := $(patsubst %.c,$(BUILD)/%.o,$(notdir $(SRCS)))
+HDRS := $(wildcard $(CORE)/*.h $(PLAT)/*.h)
+
+.PHONY: all clean toolchain-check
+all: $(OBJS)
+	@echo "compiled $(words $(OBJS)) objects for cortex-a8"
+
+toolchain-check:
+	@test -x $(CC) || { echo "no cross gcc at $(CC)"; exit 1; }
+	@test -d $(TINYALSA)/include || { echo "no tinyalsa at $(TINYALSA)"; exit 1; }
+	@$(CC) -dumpmachine
+
+$(BUILD):
+	@mkdir -p $(BUILD)
+
+$(BUILD)/%.o: $(CORE)/%.c $(HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(BUILD)/%.o: $(PLAT)/%.c $(HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+clean:
+	rm -rf $(BUILD)

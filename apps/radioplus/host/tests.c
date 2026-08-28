@@ -18,6 +18,8 @@
 #include "../core/fmreg.h"
 #include "../core/rds.h"
 #include "../core/region.h"
+#include "../core/wav.h"
+#include "../core/store.h"
 
 static int checks, failures;
 
@@ -760,6 +762,174 @@ static void test_region_apply(void)
           "a partial application must be refused");
 }
 
+/* ---- WAV and persistence -------------------------------------------------- */
+
+static void test_wav(void)
+{
+    section("WAV header");
+
+    uint8_t h[EN_WAV_HDR_BYTES];
+    uint32_t n = en_wav_header(h, sizeof h, 44100, 2, 16, 0);
+    CHECK(n == EN_WAV_HDR_BYTES, "header length %u", n);
+    CHECK(memcmp(h, "RIFF", 4) == 0 && memcmp(h + 8, "WAVE", 4) == 0,
+          "not a RIFF/WAVE header");
+    CHECK(memcmp(h + 36, "data", 4) == 0, "no data chunk");
+    CHECK(en_wav_data_len(h, sizeof h) == 0, "an open stream should say 0");
+
+    /* Byte rate and block align have to agree with the format, or players
+       compute the wrong duration and seek to the wrong place. */
+    uint32_t byte_rate = (uint32_t)h[28] | ((uint32_t)h[29] << 8)
+                       | ((uint32_t)h[30] << 16) | ((uint32_t)h[31] << 24);
+    CHECK(byte_rate == 44100u * 4u, "byte rate %u", byte_rate);
+    CHECK(h[32] == 4 && h[33] == 0, "block align wrong");
+
+    /* Patching after the fact is how a recording of unknown length closes. */
+    CHECK(en_wav_patch_len(h, sizeof h, 176400), "patch failed");
+    CHECK(en_wav_data_len(h, sizeof h) == 176400, "patched length not read back");
+    uint32_t riff = (uint32_t)h[4] | ((uint32_t)h[5] << 8)
+                  | ((uint32_t)h[6] << 16) | ((uint32_t)h[7] << 24);
+    CHECK(riff == 176400 + 36, "RIFF size not patched with it");
+
+    CHECK(en_wav_header(h, 10, 44100, 2, 16, 0) == 0,
+          "a header that does not fit must be refused");
+    CHECK(en_wav_header(h, sizeof h, 0, 2, 16, 0) == 0,
+          "a zero sample rate must be refused");
+    CHECK(en_wav_header(h, sizeof h, 44100, 2, 12, 0) == 0,
+          "an impossible bit depth must be refused");
+}
+
+static void test_presets(void)
+{
+    section("presets");
+
+    en_presets_t p;
+    en_presets_init(&p, "Americas");
+
+    en_preset_t e;
+    memset(&e, 0, sizeof e);
+
+    e.khz = 98500; strcpy(e.name, "CBC RADI"); e.pi = 0xC2B5; e.pty = 22;
+    e.rbds = true;
+    CHECK(en_preset_add(&p, &e), "add failed");
+
+    e.khz = 88100; strcpy(e.name, "VOCM"); e.pi = 0x1234; e.pty = 1;
+    CHECK(en_preset_add(&p, &e), "add failed");
+
+    e.khz = 102900; strcpy(e.name, "KIXX"); e.pi = 0x5678; e.pty = 10;
+    CHECK(en_preset_add(&p, &e), "add failed");
+    CHECK(p.count == 3, "count %u", p.count);
+
+    /* Re-adding updates rather than duplicating, so a placeholder is replaced
+       once the station name actually decodes. */
+    e.khz = 98500; strcpy(e.name, "CBC Radio One"); e.pi = 0xC2B5;
+    CHECK(en_preset_add(&p, &e), "update failed");
+    CHECK(p.count == 3, "re-adding a frequency should not duplicate it");
+    CHECK(strcmp(p.list[0].name, "CBC Radio One") == 0, "update did not apply");
+
+    en_preset_sort(&p);
+    CHECK(p.list[0].khz == 88100 && p.list[2].khz == 102900, "sort wrong");
+
+    char buf[4096];
+    uint32_t n = en_presets_save(&p, buf, sizeof buf);
+    CHECK(n > 0, "save overflowed");
+    printf("  %u bytes of JSON for %u presets\n", n, p.count);
+    printf("  %.140s...\n", buf);
+
+    en_presets_t q;
+    CHECK(en_presets_load(&q, buf, n), "load failed");
+    CHECK(q.count == p.count, "loaded %u of %u", q.count, p.count);
+    CHECK(strcmp(q.region, "Americas") == 0, "region lost: %s", q.region);
+    for (uint8_t i = 0; i < p.count; i++) {
+        CHECK(q.list[i].khz == p.list[i].khz, "preset %u frequency lost", i);
+        CHECK(strcmp(q.list[i].name, p.list[i].name) == 0,
+              "preset %u name lost: %s", i, q.list[i].name);
+        CHECK(q.list[i].pi == p.list[i].pi, "preset %u PI lost", i);
+        CHECK(q.list[i].rbds == p.list[i].rbds, "preset %u RBDS flag lost", i);
+    }
+
+    CHECK(en_preset_remove(&p, 88100), "remove failed");
+    CHECK(p.count == 2 && en_preset_find(&p, 88100) < 0, "remove did not");
+    CHECK(!en_preset_remove(&p, 88100), "removing twice should fail");
+
+    /* A truncated file must be reported, not silently half-written - a preset
+       list that quietly loses entries is worse than one that refuses. */
+    uint32_t small = en_presets_save(&p, buf, 40);
+    CHECK(small == 0, "an overflowing save must report 0, got %u", small);
+}
+
+static void test_sidecar(void)
+{
+    section("RDS sidecar");
+
+    en_rds_t r;
+    en_rds_init(&r, true);
+    for (uint8_t s2 = 0; s2 < 4; s2++) {
+        const char *nm = "CBC RADI";
+        uint16_t d = (uint16_t)(((uint8_t)nm[s2 * 2] << 8) | (uint8_t)nm[s2 * 2 + 1]);
+        feed(&r, 0xC2B5, blkb(0, false, true, 22, s2), 0, d);
+    }
+
+    char buf[2048];
+    static char whole[8192];
+    uint32_t total = 0;
+    en_sidecar_t sc;
+
+    uint32_t n = en_sidecar_begin(&sc, buf, sizeof buf, 98500, "Americas",
+                                  true, &r);
+    CHECK(n > 0, "sidecar header overflowed");
+    memcpy(whole + total, buf, n); total += n;
+
+    /* Groups are appended a flush at a time, so an hour of them never has to
+       fit in memory. */
+    const uint16_t g1[4] = { 0xC2B5, 0x02C0, 0x0000, 0x4342 };
+    const uint16_t g2[4] = { 0xC2B5, 0x22C1, 0x4E6F, 0x7720 };
+    n = en_sidecar_group(&sc, buf, sizeof buf, 0, g1, EN_RDS_ALL);
+    CHECK(n > 0, "group append overflowed");
+    memcpy(whole + total, buf, n); total += n;
+
+    n = en_sidecar_group(&sc, buf, sizeof buf, 1040, g2,
+                         (uint8_t)(EN_RDS_ALL & ~EN_RDS_C));
+    memcpy(whole + total, buf, n); total += n;
+
+    n = en_sidecar_end(&sc, buf, sizeof buf, 1500, &r);
+    CHECK(n > 0, "sidecar footer overflowed");
+    memcpy(whole + total, buf, n); total += n;
+    whole[total] = 0;
+
+    printf("  %u bytes for 2 groups\n", total);
+    printf("  %.200s...\n", whole);
+
+    /* Braces and brackets have to balance, or it is not JSON however good it
+       looks - the streaming append is exactly where that would break. */
+    int braces = 0, brackets = 0, instr = 0;
+    for (uint32_t i = 0; i < total; i++) {
+        char c = whole[i];
+        if (instr) {
+            if (c == '\\') i++;
+            else if (c == '"') instr = 0;
+            continue;
+        }
+        if (c == '"') instr = 1;
+        else if (c == '{') braces++;
+        else if (c == '}') braces--;
+        else if (c == '[') brackets++;
+        else if (c == ']') brackets--;
+        CHECK(braces >= 0 && brackets >= 0, "unbalanced at byte %u", i);
+    }
+    CHECK(braces == 0, "braces unbalanced by %d", braces);
+    CHECK(brackets == 0, "brackets unbalanced by %d", brackets);
+    CHECK(!instr, "a string was left open");
+
+    /* Raw blocks are what make a recording re-decodable later, which matters
+       while the FIFO framing is still unconfirmed. */
+    CHECK(strstr(whole, "\"blocks\"") != 0, "raw blocks not written");
+    CHECK(strstr(whole, "0xC2B5") != 0, "block A not written");
+    CHECK(strstr(whole, "\"valid\"") != 0, "block validity not written");
+    CHECK(strstr(whole, "CBC RADI") != 0, "decoded name not written");
+    CHECK(strstr(whole, "RBDS") != 0, "standard not recorded");
+    CHECK(strstr(whole, "\"duration_ms\":1500") != 0, "duration not written");
+}
+
 int main(void)
 {
     printf("Radio+ core tests\n");
@@ -779,6 +949,10 @@ int main(void)
 
     test_regions();
     test_region_apply();
+
+    test_wav();
+    test_presets();
+    test_sidecar();
 
     printf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
