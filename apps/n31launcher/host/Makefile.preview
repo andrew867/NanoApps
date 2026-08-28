@@ -18,7 +18,7 @@ LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_host.h\
              -I$(LVGL) -I$(LVGL)/src -I$(LVGL)/include -I$(LVGL)/.. -I..
 
 CFLAGS := -O1 -g -std=gnu99 -Wall -Wextra -Wno-unused-parameter
-SRCS := preview.c ../ui.c ../apps.c
+SRCS := preview.c ../ui.c ../apps.c ../status.c
 
 .PHONY: shots clean
 shots: $(BUILD)/preview

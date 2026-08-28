@@ -22,6 +22,7 @@
 
 #include "ui.h"
 #include "apps.h"
+#include "status.h"
 
 #include "lvgl/lvgl.h"
 
@@ -39,6 +40,8 @@
 #define C_EXTRAS 0xA78BFA
 #define C_MUSIC  0x34D399
 #define C_WARN   0xFB923C
+#define C_LOW    0xF43F5E
+#define C_OK     0x4ADE80
 
 #define F_BIG     (&lv_font_montserrat_24)
 #define F_NAME    (&lv_font_montserrat_20)
@@ -74,6 +77,12 @@ static void flat(lv_obj_t *o, uint32_t colour)
     lv_obj_set_style_radius(o, 0, 0);
     lv_obj_set_style_pad_all(o, 0, 0);
     lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+}
+
+static void show(lv_obj_t *o, bool on)
+{
+    if (on) lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
+    else    lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
 }
 
 static lv_obj_t *panel(lv_obj_t *parent, int x, int y, int w, int h,
@@ -150,11 +159,24 @@ static lv_obj_t *footer(lv_obj_t *screen, const char *text)
 typedef struct {
     lv_obj_t *root;
     lv_obj_t *tagline;
+    lv_obj_t *icon;        /* moved a couple of pixels by the accelerometer */
+    int       icon_x, icon_y;
+    int       depth;       /* per tile, so they do not move as one flat sheet */
 } tile_t;
 
 static lv_obj_t *s_home;
 static lv_obj_t *s_home_status;
 static tile_t    s_tile[3];
+
+/* The status bar. Each of these is hidden when there is nothing true to say
+   with it, and the row reflows - an absent battery leaves no gap. */
+static lv_obj_t *s_clock;
+static lv_obj_t *s_tray;
+static lv_obj_t *s_ic_bt;
+static lv_obj_t *s_ic_play;
+static lv_obj_t *s_ic_fm;
+static lv_obj_t *s_ic_batt;
+static lv_obj_t *s_ic_pct;
 
 /*
  * One home tile.
@@ -179,6 +201,10 @@ static void build_tile(tile_t *t, lv_obj_t *screen, int y, const char *name,
     lv_obj_set_style_radius(icon, 6, 0);
     lv_obj_center(label(icon, glyph, F_BIG, accent));
 
+    t->icon = icon;
+    t->icon_x = MARGIN + 4;
+    t->icon_y = 14;
+
     lv_obj_t *chip = panel(t->root, MARGIN + 4, 76, 58, 20, C_SURFACE_2);
     lv_obj_set_style_radius(chip, 3, 0);
     lv_obj_center(label(chip, key, F_CAPTION, accent));
@@ -192,13 +218,43 @@ static void build_tile(tile_t *t, lv_obj_t *screen, int y, const char *name,
     panel(t->root, MARGIN, TILE_H - 1, CONTENT_W, 1, C_HAIRLINE);
 }
 
+/*
+ * The header on the home screen carries the status bar instead of the "N31"
+ * label the other screens use. The clock sits left, everything else is a
+ * right-aligned row that reflows as icons come and go.
+ */
+static void build_status_bar(void)
+{
+    s_clock = label(s_home, "", F_CAPTION, C_TEXT_DIM);
+    lv_obj_set_pos(s_clock, MARGIN, 12);
+
+    s_tray = lv_obj_create(s_home);
+    flat(s_tray, C_BG);
+    lv_obj_set_style_bg_opa(s_tray, LV_OPA_TRANSP, 0);
+    lv_obj_set_size(s_tray, 150, 20);
+    lv_obj_set_pos(s_tray, N31_SCREEN_W - MARGIN - 150, 11);
+    lv_obj_set_flex_flow(s_tray, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(s_tray, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(s_tray, 6, 0);
+
+    s_ic_bt   = label(s_tray, LV_SYMBOL_BLUETOOTH, F_CAPTION, C_TEXT_MUTE);
+    s_ic_play = label(s_tray, LV_SYMBOL_PLAY,      F_CAPTION, C_OK);
+    s_ic_fm   = label(s_tray, "FM",                F_CAPTION, C_RADIO);
+    s_ic_batt = label(s_tray, LV_SYMBOL_BATTERY_FULL, F_CAPTION, C_TEXT_DIM);
+    s_ic_pct  = label(s_tray, "", F_CAPTION, C_TEXT_DIM);
+}
+
 static void build_home(void)
 {
     s_home = lv_obj_create(NULL);
     flat(s_home, C_BG);
     lv_obj_set_size(s_home, N31_SCREEN_W, N31_SCREEN_H);
 
-    header(s_home, &s_home_status);
+    /* No header() here: the status bar replaces it. */
+    s_home_status = NULL;
+    build_status_bar();
+    panel(s_home, MARGIN, HEADER_H, CONTENT_W, 1, C_HAIRLINE);
 
     /* Drawn in button order - volume up, play, volume down - so the tile you
        want is where your thumb already is. */
@@ -208,6 +264,12 @@ static void build_home(void)
                "Extra apps", "", "•••", "PLAY", C_EXTRAS);
     build_tile(&s_tile[N31_TILE_MUSIC],  s_home, TILE_TOP + 2 * TILE_H,
                "TinyPod", "Music", "TP", "VOL -", C_MUSIC);
+
+    /* Different amounts, so tilting reads as depth rather than as the whole
+       screen sliding. */
+    s_tile[N31_TILE_RADIO].depth  = 10;
+    s_tile[N31_TILE_EXTRAS].depth = 7;
+    s_tile[N31_TILE_MUSIC].depth  = 13;
 }
 
 void n31_ui_home(void)
@@ -224,6 +286,84 @@ void n31_ui_home(void)
     lv_label_set_text(s_tile[N31_TILE_EXTRAS].tagline, t);
 
     lv_screen_load(s_home);
+}
+
+/* Which battery glyph, by how full it is. */
+static const char *battery_glyph(int pct)
+{
+    if (pct >= 88) return LV_SYMBOL_BATTERY_FULL;
+    if (pct >= 62) return LV_SYMBOL_BATTERY_3;
+    if (pct >= 38) return LV_SYMBOL_BATTERY_2;
+    if (pct >= 12) return LV_SYMBOL_BATTERY_1;
+    return LV_SYMBOL_BATTERY_EMPTY;
+}
+
+void n31_ui_status_bar(const n31_status_t *st)
+{
+    if (!s_clock || !st) return;
+
+    char t[32];
+
+    /* An unset clock is shown as uptime rather than as 1970. */
+    if (st->clock_valid) snprintf(t, sizeof t, "%02d:%02d", st->hours,
+                                  st->minutes);
+    else if (st->hours)  snprintf(t, sizeof t, "up %dh %02dm", st->hours,
+                                  st->minutes);
+    else                 snprintf(t, sizeof t, "up %dm", st->minutes);
+    lv_label_set_text(s_clock, t);
+
+    /* Present but not up is drawn dim rather than hidden: "there is a radio
+       and it is not on" is worth knowing, and is the state this device is
+       actually in. */
+    show(s_ic_bt, st->bt_present);
+    lv_obj_set_style_text_color(s_ic_bt,
+        lv_color_hex(st->bt_up ? C_RADIO : C_TEXT_MUTE), 0);
+
+    show(s_ic_play, st->audio_playing);
+    show(s_ic_fm, st->fm_on);
+
+    show(s_ic_batt, st->have_battery);
+    show(s_ic_pct, st->have_battery);
+    if (st->have_battery) {
+        uint32_t c = C_TEXT_DIM;
+        if (st->charging)            c = C_OK;
+        else if (st->battery_pct <= 10) c = C_LOW;
+        else if (st->battery_pct <= 25) c = C_WARN;
+
+        lv_label_set_text(s_ic_batt, st->charging ? LV_SYMBOL_CHARGE
+                                                  : battery_glyph(st->battery_pct));
+        lv_obj_set_style_text_color(s_ic_batt, lv_color_hex(c), 0);
+
+        snprintf(t, sizeof t, "%d%%", st->battery_pct);
+        lv_label_set_text(s_ic_pct, t);
+        lv_obj_set_style_text_color(s_ic_pct, lv_color_hex(c), 0);
+    }
+}
+
+/*
+ * A couple of pixels of parallax on the tile icons.
+ *
+ * Deliberately small. This is a launcher, not a toy: the effect should be the
+ * kind of thing you notice on the second look, and it must never make a target
+ * appear to move under your thumb. The tiles themselves do not move at all -
+ * only the icon inside each one, by at most three pixels.
+ */
+void n31_ui_tilt(int tilt_x, int tilt_y)
+{
+    for (int i = 0; i < 3; i++) {
+        tile_t *t = &s_tile[i];
+        if (!t->icon) continue;
+
+        int dx = -tilt_x * t->depth / 300;
+        int dy =  tilt_y * t->depth / 300;
+
+        if (dx < -3) dx = -3;
+        if (dx > 3)  dx = 3;
+        if (dy < -3) dy = -3;
+        if (dy > 3)  dy = 3;
+
+        lv_obj_set_pos(t->icon, t->icon_x + dx, t->icon_y + dy);
+    }
 }
 
 void n31_ui_home_hot(int tile, bool on)
@@ -324,12 +464,6 @@ static void fill_row(row_t *r, int app_index)
         lv_obj_set_pos(r->name, MARGIN + 58, 21);
         lv_obj_add_flag(r->tagline, LV_OBJ_FLAG_HIDDEN);
     }
-}
-
-static void show(lv_obj_t *o, bool on)
-{
-    if (on) lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
-    else    lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
 }
 
 /* The indicator only appears when there is something off screen to indicate.
@@ -589,6 +723,9 @@ void n31_ui_init(void)
 void n31_ui_status(const char *text)
 {
     const char *t = text ? text : "";
+
+    /* The home screen has a status bar where the others have a status line,
+       so there is nothing to set there. */
     if (s_home_status)   lv_label_set_text(s_home_status, t);
     if (s_extras_status) lv_label_set_text(s_extras_status, t);
 }

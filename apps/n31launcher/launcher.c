@@ -55,6 +55,7 @@
 #include "ui.h"
 #include "apps.h"
 #include "fbcon.h"
+#include "status.h"
 
 #define FRAME_MS 33
 
@@ -75,6 +76,14 @@
    rebuilt occasionally and an app that appears simply appears. This is a
    readdir of one directory, not a disk scan. */
 #define RESCAN_MS 2000
+
+/* Battery, Bluetooth, playback and the tuner. A second is plenty - none of
+   them change faster than that in any way worth drawing. */
+#define STATUS_MS 1000
+
+/* Tilt, which has to keep up with the hand holding the device. One short read
+   and three small moves, so this is cheap enough to do properly. */
+#define TILT_MS 80
 
 #define MOUNT_HELPER "/bin/n31-mount-disk"
 
@@ -99,6 +108,8 @@ static pid_t s_child;             /* a running app */
 static bool  s_child_console;     /* it draws through the console, not fb0 */
 static screen_t s_child_from;     /* the screen to come back to */
 static uint32_t s_launched_at;
+
+static n31_status_t s_status;
 
 static pid_t s_mount;             /* the mount helper */
 static int   s_mount_fd = -1;
@@ -676,10 +687,20 @@ int main(int argc, char **argv)
     for (uint8_t i = 0; i < n31_app_count; i++)
         printf("n31launcher: %-12s %s\n", n31_apps[i].prog, n31_apps[i].path);
 
+    n31_status_read(&s_status);
+    n31_status_tilt(&s_status);
+    printf("n31launcher: battery %s, bluetooth %s, accelerometer %s\n",
+           s_status.have_battery ? "yes" : "no",
+           s_status.bt_up ? "up" : (s_status.bt_present ? "down" : "absent"),
+           s_status.have_tilt ? "yes" : "no");
+
     n31_ui_init();
+    n31_ui_status_bar(&s_status);
     go(SCREEN_HOME);
 
     uint32_t last_scan = millis();
+    uint32_t last_status = millis();
+    uint32_t last_tilt = millis();
 
     while (!s_quit) {
         pump_keys();
@@ -707,6 +728,20 @@ int main(int argc, char **argv)
         if (!s_mount && millis() - last_scan >= RESCAN_MS) {
             last_scan = millis();
             rescan();
+        }
+
+        /* Only the home screen shows either of these, so only sample for it. */
+        if (s_screen == SCREEN_HOME) {
+            if (millis() - last_status >= STATUS_MS) {
+                last_status = millis();
+                n31_status_read(&s_status);
+                n31_ui_status_bar(&s_status);
+            }
+            if (millis() - last_tilt >= TILT_MS) {
+                last_tilt = millis();
+                if (n31_status_tilt(&s_status))
+                    n31_ui_tilt(s_status.tilt_x, s_status.tilt_y);
+            }
         }
 
         uint32_t wait = lv_timer_handler();

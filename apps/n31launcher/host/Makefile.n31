@@ -35,7 +35,7 @@ LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_n31.h\"
              -I$(LVGL) -I$(LVGL)/src -I$(LVGL)/include -I$(LVGL)/.. -I..
 
 APP  := $(BUILD)/n31launcher
-SRCS := ../launcher.c ../ui.c ../apps.c ../fbcon.c
+SRCS := ../launcher.c ../ui.c ../apps.c ../fbcon.c ../status.c
 HDRS := $(wildcard ../*.h)
 
 .PHONY: all push run stop clean

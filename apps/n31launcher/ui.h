@@ -20,6 +20,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "status.h"
+
 #define N31_SCREEN_W 240
 #define N31_SCREEN_H 432
 
@@ -61,7 +63,17 @@ void n31_ui_mount_failed(const char *reason);
  */
 void n31_ui_starting(const char *name, uint32_t accent);
 
-/* Top-right line: what is running, or why something did not start. */
+/*
+ * The home screen status bar: clock, Bluetooth, playback, tuner, battery.
+ * Each part draws only when there is something true to say with it.
+ */
+void n31_ui_status_bar(const n31_status_t *st);
+
+/* A few pixels of parallax on the tile icons, from the accelerometer. Doing
+   nothing here is a perfectly good outcome - there may not be one. */
+void n31_ui_tilt(int tilt_x, int tilt_y);
+
+/* Top-right line on the screens that have one. */
 void n31_ui_status(const char *text);
 
 /* Mark everything dirty. An app that has been drawing over the framebuffer

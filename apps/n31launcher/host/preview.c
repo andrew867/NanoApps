@@ -100,6 +100,15 @@ int main(int argc, char **argv)
     n31_extra_first = n31_app_count;
 
     /* Nothing on the volume, which is the state of the device today. */
+    /* A plausible device: on battery, radio present but not up, nothing
+       playing, and no clock - which is the state of the hardware today. */
+    n31_status_t st;
+    memset(&st, 0, sizeof st);
+    st.have_battery = true; st.battery_pct = 52;
+    st.bt_present = true;
+    st.hours = 0; st.minutes = 38;
+    n31_ui_status_bar(&st);
+
     n31_ui_home();
     shot("home-no-extras");
 
@@ -130,6 +139,14 @@ int main(int argc, char **argv)
     add("Minesweeper", "on disk",        "MI", 0x38BDF8);
     add("Level",   "",                   "LE", 0x4ADE80);
     add("Paint",   "on disk",            "PA", 0xF472B6);
+
+    /* And the busy version: charging, Bluetooth up, audio playing, tuner on,
+       with a real clock - every indicator lit at once, which is the layout
+       worth checking because it is the widest the row ever gets. */
+    st.charging = true; st.battery_pct = 78;
+    st.bt_up = true; st.audio_playing = true; st.fm_on = true;
+    st.clock_valid = true; st.hours = 14; st.minutes = 32;
+    n31_ui_status_bar(&st);
 
     n31_ui_home();
     shot("home");
