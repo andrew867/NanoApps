@@ -971,6 +971,50 @@ static void test_settings(void)
     CHECK(c.live_seconds == 30,
           "a missing field should keep its default, got %u", c.live_seconds);
     CHECK(c.rds_on, "a missing flag should keep its default");
+
+    /* Register overrides ride in the same file. The tuner forgets everything
+       on power down, so an override that does not survive this round trip is
+       an override that lasts until the battery does. */
+    en_settings_t d;
+    en_settings_default(&d);
+
+    const uint8_t audio[2] = { 0x01, 0xB0 };
+    const uint8_t blend[8] = { 40, 20, 0xC4, 0xB0, 15, 0xE2, 12, 7 };
+    CHECK(en_override_set(&d.overrides, 0x05, audio, 2), "set 0x05");
+    CHECK(en_override_set(&d.overrides, 0xF9, blend, 8), "set 0xF9");
+    CHECK(d.overrides.count == 2, "count %u", d.overrides.count);
+
+    /* Editing the same register twice replaces rather than appends, or a
+       morning of fiddling fills the list. */
+    const uint8_t audio2[2] = { 0x01, 0xF0 };
+    en_override_set(&d.overrides, 0x05, audio2, 2);
+    CHECK(d.overrides.count == 2, "re-setting a register should not append");
+
+    n = en_settings_save(&d, buf, sizeof buf);
+    CHECK(n > 0, "save with overrides overflowed");
+    printf("  %s\n", buf);
+
+    en_settings_t e;
+    CHECK(en_settings_load(&e, buf, n), "load with overrides failed");
+    CHECK(e.overrides.count == 2, "loaded %u overrides", e.overrides.count);
+
+    const en_override_t *o = en_override_find(&e.overrides, 0x05);
+    CHECK(o && o->len == 2, "0x05 lost");
+    CHECK(o && o->data[0] == 0x01 && o->data[1] == 0xF0,
+          "0x05 payload wrong");
+
+    /* An eight-byte payload has to come back eight bytes long: the length is
+       part of the value, which is why they are stored as hex rather than as a
+       number. */
+    o = en_override_find(&e.overrides, 0xF9);
+    CHECK(o && o->len == 8, "0xF9 length lost: %u", o ? o->len : 0);
+    if (o) for (uint8_t i = 0; i < 8; i++)
+        CHECK(o->data[i] == blend[i], "0xF9 byte %u wrong", i);
+
+    CHECK(en_override_clear(&e.overrides, 0x05), "clear failed");
+    CHECK(!en_override_find(&e.overrides, 0x05), "still there after clear");
+    CHECK(en_override_find(&e.overrides, 0xF9), "clear removed the wrong one");
+    CHECK(!en_override_clear(&e.overrides, 0x05), "clearing twice should fail");
 }
 
 int main(void)

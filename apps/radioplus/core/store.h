@@ -96,11 +96,44 @@ bool     en_presets_load(en_presets_t *p, const char *json, uint32_t len);
  * settings file written by one build selects a different band in the next one
  * if the table ever gains a row.
  */
+/*
+ * A register the user has changed by hand.
+ *
+ * The tuner forgets everything when it is powered down, so a setting made in
+ * the register explorer lasts exactly as long as the chip stays on. Keeping the
+ * writes here and replaying them at start-up is what makes the explorer a
+ * settings screen rather than a toy - a stereo blend curve tuned once should
+ * still be there tomorrow.
+ *
+ * Replayed after the region, so a region change cannot silently undo a
+ * deliberate override of one of the registers it touches.
+ */
+#define EN_OVERRIDE_MAX 16
+
+typedef struct {
+    uint8_t addr;
+    uint8_t len;
+    uint8_t data[8];
+} en_override_t;
+
+typedef struct {
+    en_override_t list[EN_OVERRIDE_MAX];
+    uint8_t       count;
+} en_overrides_t;
+
+/* Replaces an existing entry for the same register rather than appending, so
+   editing one field twice leaves one override and not two. */
+bool en_override_set(en_overrides_t *o, uint8_t addr, const uint8_t *data,
+                     uint8_t len);
+bool en_override_clear(en_overrides_t *o, uint8_t addr);
+const en_override_t *en_override_find(const en_overrides_t *o, uint8_t addr);
+
 typedef struct {
     char     region[24];
     uint32_t khz;            /* where to come back to */
     bool     rds_on;
     uint8_t  live_seconds;   /* how much live buffer to allocate */
+    en_overrides_t overrides;
 } en_settings_t;
 
 void     en_settings_default(en_settings_t *s);

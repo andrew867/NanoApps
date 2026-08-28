@@ -151,6 +151,36 @@ void rp_act_preset_toggle(void)
     en_preset_sort(&rp_model.presets);
 }
 
+/* A shadow of the chip, so the register editor can be driven in the preview.
+   Values persist for the run, which is enough to see a toggle stick. */
+static uint8_t s_shadow[256][8];
+static en_overrides_t s_over;
+
+bool rp_act_reg_read(uint8_t addr, uint8_t *buf, uint8_t len)
+{
+    if (!buf || !len) return false;
+    for (uint8_t i = 0; i < len && i < 8; i++) buf[i] = s_shadow[addr][i];
+    return true;
+}
+
+void rp_act_reg_write(uint8_t addr, const uint8_t *buf, uint8_t len)
+{
+    if (!buf || !len) return;
+    for (uint8_t i = 0; i < len && i < 8; i++) s_shadow[addr][i] = buf[i];
+    en_override_set(&s_over, addr, buf, len);
+}
+
+void rp_act_reg_revert(uint8_t addr)
+{
+    en_override_clear(&s_over, addr);
+    for (uint8_t i = 0; i < 8; i++) s_shadow[addr][i] = 0;
+}
+
+bool rp_act_reg_overridden(uint8_t addr)
+{
+    return en_override_find(&s_over, addr) != 0;
+}
+
 void rp_act_set_region(const en_region_t *rg)
 {
     if (!rg) return;

@@ -177,6 +177,14 @@ static uint32_t read_uint(const char *p, const char *end, uint32_t *out)
     return n;
 }
 
+static bool read_uint_hex_digit(char c, uint32_t *out)
+{
+    if (c >= '0' && c <= '9') { *out = (uint32_t)(c - '0'); return true; }
+    if (c >= 'A' && c <= 'F') { *out = (uint32_t)(c - 'A' + 10); return true; }
+    if (c >= 'a' && c <= 'f') { *out = (uint32_t)(c - 'a' + 10); return true; }
+    return false;
+}
+
 static void read_str(const char *p, const char *end, char *out, uint32_t cap)
 {
     uint32_t n = 0;
@@ -335,6 +343,48 @@ bool en_presets_load(en_presets_t *p, const char *json, uint32_t len)
     return true;
 }
 
+/* ---- register overrides -------------------------------------------------- */
+
+const en_override_t *en_override_find(const en_overrides_t *o, uint8_t addr)
+{
+    if (!o) return 0;
+    for (uint8_t i = 0; i < o->count; i++)
+        if (o->list[i].addr == addr) return &o->list[i];
+    return 0;
+}
+
+bool en_override_set(en_overrides_t *o, uint8_t addr, const uint8_t *data,
+                     uint8_t len)
+{
+    if (!o || !data || !len || len > 8) return false;
+
+    en_override_t *slot = 0;
+    for (uint8_t i = 0; i < o->count; i++)
+        if (o->list[i].addr == addr) { slot = &o->list[i]; break; }
+
+    if (!slot) {
+        if (o->count >= EN_OVERRIDE_MAX) return false;
+        slot = &o->list[o->count++];
+    }
+
+    slot->addr = addr;
+    slot->len = len;
+    for (uint8_t i = 0; i < len; i++) slot->data[i] = data[i];
+    return true;
+}
+
+bool en_override_clear(en_overrides_t *o, uint8_t addr)
+{
+    if (!o) return false;
+    for (uint8_t i = 0; i < o->count; i++) {
+        if (o->list[i].addr != addr) continue;
+        for (uint8_t k = i; k + 1 < o->count; k++) o->list[k] = o->list[k + 1];
+        o->count--;
+        return true;
+    }
+    return false;
+}
+
 /* ---- settings ------------------------------------------------------------ */
 
 void en_settings_default(en_settings_t *s)
@@ -358,6 +408,28 @@ uint32_t en_settings_save(const en_settings_t *s, char *buf, uint32_t cap)
     en_json_uint(&j, "khz", s->khz);
     en_json_bool(&j, "rds", s->rds_on);
     en_json_uint(&j, "live_seconds", s->live_seconds);
+
+    /* Written as hex bytes rather than a number, because a register payload is
+       a byte string of its own length and turning it into an integer would
+       lose how long it was. */
+    en_json_arr_open(&j, "registers");
+    for (uint8_t i = 0; i < s->overrides.count; i++) {
+        const en_override_t *o = &s->overrides.list[i];
+        en_json_obj_open(&j, 0);
+        en_json_uint(&j, "reg", o->addr);
+        char hex[20];
+        static const char d[] = "0123456789ABCDEF";
+        uint8_t k = 0;
+        for (uint8_t b = 0; b < o->len && k < 16; b++) {
+            hex[k++] = d[(o->data[b] >> 4) & 0xF];
+            hex[k++] = d[o->data[b] & 0xF];
+        }
+        hex[k] = 0;
+        en_json_str(&j, "bytes", hex);
+        en_json_obj_close(&j);
+    }
+    en_json_arr_close(&j);
+
     en_json_obj_close(&j);
     return en_json_done(&j);
 }
@@ -386,6 +458,44 @@ bool en_settings_load(en_settings_t *s, const char *json, uint32_t len)
 
     v = find_key(json, end, "live_seconds");
     if (v && read_uint(v, end, &n) && n) s->live_seconds = (uint8_t)n;
+
+    const char *arr = find_key(json, end, "registers");
+    if (arr && *arr == '[') {
+        const char *q = arr + 1;
+        while (q < end && s->overrides.count < EN_OVERRIDE_MAX) {
+            q = skip_ws(q, end);
+            if (q >= end || *q == ']') break;
+            if (*q != '{') { q++; continue; }
+
+            const char *obj = q;
+            int depth = 0;
+            while (q < end) {
+                if (*q == '{') depth++;
+                else if (*q == '}') { depth--; if (!depth) { q++; break; } }
+                q++;
+            }
+            const char *oend = q;
+
+            uint32_t addr = 0;
+            const char *f = find_key(obj, oend, "reg");
+            if (!f || !read_uint(f, oend, &addr)) continue;
+
+            char hex[20];
+            f = find_key(obj, oend, "bytes");
+            if (!f) continue;
+            read_str(f, oend, hex, sizeof hex);
+
+            uint8_t data[8], nbytes = 0;
+            for (uint8_t k = 0; hex[k] && hex[k + 1] && nbytes < 8; k += 2) {
+                uint32_t hi = 0, lo = 0;
+                if (!read_uint_hex_digit(hex[k], &hi)) break;
+                if (!read_uint_hex_digit(hex[k + 1], &lo)) break;
+                data[nbytes++] = (uint8_t)((hi << 4) | lo);
+            }
+            if (nbytes)
+                en_override_set(&s->overrides, (uint8_t)addr, data, nbytes);
+        }
+    }
 
     return true;
 }

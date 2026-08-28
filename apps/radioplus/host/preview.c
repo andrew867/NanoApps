@@ -118,6 +118,25 @@ int main(int argc, char **argv)
         }
     }
 
+    /* Three registers with different field shapes, because the editor is
+       generated from the table and the shapes are what it has to get right:
+       0x05 packs a range field above a bitmap, 0xFA is an enum, and 0xF9 is
+       eight sliders of mixed sign. */
+    static const struct { uint8_t addr; const char *name; } regs[] = {
+        { 0x05, "8-reg-audio" },
+        { 0xFA, "9-reg-antenna" },
+        { 0xF9, "10-reg-blend" },
+    };
+    for (unsigned i = 0; i < sizeof regs / sizeof regs[0]; i++) {
+        rp_ui_open_register(regs[i].addr);
+        settle();
+        snprintf(path, sizeof path, "%s/%s.bmp", out, regs[i].name);
+        if (write_bmp(path, s_fb, RP_SCREEN_W, RP_SCREEN_H)) {
+            printf("  %s\n", path);
+            made++;
+        }
+    }
+
     /* One more of Now Playing mid-recording, because the recording state
        changes several things at once and is worth seeing as a whole. */
     rp_act_record_toggle();

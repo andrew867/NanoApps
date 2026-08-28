@@ -81,6 +81,12 @@ static lv_obj_t *s_preset_list, *s_library_list;
 static lv_obj_t *s_set_region, *s_set_std, *s_set_backend, *s_set_capture;
 static lv_obj_t *s_adv_list;
 
+/* The register being edited, and its live payload. */
+static const en_fm_reg_t *s_reg;
+static uint8_t s_reg_val[8];
+static lv_obj_t *s_reg_title, *s_reg_name, *s_reg_doc, *s_reg_body,
+                *s_reg_hex, *s_reg_revert;
+
 /* ---- small builders ------------------------------------------------------- */
 
 /* A flat panel: no border, no radius, no shadow. Everything in this interface
@@ -226,7 +232,7 @@ static void build_dots(lv_obj_t *parent)
 {
     /* One dot per screen, centred. The advanced screen is not in the swipe
        order - it is reached from settings - so it gets no dot. */
-    const int n = RP_SCREEN_COUNT - 1;
+    const int n = RP_SWIPE_COUNT;
     const int gap = 14;
     int x = (RP_SCREEN_W - (n - 1) * gap) / 2 - 2;
 
@@ -240,7 +246,7 @@ static void build_dots(lv_obj_t *parent)
 
 static void refresh_dots(void)
 {
-    for (int i = 0; i < RP_SCREEN_COUNT - 1; i++) {
+    for (int i = 0; i < RP_SWIPE_COUNT; i++) {
         if (!s_dots[i]) continue;
         bool on = (i == (int)s_current);
         lv_obj_set_style_bg_color(s_dots[i],
@@ -262,7 +268,7 @@ static void on_gesture(lv_event_t *e)
     else return;
 
     if (next < 0) next = 0;
-    if (next > RP_SCREEN_COUNT - 2) next = RP_SCREEN_COUNT - 2;
+    if (next > RP_SWIPE_COUNT - 1) next = RP_SWIPE_COUNT - 1;
     rp_ui_show((rp_screen_t)next);
 }
 
@@ -785,6 +791,11 @@ static void refresh_settings(void)
 
 /* ---- Advanced: the register explorer --------------------------------------- */
 
+static void on_register_pick(lv_event_t *e)
+{
+    rp_ui_open_register((uint8_t)(uintptr_t)lv_event_get_user_data(e));
+}
+
 static void on_advanced_back(lv_event_t *e)
 {
     (void)e;
@@ -831,7 +842,8 @@ static void refresh_advanced(void)
     char buf[80];
     for (uint8_t i = 0; i < en_fm_reg_count; i++) {
         const en_fm_reg_t *g = &en_fm_regs[i];
-        lv_obj_t *r = row(s_adv_list, y, 54, 0, 0);
+        lv_obj_t *r = row(s_adv_list, y, 54, on_register_pick,
+                          (void *)(uintptr_t)g->addr);
 
         /* Address in hex, because that is how the datasheet and every other
            tool refer to it, and matching them is the whole point of this
@@ -866,6 +878,307 @@ static void refresh_advanced(void)
     }
 }
 
+/* ---- one register, field by field ------------------------------------------ */
+
+/*
+ * Every control here is generated from the field descriptors in fmreg.c. A
+ * bitmap becomes a list of toggles named by its bits, an enum becomes a list of
+ * options, and everything else becomes a slider bounded by the range the table
+ * declares. Nothing about any particular register is written down twice.
+ */
+
+static void reg_push(void)
+{
+    if (!s_reg) return;
+    rp_act_reg_write(s_reg->addr, s_reg_val, s_reg->write_len);
+}
+
+/* user_data packs which field and which bit, since a toggle needs both. */
+#define PACK(f, b)  ((void *)(uintptr_t)(((uint32_t)(f) << 8) | (uint8_t)(b)))
+#define UNPACK_F(p) ((uint8_t)(((uintptr_t)(p) >> 8) & 0xFF))
+#define UNPACK_B(p) ((uint8_t)((uintptr_t)(p) & 0xFF))
+
+static void on_bit_toggle(lv_event_t *e)
+{
+    void *u = lv_event_get_user_data(e);
+    if (!s_reg) return;
+
+    const en_fm_field_t *f = &s_reg->fields[UNPACK_F(u)];
+    uint32_t mask = f->bits[UNPACK_B(u)].mask;
+
+    int32_t v = en_fm_field_get(f, s_reg_val, s_reg->write_len);
+    v = (int32_t)(((uint32_t)v) ^ mask);
+
+    if (en_fm_field_set(f, s_reg_val, s_reg->write_len, v)) reg_push();
+    rp_ui_open_register(s_reg->addr);      /* redraw with the new state */
+}
+
+static void on_enum_pick(lv_event_t *e)
+{
+    void *u = lv_event_get_user_data(e);
+    if (!s_reg) return;
+
+    const en_fm_field_t *f = &s_reg->fields[UNPACK_F(u)];
+    int32_t v = (int32_t)f->vals[UNPACK_B(u)].value;
+
+    if (en_fm_field_set(f, s_reg_val, s_reg->write_len, v)) reg_push();
+    rp_ui_open_register(s_reg->addr);
+}
+
+static void on_slider(lv_event_t *e)
+{
+    lv_obj_t *sl = lv_event_get_target(e);
+    void *u = lv_event_get_user_data(e);
+    if (!s_reg) return;
+
+    const en_fm_field_t *f = &s_reg->fields[UNPACK_F(u)];
+    if (en_fm_field_set(f, s_reg_val, s_reg->write_len,
+                        (int32_t)lv_slider_get_value(sl)))
+        reg_push();
+
+    /* Only the readout is updated here. Rebuilding the screen mid-drag would
+       destroy the slider under the finger. */
+    lv_obj_t *val = lv_obj_get_child(lv_obj_get_parent(sl), 1);
+    if (val) {
+        char b[16];
+        put_uint(b, (uint32_t)lv_slider_get_value(sl), 0);
+        lv_label_set_text(val, b);
+    }
+}
+
+static void on_reg_back(lv_event_t *e)
+{
+    (void)e;
+    rp_ui_show(RP_SCREEN_ADVANCED);
+}
+
+static void on_reg_revert(lv_event_t *e)
+{
+    (void)e;
+    if (!s_reg) return;
+    rp_act_reg_revert(s_reg->addr);
+    rp_ui_open_register(s_reg->addr);
+}
+
+/* A row whose right-hand chip is filled when the thing is on. Used for both
+   bitmap bits and enum options, because "this one is selected" reads the same
+   either way. */
+static int reg_choice(lv_obj_t *parent, int y, const char *name, bool on,
+                      lv_event_cb_t cb, void *user)
+{
+    lv_obj_t *r = row(parent, y, 44, cb, user);
+
+    lv_obj_t *l = label(r, name, F_CAPTION, on ? C_TEXT : C_TEXT_DIM);
+    lv_obj_set_width(l, CONTENT_W - 40);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+    lv_obj_set_pos(l, MARGIN + 8, 14);
+
+    lv_obj_t *chip = panel(r, RP_SCREEN_W - MARGIN - 24, 15, 14, 14,
+                           on ? C_SIGNAL : C_SURFACE_2);
+    lv_obj_set_style_radius(chip, 3, 0);
+
+    panel(r, MARGIN + 8, 43, CONTENT_W - 8, 1, C_HAIRLINE);
+    return y + 44;
+}
+
+static int reg_slider(lv_obj_t *parent, int y, const en_fm_field_t *f,
+                      uint8_t fi)
+{
+    lv_obj_t *r = row(parent, y, 66, 0, 0);
+
+    lv_obj_t *n = label(r, f->name, F_CAPTION, C_TEXT);
+    lv_obj_set_pos(n, MARGIN + 8, 8);
+
+    /* Child index 1: on_slider finds the readout this way rather than caching
+       a pointer per field. */
+    int32_t cur = en_fm_field_get(f, s_reg_val, s_reg->write_len);
+    char b[16];
+    put_uint(b, (uint32_t)(cur < 0 ? -cur : cur), 0);
+    lv_obj_t *val = label(r, b, F_CAPTION, C_SIGNAL);
+    lv_obj_set_style_text_align(val, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_width(val, CONTENT_W - 16);
+    lv_obj_set_pos(val, MARGIN + 8, 8);
+
+    lv_obj_t *sl = lv_slider_create(r);
+    lv_obj_set_size(sl, CONTENT_W - 16, 6);
+    lv_obj_set_pos(sl, MARGIN + 8, 36);
+    lv_slider_set_range(sl, f->min, f->max);
+    lv_slider_set_value(sl, cur, LV_ANIM_OFF);
+
+    lv_obj_set_style_bg_color(sl, lv_color_hex(C_SURFACE_2), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(sl, lv_color_hex(C_SIGNAL), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(sl, lv_color_hex(C_TEXT), LV_PART_KNOB);
+    lv_obj_set_style_radius(sl, 2, LV_PART_MAIN);
+    lv_obj_set_style_radius(sl, 2, LV_PART_INDICATOR);
+    lv_obj_set_style_pad_all(sl, 7, LV_PART_KNOB);
+    lv_obj_set_ext_click_area(sl, 18);
+    lv_obj_add_event_cb(sl, on_slider, LV_EVENT_VALUE_CHANGED, PACK(fi, 0));
+
+    panel(r, MARGIN + 8, 65, CONTENT_W - 8, 1, C_HAIRLINE);
+    return y + 66;
+}
+
+static void build_register(void)
+{
+    lv_obj_t *s = s_screen[RP_SCREEN_REGISTER];
+
+    lv_obj_t *back = panel(s, 0, 0, RP_SCREEN_W - 76, 40, C_BG);
+    lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(back, on_reg_back, LV_EVENT_CLICKED, 0);
+    lv_obj_t *b = label(back, LV_SYMBOL_LEFT "  REGISTERS", F_CAPTION,
+                        C_TEXT_MUTE);
+    lv_obj_set_pos(b, MARGIN, 12);
+
+    /* Only shown when this register has actually been overridden - an always
+       present Revert invites undoing something that was never done. */
+    s_reg_revert = panel(s, RP_SCREEN_W - 76, 0, 76, 40, C_BG);
+    lv_obj_add_flag(s_reg_revert, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_reg_revert, on_reg_revert, LV_EVENT_CLICKED, 0);
+    lv_obj_t *rv = label(s_reg_revert, "REVERT", F_CAPTION, C_TA);
+    lv_obj_set_pos(rv, 12, 12);
+
+    /* The address in large type on the left - it is short, and it is what you
+       match against a datasheet - with the raw value opposite it. */
+    s_reg_title = label(s, "", F_TITLE, C_SIGNAL);
+    lv_obj_set_pos(s_reg_title, MARGIN, 46);
+
+    s_reg_hex = label(s, "", F_CAPTION, C_TEXT_DIM);
+    lv_obj_set_style_text_align(s_reg_hex, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_width(s_reg_hex, CONTENT_W);
+    lv_obj_set_pos(s_reg_hex, MARGIN, 52);
+
+    /* The name underneath, at a size that fits. Given a height as well as a
+       width, so LV_LABEL_LONG_DOT truncates rather than wrapping. */
+    s_reg_name = label(s, "", F_BODY, C_TEXT);
+    lv_obj_set_size(s_reg_name, CONTENT_W, 20);
+    lv_label_set_long_mode(s_reg_name, LV_LABEL_LONG_DOT);
+    lv_obj_set_pos(s_reg_name, MARGIN, 76);
+
+    s_reg_doc = para(s, "", F_CAPTION, C_TEXT_MUTE, CONTENT_W);
+    lv_obj_set_pos(s_reg_doc, MARGIN, 102);
+
+    hairline(s, 146);
+    s_reg_body = panel(s, 0, 152, RP_SCREEN_W, RP_SCREEN_H - 162, C_BG);
+    lv_obj_add_flag(s_reg_body, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(s_reg_body, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_reg_body, LV_SCROLLBAR_MODE_OFF);
+}
+
+void rp_ui_open_register(uint8_t addr)
+{
+    s_reg = en_fm_reg_find(addr);
+    if (!s_reg) return;
+
+    /* Start from what the chip currently holds, so editing one field of a
+       packed register leaves its neighbours where they were. Registers that
+       cannot be read start from an override if there is one, and from zero if
+       not - which is stated on screen rather than left to be discovered. */
+    for (uint8_t i = 0; i < 8; i++) s_reg_val[i] = 0;
+    bool live = (s_reg->flags & EN_FM_R)
+             && rp_act_reg_read(addr, s_reg_val,
+                                s_reg->write_len ? s_reg->write_len
+                                                 : s_reg->read_len);
+
+    char buf[96];
+    static const char hex[] = "0123456789ABCDEF";
+
+    buf[0] = '0'; buf[1] = 'x';
+    buf[2] = hex[(addr >> 4) & 0xF];
+    buf[3] = hex[addr & 0xF];
+    buf[4] = 0;
+    lv_label_set_text(s_reg_title, buf);
+    lv_label_set_text(s_reg_name, s_reg->name);
+
+    /* The raw value, because anyone on this screen is cross-referencing a
+       datasheet and wants the number the fields add up to. */
+    buf[0] = 0;
+    if (s_reg->write_len) {
+        cat(buf, "= 0x", sizeof buf);
+        char h[3] = { 0, 0, 0 };
+        for (uint8_t i = 0; i < s_reg->write_len; i++) {
+            h[0] = hex[(s_reg_val[i] >> 4) & 0xF];
+            h[1] = hex[s_reg_val[i] & 0xF];
+            cat(buf, h, sizeof buf);
+        }
+    }
+    if (!live && (s_reg->flags & EN_FM_R)) cat(buf, "   (not read)", sizeof buf);
+    lv_label_set_text(s_reg_hex, buf);
+    lv_label_set_text(s_reg_doc, s_reg->doc ? s_reg->doc : "");
+
+    if (rp_act_reg_overridden(addr))
+        lv_obj_remove_flag(s_reg_revert, LV_OBJ_FLAG_HIDDEN);
+    else
+        lv_obj_add_flag(s_reg_revert, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_clean(s_reg_body);
+    int y = 0;
+
+    if (!s_reg->nfields) {
+        lv_obj_t *n = label(s_reg_body, "No fields described", F_CAPTION,
+                            C_TEXT_MUTE);
+        lv_obj_set_pos(n, MARGIN, 8);
+    }
+
+    for (uint8_t i = 0; i < s_reg->nfields; i++) {
+        const en_fm_field_t *f = &s_reg->fields[i];
+
+        /* A register that cannot be written gets its values shown and no
+           controls - offering a slider that does nothing would be a lie. */
+        bool editable = (s_reg->flags & EN_FM_W) != 0;
+
+        if ((f->flags & EN_FMF_BITMAP) && f->bits) {
+            lv_obj_t *h = label(s_reg_body, f->name, F_CAPTION, C_TEXT_MUTE);
+            lv_obj_set_pos(h, MARGIN, y + 8);
+            y += 30;
+
+            int32_t v = en_fm_field_get(f, s_reg_val, s_reg->write_len
+                                                    ? s_reg->write_len
+                                                    : s_reg->read_len);
+            for (uint8_t b = 0; b < f->nbits; b++)
+                y = reg_choice(s_reg_body, y, f->bits[b].name,
+                               (((uint32_t)v) & f->bits[b].mask) != 0,
+                               editable ? on_bit_toggle : 0, PACK(i, b));
+
+        } else if ((f->flags & EN_FMF_ENUM) && f->vals) {
+            lv_obj_t *h = label(s_reg_body, f->name, F_CAPTION, C_TEXT_MUTE);
+            lv_obj_set_pos(h, MARGIN, y + 8);
+            y += 30;
+
+            int32_t v = en_fm_field_get(f, s_reg_val, s_reg->write_len
+                                                    ? s_reg->write_len
+                                                    : s_reg->read_len);
+            for (uint8_t k = 0; k < f->nvals; k++)
+                y = reg_choice(s_reg_body, y, f->vals[k].name,
+                               (uint32_t)v == f->vals[k].value,
+                               editable ? on_enum_pick : 0, PACK(i, k));
+
+        } else if (editable) {
+            y = reg_slider(s_reg_body, y, f, i);
+
+        } else {
+            /* Read-only: the name and its value, nothing to touch. */
+            lv_obj_t *r = row(s_reg_body, y, 44, 0, 0);
+            lv_obj_t *n = label(r, f->name, F_CAPTION, C_TEXT_DIM);
+            lv_obj_set_pos(n, MARGIN, 14);
+
+            int32_t v = en_fm_field_get(f, s_reg_val, s_reg->read_len);
+            char vb[16];
+            if (v < 0) { vb[0] = '-'; put_uint(vb + 1, (uint32_t)(-v), 0); }
+            else put_uint(vb, (uint32_t)v, 0);
+
+            lv_obj_t *vl = label(r, vb, F_CAPTION, C_SIGNAL);
+            lv_obj_set_style_text_align(vl, LV_TEXT_ALIGN_RIGHT, 0);
+            lv_obj_set_width(vl, CONTENT_W);
+            lv_obj_set_pos(vl, MARGIN, 14);
+            panel(r, MARGIN, 43, CONTENT_W, 1, C_HAIRLINE);
+            y += 44;
+        }
+    }
+
+    lv_screen_load(s_screen[RP_SCREEN_REGISTER]);
+    s_current = RP_SCREEN_REGISTER;
+}
+
 /* ---- lifecycle ------------------------------------------------------------- */
 
 static void build_screen_shell(rp_screen_t which)
@@ -887,9 +1200,10 @@ void rp_ui_build_all(void)
     build_library();
     build_settings();
     build_advanced();
+    build_register();
 
     /* Dots go on the screens that are in the swipe order. */
-    for (int i = 0; i < RP_SCREEN_COUNT - 1; i++) {
+    for (int i = 0; i < RP_SWIPE_COUNT; i++) {
         rp_screen_t save = s_current;
         s_current = (rp_screen_t)i;
         build_dots(s_screen[i]);
@@ -925,16 +1239,16 @@ void rp_ui_show(rp_screen_t which)
 
     /* Rebuild the dots on the screen being shown, since each screen owns its
        own copy of them. */
-    if (which < RP_SCREEN_COUNT - 1) {
-        for (int i = 0; i < RP_SCREEN_COUNT - 1; i++) s_dots[i] = 0;
+    if (which < RP_SWIPE_COUNT) {
+        for (int i = 0; i < RP_SWIPE_COUNT; i++) s_dots[i] = 0;
         /* The dots for this screen were created as its last children; find
            them by walking backwards rather than caching per screen. */
         uint32_t n = lv_obj_get_child_count(s_screen[which]);
         int found = 0;
-        for (uint32_t k = n; k-- > 0 && found < RP_SCREEN_COUNT - 1;) {
+        for (uint32_t k = n; k-- > 0 && found < RP_SWIPE_COUNT;) {
             lv_obj_t *c = lv_obj_get_child(s_screen[which], (int32_t)k);
             if (lv_obj_get_height(c) <= 6 && lv_obj_get_width(c) <= 6)
-                s_dots[RP_SCREEN_COUNT - 2 - found++] = c;
+                s_dots[RP_SWIPE_COUNT - 1 - found++] = c;
         }
         refresh_dots();
     }

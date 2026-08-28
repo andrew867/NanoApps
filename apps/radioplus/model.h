@@ -68,4 +68,18 @@ void rp_act_save_live(uint32_t ms);
 void rp_act_preset_toggle(void);
 void rp_act_set_region(const en_region_t *rg);
 
+/*
+ * Raw register access from the explorer.
+ *
+ * A write is also remembered: the tuner forgets everything when it powers down,
+ * so an override that is not replayed at start-up lasts only as long as the
+ * chip stays on, and the explorer would be a toy rather than a settings screen.
+ * rp_act_reg_revert drops the override and puts the register back to whatever
+ * the chip powers up with.
+ */
+bool rp_act_reg_read(uint8_t addr, uint8_t *buf, uint8_t len);
+void rp_act_reg_write(uint8_t addr, const uint8_t *buf, uint8_t len);
+void rp_act_reg_revert(uint8_t addr);
+bool rp_act_reg_overridden(uint8_t addr);
+
 #endif /* RADIOPLUS_MODEL_H */

@@ -193,6 +193,15 @@ static void bring_up(void)
     if (rp_model.tuner_ok) {
         en_tuner_power(true);
         en_tuner_set_region(rp_model.region);
+
+        /* After the region, not before: a region write touches the control and
+           audio registers, so replaying first would let it undo a deliberate
+           override of either. */
+        for (uint8_t i = 0; i < s_settings.overrides.count; i++) {
+            const en_override_t *o = &s_settings.overrides.list[i];
+            en_tuner_reg_write(o->addr, o->data, o->len);
+        }
+
         en_tuner_rds_enable(rp_model.rds_on);
     }
 
@@ -422,6 +431,42 @@ void rp_act_preset_toggle(void)
 
     en_preset_sort(&rp_model.presets);
     presets_save();
+}
+
+/* ---- the register explorer ------------------------------------------------ */
+
+bool rp_act_reg_read(uint8_t addr, uint8_t *buf, uint8_t len)
+{
+    if (!rp_model.tuner_ok || !buf || !len) return false;
+    return en_tuner_reg_read(addr, buf, len) == EN_TUNER_OK;
+}
+
+void rp_act_reg_write(uint8_t addr, const uint8_t *buf, uint8_t len)
+{
+    if (!buf || !len) return;
+
+    if (rp_model.tuner_ok) en_tuner_reg_write(addr, buf, len);
+
+    /* Remembered even if the write failed. The user asked for this value, and
+       a transport that is down now may be up on the next run - dropping the
+       intent because of a transient failure would be the wrong call. */
+    en_override_set(&s_settings.overrides, addr, buf, len);
+    settings_save();
+}
+
+void rp_act_reg_revert(uint8_t addr)
+{
+    en_override_clear(&s_settings.overrides, addr);
+    settings_save();
+
+    /* The chip is not put back here. There is no record of what it held before
+       the first override - the only honest reset is a power cycle, and saying
+       so is better than writing a zero and calling it the default. */
+}
+
+bool rp_act_reg_overridden(uint8_t addr)
+{
+    return en_override_find(&s_settings.overrides, addr) != 0;
 }
 
 void rp_act_set_region(const en_region_t *rg)
