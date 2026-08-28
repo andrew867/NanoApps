@@ -570,3 +570,110 @@ way Entrain's DSP was.
 The `TRFTuner` work is not wasted. It stays the fallback if issuing HCI
 alongside a running OS stack turns out to be unsafe, and `TRFTunerPresetList` is
 still likely the cheapest way to read the presets the stock app has saved.
+
+---
+
+# Phase 0e — UART ownership: do not open it, borrow it
+
+Resolved, and the answer is better than expected: there is a send entry point
+that fetches the live handle itself, so Radio+ never touches the transport.
+
+## What the readiness global actually is
+
+`0x0896dd00` is not a handle. It is a struct, and a teardown at `0x080da068`
+checks and clears three fields:
+
+```
+80da06c: ldr r1,[r0,#12] ; cbz -> fail
+80da070: ldr r1,[r0,#16] ; cbz -> fail
+80da074: ldr r1,[r0,#20] ; cbz -> fail
+80da078: store 0 to +12, +16, +20 ; return 0
+```
+
+and a registration at `0x08416b84` appends 16-byte records to a table, bumps a
+count, and tail-calls the FM function when the count first reaches 1. So it is a
+client/callback registry for FM, not the transport.
+
+## The send to use
+
+```
+8133ed4: mov r2, r1         ; len = arg1
+8133ed6: mov r1, r0         ; buf = arg0
+8133ed8: ldr r0,[pc]        ; -> 0x0896d8e0
+8133ee0: ldr r0,[r0,#20]    ; the live handle
+8133ee2: bl  0x8410820      ; hci_send(handle, buf, len)
+8133ee6: cbz r0 -> success
+8133ee8: cmp r0, #31 ; beq  ; 31 handled separately
+8133eec: movs r4, #114      ; otherwise error
+```
+
+| Address | Meaning |
+|---|---|
+| **`0x08133ED4`** | `hci_send_current(buf, len)` — two arguments, finds the handle itself |
+| **`0x0896D8E0`** | the transport struct (BSS) |
+| **`0x0896D8F4`** | the live handle, struct + 20 — non-null means the transport is up |
+
+`0x08133ED4` has **zero BL callers**, so it is reached through a pointer: it is
+the transport driver's `send` method, which matches the `docs-internal` note
+that the HCI driver is registered with a vtable-like interface. That is exactly
+what makes it the right thing to call — it is the OS's own send, used the way
+the OS uses it.
+
+So the plan is: **never call `uart_open`.** Read `0x0896D8F4`; if it is null the
+stack is not up and there is nothing to talk to, and if it is non-null call
+`0x08133ED4(buf, len)`. `uart_open` at `0x0854F878` has exactly one caller — the
+bring-up sequence — and opening a second time would be a conflict rather than a
+shortcut.
+
+## The event format, from the firmware
+
+The bring-up checks its own command-complete reply byte by byte at `0x0854f82a`:
+
+```
+sp[3] == 0x01     ; num_hci_command_packets
+sp[4] == 0x18     \ opcode, little endian
+sp[5] == 0xFC     /
+sp[6] == 0x00     ; status
+```
+
+So an event is:
+
+```
+[0] 04            H4 event packet type   (hci_wait_event checks this itself)
+[1] 0E            Command Complete
+[2] plen
+[3] 01            num_hci_command_packets
+[4] ocf_lo
+[5] ogf_hi
+[6] status
+[7..] return parameters
+```
+
+**A register read comes back at offset 7.** That is the whole read path, and it
+came from the firmware checking its own reply rather than from us guessing.
+
+## The hazard this exposes, which is not solved
+
+Writes look safe. Reads do not, and it would be dishonest to call this finished.
+
+`hci_wait_event` pulls from the transport directly. While the OS Bluetooth stack
+is running it has its own RX path consuming events, so a command-complete for
+our `0xFC15` may be dispatched to the OS before we see it — or worse, we may
+consume an event the OS was waiting for. That is a race we do not control, and
+it gets more likely the busier the stack is.
+
+Options, none yet tested:
+
+1. **Write-only through HCI, read through `TRFTuner`.** The vtable is already
+   mapped, and reads are the smaller half of the feature set.
+2. **Hook the event dispatcher** and filter command-completes for opcode
+   `0xFC15` out of the stream. Cleanest if it works, and `hb_silver_patch_function`
+   in the SDK exists precisely to patch a non-virtual function.
+3. **Only send when the stack is idle**, i.e. FM is up but no Bluetooth link is
+   active. Narrow, and not something the app can guarantee.
+
+This has to be settled on the device rather than in the disassembler, and the
+first build should therefore treat reads as unproven: send writes, and display
+what comes back only when it can be correlated with a request. The register
+table and encoder below are unaffected either way — they are pure data and pure
+functions, and they are correct regardless of which transport answers.
