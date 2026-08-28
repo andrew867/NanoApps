@@ -243,6 +243,32 @@ void en_render_loop(en_render_t *r, const en_segment_t *seg, int16_t *out)
     r->osc_gate.phase = 0;
 }
 
+uint32_t en_zero_cut(const int16_t *pcm, uint32_t lo, uint32_t hi)
+{
+    if (hi <= lo + 1) return hi;
+
+    uint32_t best = hi;
+    int32_t  best_cost = 0x7FFFFFFF;
+
+    for (uint32_t k = lo; k + 1 < hi; k++) {
+        int32_t l0 = pcm[2 * k + 0], r0 = pcm[2 * k + 1];
+        int32_t l1 = pcm[2 * (k + 1) + 0], r1 = pcm[2 * (k + 1) + 1];
+
+        /* The LARGEST of the samples straddling the boundary, across both
+           channels. Not their sum: what a gap costs is the biggest single step
+           the output takes, and a boundary with one small sample and one large
+           one is no good however flattering its total. */
+        int32_t cost = (l0 < 0 ? -l0 : l0);
+        int32_t v;
+        v = (r0 < 0 ? -r0 : r0); if (v > cost) cost = v;
+        v = (l1 < 0 ? -l1 : l1); if (v > cost) cost = v;
+        v = (r1 < 0 ? -r1 : r1); if (v > cost) cost = v;
+
+        if (cost < best_cost) { best_cost = cost; best = k + 1; }
+    }
+    return best;
+}
+
 const char *en_mode_name(en_mode_t mode)
 {
     switch (mode) {

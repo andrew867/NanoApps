@@ -417,113 +417,223 @@ static void test_noise_bed(void)
     free(pcm);
 }
 
-/* ---- overlap-add reconstruction ------------------------------------------
+/* ---- how consecutive blocks are joined -----------------------------------
  *
- * The device plays a window at a time and overlap-adds consecutive windows,
- * because nothing can silence a voice already sounding and the pool mixes
- * rather than cuts. This checks the join maths, which has been wrong once
- * already: a short crossfade only sums to unity when the two windows line up
- * exactly, so a late tick turned into a 40% amplitude dip twice a second - an
- * audible tremolo. Overlap-add with a full-advance triangle makes the same
- * lateness cost d/advance instead of d/crossfade.
+ * The device hands the sound hardware one block at a time, because nothing can
+ * silence a voice already sounding and the pool mixes rather than cuts. The
+ * blocks are consecutive samples of one continuous signal - the renderer never
+ * resets a phase - but WHEN the next voice actually starts is not ours to
+ * choose, so the join lands early or late by up to a UI tick.
  *
- * The gain formula here mirrors audio_device.c exactly. */
-static int32_t ola_gain(uint32_t i, uint32_t advance)
+ * Two versions shipped that tried to hide that with a crossfade, and both
+ * sounded wrong. These prove why, and prove the replacement.
+ */
+
+/* A plain binaural pair: the hardest case for a join, because the two channels
+   carry different frequencies and so only cross zero together once per beat. */
+static void join_signal(int16_t *pcm, uint32_t frames, uint32_t sr)
 {
-    return (i < advance)
-         ? (int32_t)((i * 4096u) / advance)
-         : 4096 - (int32_t)(((i - advance) * 4096u) / advance);
-}
-
-static void test_overlap_add(void)
-{
-    section("overlap-add reconstruction");
-
-    const uint32_t sr = 22050;
-    const uint32_t advance = sr;          /* 1 s advance, 2 s buffers */
-    const uint32_t buflen = advance * 2;
-    const uint32_t total = advance * 6;
-
-    /* One continuous signal, the reference the joins must reproduce. */
-    int16_t *ref = malloc((size_t)total * 2 * sizeof *ref);
     en_render_t r;
     en_render_init(&r, sr, EN_NOISE_NONE, 1);
+
     en_segment_t seg;
     memset(&seg, 0, sizeof seg);
     seg.sample_rate = sr;
     seg.mode = EN_MODE_BINAURAL;
     seg.noise = EN_NOISE_NONE;
-    seg.frames = total;
+    seg.frames = frames;
     seg.start.carrier_hz = 200.0;
     seg.start.beat_hz = 10.0;
     seg.start.tone_level = 0.8;
     seg.end = seg.start;
-    en_render_segment(&r, &seg, ref);
+    en_render_segment(&r, &seg, pcm);
+}
 
-    /* Now rebuild it the way the device does: windows of 2 x advance, each
-       triangular, summed at one advance apart. */
-    int32_t *acc = calloc((size_t)total * 2, sizeof *acc);
-    for (uint32_t start = 0; start + buflen <= total; start += advance) {
-        for (uint32_t i = 0; i < buflen; i++) {
-            int32_t g = ola_gain(i, advance);
-            acc[2 * (start + i) + 0] += (ref[2 * (start + i) + 0] * g) >> 12;
-            acc[2 * (start + i) + 1] += (ref[2 * (start + i) + 1] * g) >> 12;
-        }
+/* Why the crossfade had to go.
+ *
+ * Overlapping consecutive blocks does not blend two different sounds. It sums
+ * one signal with a time-shifted copy of itself, which is a comb filter. At the
+ * middle of any fade the two gains are equal, so a shift of half a carrier
+ * period cancels the carrier outright - and the notch sweeps as the timing
+ * drifts, which is exactly what the wobble was. */
+static void test_crossfade_combs(void)
+{
+    section("crossfading consecutive blocks comb-filters (why it went)");
+
+    const uint32_t sr = 22050;
+    const uint32_t frames = sr * 2;
+    int16_t *pcm = malloc((size_t)frames * 2 * sizeof *pcm);
+    join_signal(pcm, frames, sr);
+
+    /* Half a period of the 200 Hz carrier - well inside a UI tick, which is
+       16 to 30 ms. */
+    const uint32_t shift = sr / 400;
+    printf("  carrier 200 Hz, half-period shift = %u frames (%.1f ms)\n",
+           shift, 1000.0 * shift / sr);
+
+    int ref_peak = 0, mix_peak = 0;
+    for (uint32_t i = shift; i < frames; i++) {
+        int a = pcm[2 * i];
+        if (a < 0) a = -a;
+        if (a > ref_peak) ref_peak = a;
+
+        /* Equal gains, as at the midpoint of any crossfade. */
+        int m = (pcm[2 * i] + pcm[2 * (i - shift)]) / 2;
+        if (m < 0) m = -m;
+        if (m > mix_peak) mix_peak = m;
     }
+    int left = ref_peak ? (mix_peak * 100) / ref_peak : 0;
+    printf("  crossfade midpoint keeps %d%% of the carrier\n", left);
+    CHECK(left < 10, "expected near-total cancellation, got %d%%", left);
 
-    /* Only the fully-covered interior is expected to reconstruct: the first
-       and last advance are covered by one window each, which is the app's
-       fade in and fade out. */
+    free(pcm);
+}
+
+/* The replacement: cut each block where both channels are crossing zero, and
+   butt-join. A late start is then a gap of silence between two near-zero
+   samples, and an early start sums two near-zero samples. Neither is a step,
+   and neither sums two full-scale copies of anything. */
+static void test_zero_cut(void)
+{
+    section("zero-crossing cut");
+
+    const uint32_t sr = 22050;
+    const uint32_t block = (sr * 2500u) / 1000u;   /* BLOCK_MS  */
+    const uint32_t cap   = block + sr;             /* + SLACK_MS */
+
+    int16_t *pcm = malloc((size_t)cap * 2 * sizeof *pcm);
+    join_signal(pcm, cap, sr);
+
+    int peak = peak_abs(pcm, cap);
+    uint32_t cut = en_zero_cut(pcm, block, cap);
+
+    CHECK(cut > block && cut < cap, "cut %u outside the search range", cut);
+
+    /* The two samples straddling the boundary, both channels. These are the
+       whole point: they are what a gap steps to and from. */
     int worst = 0;
-    for (uint32_t i = advance; i < total - buflen; i++) {
+    for (uint32_t k = cut - 1; k <= cut; k++)
         for (int ch = 0; ch < 2; ch++) {
-            int d = acc[2 * i + ch] - ref[2 * i + ch];
-            if (d < 0) d = -d;
-            if (d > worst) worst = d;
+            int v = pcm[2 * k + ch];
+            if (v < 0) v = -v;
+            if (v > worst) worst = v;
         }
-    }
-    printf("  aligned: worst reconstruction error %d of 32767\n", worst);
-    CHECK(worst <= 4, "overlap-add does not reconstruct (off by %d)", worst);
+    printf("  peak %d, cut at frame %u (%.3f s), boundary samples <= %d\n",
+           peak, cut, (double)cut / sr, worst);
+    int pct = peak ? (worst * 100) / peak : 0;
+    printf("  boundary excursion %d%% of peak\n", pct);
 
-    /* And the property that actually matters: being LATE must degrade
-       gently. Shift every other window by a plausible tick and measure the
-       amplitude dip. */
-    for (uint32_t late_ms = 16; late_ms <= 32; late_ms += 16) {
-        uint32_t d = (sr * late_ms) / 1000u;
-        memset(acc, 0, (size_t)total * 2 * sizeof *acc);
-        uint32_t k = 0;
-        for (uint32_t start = 0; start + buflen + d <= total; start += advance, k++) {
-            uint32_t at = start + ((k & 1) ? d : 0);
-            for (uint32_t i = 0; i < buflen; i++) {
-                int32_t g = ola_gain(i, advance);
-                acc[2 * (at + i) + 0] += (ref[2 * (at + i) + 0] * g) >> 12;
-                acc[2 * (at + i) + 1] += (ref[2 * (at + i) + 1] * g) >> 12;
-            }
+    /* The floor is the sample grid, not the search. One sample at 200 Hz into
+       22050 Hz is 3.3 degrees of phase, so the nearest sample to a crossing sits
+       up to half that off zero - about 3% of peak - and both channels have to
+       manage it at once. Anything near that is as good as it gets. */
+    CHECK(pct <= 4, "cut is not on a zero crossing: %d%% of peak", pct);
+
+    /* Against the alternative: a fixed length, which is what butt-joining
+       without the search would do. */
+    int naive = 0;
+    for (uint32_t k = block - 1; k <= block; k++)
+        for (int ch = 0; ch < 2; ch++) {
+            int v = pcm[2 * k + ch];
+            if (v < 0) v = -v;
+            if (v > naive) naive = v;
         }
-        /* Compare envelopes rather than samples: a shifted window reproduces
-           the same waveform at a slightly different gain. */
-        int peak_ref = 0, peak_min = 32767;
-        for (uint32_t i = advance * 2; i < total - buflen - d; i += advance / 4) {
-            int hi = 0, lo = 32767;
-            for (uint32_t j = i; j < i + advance / 4 && j < total; j++) {
-                int v = acc[2 * j] < 0 ? -acc[2 * j] : acc[2 * j];
-                if (v > hi) hi = v;
-                int w = ref[2 * j] < 0 ? -ref[2 * j] : ref[2 * j];
-                if (w > peak_ref) peak_ref = w;
+    printf("  a fixed-length cut would have stepped %d%% of peak\n",
+           peak ? (naive * 100) / peak : 0);
+
+    /* Why the backend biases late rather than trying to hit the boundary
+       exactly. Arriving EARLY overlaps this block's last d frames with the next
+       block's first d, and both are full-scale that far from the boundary - so
+       they comb, and they clip. No cut point can help, because the damage is
+       not at the boundary. */
+    for (uint32_t early_ms = 2; early_ms <= 8; early_ms += 3) {
+        uint32_t d = (sr * early_ms) / 1000u;
+        int over = 0;
+        for (uint32_t i = 0; i < d && cut + i < cap; i++)
+            for (int ch = 0; ch < 2; ch++) {
+                int v = pcm[2 * (cut - d + i) + ch] + pcm[2 * (cut + i) + ch];
+                if (v < 0) v = -v;
+                if (v > over) over = v;
             }
-            (void)lo;
-            if (hi < peak_min) peak_min = hi;
-        }
-        int dip_pct = peak_ref ? 100 - (peak_min * 100) / peak_ref : 100;
-        printf("  %2u ms late: worst dip %d%%\n", late_ms, dip_pct);
-        /* The short-crossfade version dipped 40-75%% here. Anything in single
-           figures is inaudible. */
-        CHECK(dip_pct <= 12, "%u ms of lateness dips %d%% - that is audible",
-              late_ms, dip_pct);
+        printf("  %u ms EARLY would peak at %d%% of peak\n",
+               early_ms, peak ? (over * 100) / peak : 0);
     }
 
-    free(acc);
-    free(ref);
+    /* Late is the case the backend actually produces, and all it costs is a gap
+       of silence between two samples the cut has already put on a crossing. The
+       step at each end is what was measured above, whatever the gap length -
+       which is why the gap only has to be short, not zero.
+
+       JOIN_BIAS_MS plus the spin residual is two to three milliseconds. At the
+       carrier that is well under a cycle. */
+    printf("  2-3 ms LATE: %d%% step at each end, %.1f cycles of carrier lost\n",
+           pct, 0.0025 * 200.0);
+    CHECK(pct <= 4, "a late join still steps %d%% of peak", pct);
+
+    free(pcm);
+}
+
+/* The cut has to work for every mode and every beat on offer, not just the one
+   convenient case above. The slack was sized for the slowest beat, so check the
+   extremes. */
+static void test_zero_cut_range(void)
+{
+    section("zero-crossing cut across the range");
+
+    const uint32_t sr = 22050;
+    const uint32_t block = (sr * 2500u) / 1000u;
+    const uint32_t cap   = block + sr;
+    int16_t *pcm = malloc((size_t)cap * 2 * sizeof *pcm);
+
+    static const struct { en_mode_t mode; double carrier, beat; } cases[] = {
+        { EN_MODE_BINAURAL,   100.0,  0.5 },   /* slowest beat on offer */
+        { EN_MODE_BINAURAL,   200.0,  7.83 },  /* Schumann */
+        { EN_MODE_BINAURAL,   440.0, 40.0 },   /* fastest */
+        { EN_MODE_ISOCHRONIC, 200.0, 10.0 },
+        { EN_MODE_MONAURAL,   180.0,  6.0 },
+    };
+
+    for (size_t c = 0; c < sizeof cases / sizeof cases[0]; c++) {
+        en_render_t r;
+        en_render_init(&r, sr, EN_NOISE_NONE, 1);
+        en_segment_t seg;
+        memset(&seg, 0, sizeof seg);
+        seg.sample_rate = sr;
+        seg.mode = cases[c].mode;
+        seg.noise = EN_NOISE_NONE;
+        seg.frames = cap;
+        seg.start.carrier_hz = cases[c].carrier;
+        seg.start.beat_hz = cases[c].beat;
+        seg.start.tone_level = 0.8;
+        seg.end = seg.start;
+        en_render_segment(&r, &seg, pcm);
+
+        int peak = peak_abs(pcm, cap);
+        uint32_t cut = en_zero_cut(pcm, block, cap);
+
+        int worst = 0;
+        for (uint32_t k = cut - 1; k <= cut; k++)
+            for (int ch = 0; ch < 2; ch++) {
+                int v = pcm[2 * k + ch];
+                if (v < 0) v = -v;
+                if (v > worst) worst = v;
+            }
+        int pct = peak ? (worst * 100) / peak : 0;
+        printf("  %-11s carrier %5.1f beat %5.2f -> cut %.3f s, %d%% of peak\n",
+               en_mode_name(cases[c].mode), cases[c].carrier, cases[c].beat,
+               (double)cut / sr, pct);
+        /* Scaled to the sample grid: half a sample of phase at this carrier is
+           the best any search could do, and both channels have to hit it
+           together. 440 Hz into 22050 Hz is 7 degrees a sample, so the floor
+           there is around 6%. */
+        int floor_pct = (int)(100.0 * 3.14159265358979 * cases[c].carrier / sr);
+        if (floor_pct < 2) floor_pct = 2;
+        CHECK(pct <= floor_pct + 3,
+              "%s carrier %.0f cuts %d%% off zero (floor about %d%%)",
+              en_mode_name(cases[c].mode), cases[c].carrier, pct, floor_pct);
+    }
+
+    free(pcm);
 }
 
 /* ---- 6. phase continuity across a glide --------------------------------- */
@@ -797,7 +907,9 @@ int main(void)
     test_clicks();
     test_loop_seams();
     test_noise_bed();
-    test_overlap_add();
+    test_crossfade_combs();
+    test_zero_cut();
+    test_zero_cut_range();
     test_glide();
     test_levels();
     test_wav_header();

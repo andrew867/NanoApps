@@ -430,15 +430,22 @@ static uint32_t stream_pull(int16_t *dst, uint32_t frames,
     if (S_total > 0.0 && S_t >= S_total) return 0;   /* the program is over */
 
     const uint32_t rate = stream_rate();
-    if (advance_frames == 0 || advance_frames > frames) advance_frames = frames;
+    /* advance_frames == 0 is a peek: render these frames from where the source
+       stands and leave it standing there. The device backend renders a block
+       long, looks for the best place to cut it, then asks again for exactly
+       that many and commits. Both renders start from the same state, so the
+       samples it keeps are the samples it measured. */
+    if (advance_frames > frames) advance_frames = frames;
 
     stream_params_t p = S_params[S_slot];            /* snapshot */
     en_segment_t seg;
 
     /* The part that actually moves the source on. */
-    stream_segment(&seg, &p, S_t, (double)advance_frames / (double)rate);
-    seg.frames = advance_frames;
-    en_render_segment(&S_rnd, &seg, dst);
+    if (advance_frames) {
+        stream_segment(&seg, &p, S_t, (double)advance_frames / (double)rate);
+        seg.frames = advance_frames;
+        en_render_segment(&S_rnd, &seg, dst);
+    }
 
     double t_after = S_t + (double)advance_frames / (double)rate;
 

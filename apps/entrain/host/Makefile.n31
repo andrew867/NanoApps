@@ -51,6 +51,11 @@ CORE_SRCS := $(CORE)/osc.c $(CORE)/noise.c $(CORE)/render.c \
 APP_SRCS  := main_host.c ../ui.c ../engine.c \
              ../platform/audio_linux.c ../platform/sys_host.c $(CORE_SRCS)
 
+# The app is compiled in one gcc invocation, so there are no object files for
+# -MMD to hang dependency files off. Without this, editing a header changed
+# nothing as far as make was concerned and the binary kept stale code.
+APP_HDRS  := $(wildcard $(CORE)/*.h ../platform/*.h ../*.h *.h)
+
 # tinyalsa is five files with no dependencies, which is exactly why it is used
 # here instead of alsa-lib: it compiles straight into the static binary.
 TA_SRCS   := $(TINYALSA)/src/pcm.c $(TINYALSA)/src/pcm_hw.c \
@@ -73,7 +78,7 @@ LV_SRCS := $(shell find $(LVGL)/src -name '*.c' \
 LV_OBJS := $(patsubst $(LVGL)/%.c,$(BUILD)/lvgl/%.o,$(LV_SRCS))
 TA_OBJS := $(patsubst $(TINYALSA)/%.c,$(BUILD)/tinyalsa/%.o,$(TA_SRCS))
 
-.PHONY: all push push-programs run run-bg log stop fbcon-off fbcon-on clean toolchain-check
+.PHONY: all push push-programs run run-bg log stop fbcon-off fbcon-on clean clean-app toolchain-check
 
 all: $(BUILD)/entrain
 
@@ -101,7 +106,7 @@ $(BUILD)/libtinyalsa_n31.a: $(TA_OBJS)
 	@echo "  AR  $@"
 	@$(AR) crs $@ $^
 
-$(BUILD)/entrain: $(APP_SRCS) $(BUILD)/liblvgl_n31.a $(BUILD)/libtinyalsa_n31.a | $(BUILD)
+$(BUILD)/entrain: $(APP_SRCS) $(APP_HDRS) $(BUILD)/liblvgl_n31.a $(BUILD)/libtinyalsa_n31.a | $(BUILD)
 	$(CC) $(CFLAGS) $(LV_CFLAGS) $(TA_CFLAGS) $(LDFLAGS) -o $@ $(APP_SRCS) \
 	      $(BUILD)/liblvgl_n31.a $(BUILD)/libtinyalsa_n31.a $(LDLIBS)
 	@$(STRIP) $@
@@ -168,6 +173,12 @@ log: $(KEY)
 # come out of ps.
 stop: $(KEY)
 	-@$(SSH) $(DEVICE) 'for p in $$(ps | grep "[e]ntrain" | while read pid rest; do echo $$pid; done); do kill -9 $$p 2>/dev/null; done; sleep 1; true'
+
+# Only the app. The LVGL and tinyalsa archives are several minutes of
+# cross-compilation and nothing in this app has ever needed them rebuilt — use
+# this unless the toolchain itself changed.
+clean-app:
+	rm -f $(BUILD)/entrain
 
 clean:
 	rm -rf $(BUILD)

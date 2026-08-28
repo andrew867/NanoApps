@@ -1009,6 +1009,160 @@ static void test_raw_pcm(void)
     lg_warn("tap to return to menu");
 }
 
+/* ---- T10: watch the voice while it plays ---------------------------------- *
+ *
+ * Everything about how Entrain joins buffers is currently guesswork, and it
+ * sounds like it. Three things would settle it, and all three are readable
+ * from the voice object:
+ *
+ *   voice::setSource (VA 0x0862fd24) writes the voice pointer into desc+0x48,
+ *   so after play() we have the object. It also sets voice+0x50 to the total
+ *   playable frames, and voice::start (VA 0x08630154) sets voice+0x5C to 1.
+ *
+ *   1. Is there a read cursor? A field that counts up in step with playback
+ *      would let the next buffer be started at exactly the right sample
+ *      instead of whenever the UI tick happens to land - which is what the
+ *      crossfades are currently papering over.
+ *   2. Is a finished voice released? We start one a second and each plays for
+ *      two, so if they are never freed the pool of eight runs out after eight
+ *      seconds and the allocator starts stealing one that is still sounding.
+ *      That would click exactly the way it does.
+ *   3. Are voice+0x48 / +0x4C loop points? setSource fills them from
+ *      desc+0x34 and desc+0x30/+0x5C, converted from milliseconds to samples.
+ *      If they are loop bounds, a steady preset needs no joins at all.
+ *
+ * This plays four seconds from RAM and samples the voice's first 0x100 bytes
+ * ten times a second, then reports every word that changed, how it changed,
+ * and whether it moved monotonically. */
+
+#define T10_RATE    22050u
+#define T10_SECONDS 4u
+#define T10_FRAMES  (T10_RATE * T10_SECONDS)
+#define T10_WORDS   0x40            /* 0x100 bytes of the voice struct */
+#define T10_SAMPLES 40
+
+static int16_t *g_t10_pcm;
+static uint32_t g_t10_first[T10_WORDS];
+static uint32_t g_t10_last[T10_WORDS];
+static uint32_t g_t10_changes[T10_WORDS];
+static uint8_t  g_t10_monotonic[T10_WORDS];
+
+static void test_voice_watch(void)
+{
+    log_clear("T10 VOICE WATCH");
+    lg("4s from RAM, sampling the voice");
+    lg("object 10x a second.");
+    lg("");
+
+    uint32_t bytes = T10_FRAMES * 4u;
+    if (!g_t10_pcm) g_t10_pcm = (int16_t *)hb_os_alloc(bytes);
+    if (!g_t10_pcm) {
+        lg_warn("alloc failed - not enough heap");
+        lg_warn("tap to return to menu");
+        return;
+    }
+    t9_fill(g_t10_pcm, T10_FRAMES, T10_RATE, 0, 0);
+
+    chk("t10 ctor");
+    sfx_ctor(g_desc_a);
+    chk("t10 fields");
+    *(volatile uint32_t *)(g_desc_a + 0x04) = (uint32_t)(uintptr_t)g_t10_pcm;
+    *(volatile uint32_t *)(g_desc_a + 0x08) = (uint32_t)(uintptr_t)g_t10_pcm;
+    *(volatile uint32_t *)(g_desc_a + 0x0C) = bytes;
+    g_desc_a[0x10] = 0;
+    *(volatile uint32_t *)(g_desc_a + 0x14) = T10_RATE;
+    *(volatile uint32_t *)(g_desc_a + 0x18) = 2;
+    *(volatile uint32_t *)(g_desc_a + 0x1C) = 16;
+    *(volatile uint32_t *)(g_desc_a + 0x38) = 0;
+    *(volatile uint32_t *)(g_desc_a + 0x3C) = 0;
+    sfx_fields(g_desc_a, 0x5000, 1, 0, (void *)0);
+
+    chk("t10 play");
+    if (!sfx_play(g_desc_a, (void *)0, (void *)0)) {
+        lg_warn("play() failed");
+        lg_warn("tap to return to menu");
+        return;
+    }
+
+    /* setSource stores the voice here. If it is still zero, the descriptor
+       never reached a voice and nothing else below means anything. */
+    uint32_t voice = *(volatile uint32_t *)(g_desc_a + 0x48);
+    char buf[48], *p = buf;
+    p = app_str(p, "voice = 0x");
+    for (int sh = 28; sh >= 0; sh -= 4)
+        *p++ = HEXD[(voice >> sh) & 0xF];
+    *p = 0;
+    lg(buf);
+    hb_trace_log("SPKA", voice, T10_FRAMES);
+
+    if (voice < 0x08000000u || voice >= 0x0A000000u) {
+        lg_warn("not a sane pointer - stopping");
+        lg_warn("tap to return to menu");
+        return;
+    }
+
+    volatile uint32_t *v = (volatile uint32_t *)(uintptr_t)voice;
+    for (int i = 0; i < T10_WORDS; i++) {
+        g_t10_first[i] = v[i];
+        g_t10_last[i] = v[i];
+        g_t10_changes[i] = 0;
+        g_t10_monotonic[i] = 1;
+    }
+
+    for (int s = 0; s < T10_SAMPLES; s++) {
+        wait_ms(100, "watching");
+        for (int i = 0; i < T10_WORDS; i++) {
+            uint32_t now = v[i];
+            if (now != g_t10_last[i]) {
+                g_t10_changes[i]++;
+                if (now < g_t10_last[i]) g_t10_monotonic[i] = 0;
+                g_t10_last[i] = now;
+            }
+        }
+    }
+
+    lg("");
+    lg("off  first -> last   n  mono");
+    int shown = 0;
+    for (int i = 0; i < T10_WORDS && shown < 16; i++) {
+        if (!g_t10_changes[i]) continue;
+        p = buf;
+        *p++ = '+';
+        p = app_hex8(p, (uint8_t)(i * 4));
+        p = app_str(p, " ");
+        p = app_u32(p, g_t10_first[i]);
+        p = app_str(p, ">");
+        p = app_u32(p, g_t10_last[i]);
+        p = app_str(p, " ");
+        p = app_u32(p, g_t10_changes[i]);
+        p = app_str(p, g_t10_monotonic[i] ? " UP" : " --");
+        lg(buf);
+        hb_trace_log("SPKA", (uint32_t)(i * 4), g_t10_last[i]);
+        shown++;
+    }
+    if (!shown) lg_warn("nothing in the voice moved at all");
+
+    lg("");
+    lg("a field rising to about");
+    p = buf; p = app_u32(p, T10_FRAMES); app_str(p, " is the read cursor.");
+    lg(buf);
+
+    /* After the buffer has finished: is the voice released, or still marked
+       busy? If it stays busy, the pool of eight runs out and the allocator
+       starts stealing voices that are still sounding. */
+    wait_ms(2000, "after end");
+    p = buf;
+    p = app_str(p, "after end +5C = ");
+    p = app_u32(p, v[0x5C / 4]);
+    p = app_str(p, "  +50 = ");
+    app_u32(p, v[0x50 / 4]);
+    lg(buf);
+    lg("+5C back to 0 means released.");
+    hb_trace_log("SPKA", 0xEEEE, v[0x5C / 4]);
+
+    lg_warn("tap to return to menu");
+}
+
 /* ---- menu ---------------------------------------------------------------- */
 
 typedef void (*test_fn_t)(void);
@@ -1030,6 +1184,7 @@ static const menu_item_t MENU[] = {
     { "T7  SIZE + HEAP",    test_size },
     { "T8  SUBRANGE",       test_subrange },
     { "T9  PCM FROM RAM",   test_raw_pcm },
+    { "T10 VOICE WATCH",    test_voice_watch },
 };
 #define N_MENU ((int)(sizeof MENU / sizeof MENU[0]))
 
