@@ -334,6 +334,8 @@ bool en_audio_queue(const char *key, const int16_t *pcm,
 
 /* This backend plays buffers, not a continuous feed, so the engine takes the
    submit/queue path. */
+uint32_t en_audio_preferred_rate(void) { return 44100u; }   /* the desktop can afford full rate */
+
 bool en_audio_can_stream(void) { return false; }
 
 bool en_audio_start_stream(uint32_t sample_rate, en_audio_pull_fn pull,

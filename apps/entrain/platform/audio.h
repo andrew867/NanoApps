@@ -86,7 +86,16 @@ double en_audio_remaining(void);
    The pull callback runs on the audio thread. It must not allocate, block, or
    touch LVGL. */
 
-typedef uint32_t (*en_audio_pull_fn)(int16_t *dst, uint32_t frames, void *ctx);
+/* Fill `frames` of interleaved stereo, but only ADVANCE the source by
+   `advance_frames`. Those differ when the backend crossfades: it asks for a
+   window plus the overlap the next window will also carry, and the source has
+   to produce those overlapping frames twice — once as this window's tail and
+   once as the next one's head. Counting them as consumed would gain that much
+   time on every window.
+   Where a backend streams contiguously, advance_frames == frames.
+   Returns frames produced; 0 means the source is finished. */
+typedef uint32_t (*en_audio_pull_fn)(int16_t *dst, uint32_t frames,
+                                     uint32_t advance_frames, void *ctx);
 
 /* True when en_audio_start_stream is usable. Backends that can only play
    files return false and the engine uses submit/queue instead. */
@@ -97,6 +106,11 @@ bool en_audio_can_stream(void);
    say so rather than pretending. */
 bool en_audio_start_stream(uint32_t sample_rate, en_audio_pull_fn pull,
                            void *ctx);
+
+/* The rate this backend would rather be fed. The DSP is rate-agnostic, so this
+   is about what the output path likes and what the CPU can afford, not about
+   the maths. */
+uint32_t en_audio_preferred_rate(void);
 
 /* Fade out over `fade_ms` and stop. Passing 0 stops immediately; anything the
    user can hear should pass at least 1000. */

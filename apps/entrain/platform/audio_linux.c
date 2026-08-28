@@ -241,7 +241,9 @@ static uint32_t produce(void)
         memset(s_buf, 0, sizeof s_buf);
         got = EN_PERIOD_FRAMES;
     } else {
-        got = pull(s_buf, EN_PERIOD_FRAMES, ctx);
+        /* Streams contiguously - no crossfade, so the advance is the
+           whole period. */
+        got = pull(s_buf, EN_PERIOD_FRAMES, EN_PERIOD_FRAMES, ctx);
         if (got == 0) {
             pthread_mutex_lock(&s_lock);
             s_pull = NULL;
@@ -341,6 +343,8 @@ void en_audio_shutdown(void)
     s_thread_running = 0;
     s_state = EN_AUDIO_IDLE;
 }
+
+uint32_t en_audio_preferred_rate(void) { return 44100u; }   /* what the cs42l81 path is configured for */
 
 bool en_audio_can_stream(void) { return true; }
 

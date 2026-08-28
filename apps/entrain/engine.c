@@ -81,9 +81,15 @@ static struct {
  * double here would be an audible blip, which is why it is not simply left to
  * chance. */
 
-/* The hardware's rate. The DSP is rate-agnostic, so this is chosen to suit the
-   codec rather than the maths. */
-#define EN_STREAM_RATE 44100
+/* The rate the backend asks for. The DSP is rate-agnostic, so this follows the
+   output path rather than the maths: 44.1k on a desktop, and half that on the
+   iPod, where it halves both the render cost and the buffers for carriers that
+   never go above a few hundred hertz. */
+static uint32_t stream_rate(void)
+{
+    uint32_t r = en_audio_preferred_rate();
+    return r ? r : 44100u;
+}
 
 typedef struct {
     double          carrier_hz;
@@ -377,56 +383,83 @@ static bool start_next_chunk(bool first)
     return true;
 }
 
-/* Called from the audio thread. No allocation, no locks, no LVGL. */
-static uint32_t stream_pull(int16_t *dst, uint32_t frames, void *ctx)
+/* Build the segment describing [t, t + span) of whatever is playing. */
+static void stream_segment(en_segment_t *seg, const stream_params_t *p,
+                           double t, double span)
+{
+    memset(seg, 0, sizeof *seg);
+    seg->sample_rate = stream_rate();
+    seg->mode = p->mode;
+    seg->noise = p->noise;
+
+    if (S_is_program) {
+        /* Evaluate the timeline across exactly this block, so the ramp stays
+           continuous over every block boundary and every segment join. */
+        double b0, c0, b1, c1, nl0, nl1;
+        en_noise_kind_t nk0, nk1;
+        program_params_at(t, &b0, &c0, &nk0, &nl0);
+        program_params_at(t + span, &b1, &c1, &nk1, &nl1);
+        seg->noise = nk0;
+        seg->start.carrier_hz  = c0;
+        seg->start.beat_hz     = b0;
+        seg->start.tone_level  = p->tone_level;
+        seg->start.noise_level = nl0;
+        seg->end.carrier_hz    = c1;
+        seg->end.beat_hz       = b1;
+        seg->end.tone_level    = p->tone_level;
+        seg->end.noise_level   = nl1;
+    } else {
+        /* A preset, or one being tuned by hand. The renderer's control-rate
+           interpolation turns a changed target into a glide, so live tuning
+           needs no re-render here - it just moves. */
+        seg->start.carrier_hz  = p->carrier_hz;
+        seg->start.beat_hz     = p->beat_hz;
+        seg->start.tone_level  = p->tone_level;
+        seg->start.noise_level = p->noise_level;
+        seg->end = seg->start;
+    }
+}
+
+/* Called from whatever thread or tick the backend pulls on. No allocation, no
+   locks, no LVGL. */
+static uint32_t stream_pull(int16_t *dst, uint32_t frames,
+                            uint32_t advance_frames, void *ctx)
 {
     (void)ctx;
 
     if (S_total > 0.0 && S_t >= S_total) return 0;   /* the program is over */
 
-    const double dt = (double)frames / (double)EN_STREAM_RATE;
+    const uint32_t rate = stream_rate();
+    if (advance_frames == 0 || advance_frames > frames) advance_frames = frames;
+
     stream_params_t p = S_params[S_slot];            /* snapshot */
-
     en_segment_t seg;
-    memset(&seg, 0, sizeof seg);
-    seg.sample_rate = EN_STREAM_RATE;
-    seg.frames = frames;
-    seg.mode = p.mode;
-    seg.noise = p.noise;
 
-    if (S_is_program) {
-        /* Evaluate the timeline across exactly this block, so the ramp is
-           continuous across every block boundary and every segment join. */
-        double b0, c0, b1, c1, nl0, nl1;
-        en_noise_kind_t nk0, nk1;
-        program_params_at(S_t, &b0, &c0, &nk0, &nl0);
-        program_params_at(S_t + dt, &b1, &c1, &nk1, &nl1);
-        seg.noise = nk0;
-        seg.start.carrier_hz  = c0;
-        seg.start.beat_hz     = b0;
-        seg.start.tone_level  = p.tone_level;
-        seg.start.noise_level = nl0;
-        seg.end.carrier_hz    = c1;
-        seg.end.beat_hz       = b1;
-        seg.end.tone_level    = p.tone_level;
-        seg.end.noise_level   = nl1;
-    } else {
-        /* A preset, or a preset being tuned by hand. The renderer's own
-           control-rate interpolation turns a changed target into a glide, so
-           live tuning needs no re-render at all here — it just moves. */
-        seg.start.carrier_hz  = p.carrier_hz;
-        seg.start.beat_hz     = p.beat_hz;
-        seg.start.tone_level  = p.tone_level;
-        seg.start.noise_level = p.noise_level;
-        seg.end = seg.start;
-    }
-
+    /* The part that actually moves the source on. */
+    stream_segment(&seg, &p, S_t, (double)advance_frames / (double)rate);
+    seg.frames = advance_frames;
     en_render_segment(&S_rnd, &seg, dst);
 
-    if (S_is_program)
-        apply_program_fades(dst, frames, EN_STREAM_RATE, S_t, S_total);
+    double t_after = S_t + (double)advance_frames / (double)rate;
 
-    S_t += dt;
+    /* The overlap: rendered here as this window's tail, and again as the next
+       window's head, so the renderer is rewound afterwards. en_render_t is a
+       plain struct - oscillator phases and noise state - so a copy is a
+       complete snapshot. Without the rewind the timeline would gain the length
+       of every overlap and a 45 minute program would finish early. */
+    uint32_t tail = frames - advance_frames;
+    if (tail) {
+        en_render_t saved = S_rnd;
+        stream_segment(&seg, &p, t_after, (double)tail / (double)rate);
+        seg.frames = tail;
+        en_render_segment(&S_rnd, &seg, dst + (size_t)advance_frames * 2);
+        S_rnd = saved;
+    }
+
+    if (S_is_program)
+        apply_program_fades(dst, frames, rate, S_t, S_total);
+
+    S_t = t_after;
     return frames;
 }
 
@@ -458,10 +491,10 @@ static bool stream_start(bool is_program, double total_s)
     S_is_program = is_program ? 1 : 0;
     S_total = total_s;
     S_t = 0.0;
-    en_render_init(&S_rnd, EN_STREAM_RATE,
+    en_render_init(&S_rnd, stream_rate(),
                    is_program ? EN_NOISE_PINK : EN_NOISE_NONE, 1);
     stream_publish_from_state();
-    return en_audio_start_stream(EN_STREAM_RATE, stream_pull, NULL);
+    return en_audio_start_stream(stream_rate(), stream_pull, NULL);
 }
 
 /* ---- starting things ----------------------------------------------------- */

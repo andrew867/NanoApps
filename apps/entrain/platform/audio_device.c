@@ -1,38 +1,44 @@
 /*
  * audio_device.c — audio.h on the iPod under RetailOS.
  *
- * Plays PCM straight from RAM, in short windows.
+ * Generates audio a window at a time, straight into RAM, and never touches the
+ * filesystem.
  *
- * Two findings shape this file, both from RetailOS 1.1.2 and both confirmed on
- * device:
+ * Three findings from RetailOS 1.1.2 shape this, all confirmed on device:
  *
  *   1. The OS sound player will play a buffer we allocate and fill ourselves.
  *      voice::setSource (VA 0x0862fd24) stores the DESCRIPTOR pointer at
- *      voice+0x78 rather than copying the audio, and dispatches on a container
- *      type at desc+0x10 whose type 0 computes framesPerPacket = 1 and
- *      bytesPerFrame = (bits/8) * channels. That is linear PCM and nothing
- *      else. loadFile was only ever a parser, so we skip it: no files, no FAT
+ *      voice+0x78 rather than copying the audio, and its container-type table
+ *      (desc+0x10) has a type 0 whose framesPerPacket = 1 and
+ *      bytesPerFrame = (bits/8) * channels — linear PCM and nothing else.
+ *      loadFile was only ever a parser, so we skip it. No files, no FAT
  *      writes, and no 1 MiB ceiling (which limited the FILE, not the buffer).
  *
- *   2. Nothing can silence a voice that is already playing. No stop entry
- *      point has been found, and the voice pool mixes rather than cutting, so
- *      a second play() does not replace the first — it sums with it.
+ *   2. Nothing can silence a voice that is already playing, and the voice pool
+ *      mixes rather than cutting — so a second play() sums with the first
+ *      instead of replacing it. Handing over one long buffer meant every
+ *      preset change and every live-tune re-render started a second voice on
+ *      top of the first: twice as loud, drifting against itself.
  *
- * (2) is why this does not simply hand over one long buffer. Doing that made
- * every preset change, and every live-tune re-render, start a second voice on
- * top of the first: audibly twice as loud, and drifting against itself.
+ *   3. play() itself is cheap once no file is involved.
  *
- * So the rendered audio is kept as a master buffer and played out in half
- * second windows, alternating between two small slots. Anything the user does
- * takes effect at the next window instead of instantly, which is a fiftieth of
- * the wait that a full loop would have been, and — crucially — never overlaps
- * two different sounds.
+ * So this backend pulls. It keeps two half-second buffers, asks the engine to
+ * fill the idle one while the other sounds, and plays them alternately. That
+ * gives, in one design:
  *
- * The windows are consecutive samples of the same signal, so the join carries
- * a short crossfade: each window ends with the frames the next one opens with,
- * faded down while that one fades up, gains summing to exactly one. Identical
- * content cannot comb-filter, so a late tick costs a slight ripple instead of
- * a click.
+ *   - no render stage the user can see. A window is a few thousand frames and
+ *     renders in a couple of milliseconds, a whole window ahead of when it is
+ *     needed, instead of a whole loop up front while a progress ring spun.
+ *   - no loop and no seam. Successive windows are successive samples of a
+ *     continuous signal, so there is no wrap to get right. The cycle-exact
+ *     loop planner still runs, but only to report an honest realised beat.
+ *   - everything the user does lands within one window: stop, pause, retune,
+ *     a different preset. Never two sounds at once.
+ *   - about 50 KB of buffers instead of the best part of a megabyte.
+ *
+ * Windows carry a short crossfade: each ends with the frames the next opens
+ * with, faded down while that fades up, gains summing to one. Identical
+ * content cannot comb-filter, so a late tick costs a ripple, not a click.
  *
  * Ownership: buffers come from hb_os_alloc and are never handed to loadFile,
  * so the OS never frees them. The descriptor is reconstructed before every
@@ -62,65 +68,64 @@
 #define SFX_OFF_VOLUME   0x24
 #define SFX_OFF_TRIM_LO  0x38
 #define SFX_OFF_TRIM_HI  0x3C
-#define SFX_OFF_VOICE    0x48   /* setSource writes the voice pointer here */
 #define SFX_OFF_PLAYMODE 0x51
 #define SFX_OFF_FLAGS    0x52
 #define SFX_OFF_NEXTSFX  0x54
 
 #define SFX_TYPE_LPCM 0
 
-/* Window length. Everything the user can do — stop, pause, retune, pick
-   another preset — lands at the next window boundary, so this is the app's
-   worst-case response time. Short enough to feel immediate, long enough that
-   re-arming stays cheap at two play() calls a second. */
-#define WINDOW_MS  500
+/* 22050 Hz: proven by harness T9, and half the render cost and half the
+   memory of 44.1k for carriers that never go above a few hundred hertz. */
+#define DEVICE_RATE 22050u
+
+/* Window length. This is the app's worst-case response time to anything the
+   user does, and also how far ahead the engine renders. Short enough to feel
+   immediate, long enough that re-arming is two play() calls a second. */
+#define WINDOW_MS 500
 
 /* Crossfade between consecutive windows. Only has to cover UI-tick jitter. */
-#define XFADE_MS   40
+#define XFADE_MS 40
+
+#define WINDOW_FRAMES ((DEVICE_RATE * WINDOW_MS) / 1000u)
+#define XFADE_FRAMES  ((DEVICE_RATE * XFADE_MS) / 1000u)
+#define BUFFER_FRAMES (WINDOW_FRAMES + XFADE_FRAMES)
+
+/* Longer than this since the last window started and we were not being run at
+   all — the OS switched to another app. Restart cleanly rather than trying to
+   catch up on audio nobody heard. */
+#define STARVED_MS (WINDOW_MS * 4)
 
 typedef void *(*sfx_ctor_t)(void *self);
 typedef void *(*sfx_player_inst_t)(void);
 typedef void  (*sfx_player_play_t)(void *player, void *desc,
                                    void *cb, void *cbdata);
 
-/* The rendered audio we are playing out of. */
-typedef struct {
-    int16_t *pcm;
-    uint32_t capacity;      /* bytes allocated */
-    uint32_t frames;
-    uint32_t advance;       /* loop period; frames unless the caller says less */
-    uint32_t rate;
-    bool     loop;
-    bool     ready;
-} master_t;
-
-/* One of the two small buffers actually handed to the OS. */
 typedef struct {
     uint8_t  desc[0x80];
     int16_t *pcm;
-    uint32_t capacity;
     uint32_t frames;        /* window + crossfade tail */
-    uint32_t advance;       /* window only */
+    bool     filled;
 } window_t;
 
-static master_t g_cur, g_next;
-static bool     g_next_ready;
-
 static window_t g_win[2];
-static int      g_playing = -1;
+static int      g_playing = -1;     /* the sounding window, or -1 */
+static int      g_filled_next = -1; /* the one already rendered and waiting */
 static uint32_t g_started_ms;
-static uint32_t g_read_pos;        /* frame cursor into the current master */
-static uint64_t g_frames_out;      /* for the elapsed readout */
+static uint64_t g_frames_out;
+
+static en_audio_pull_fn s_pull;
+static void            *s_pull_ctx;
+static bool             s_source_done;   /* the pull said it had no more */
 
 static bool g_paused;
 static bool g_stopping;
 static int  g_volume = 45;
 static en_audio_state_t g_state = EN_AUDIO_IDLE;
 
-/* ---- helpers ------------------------------------------------------------- */
+/* Scratch the engine renders into before the crossfade shaping is applied. */
+static int16_t *g_scratch;
 
-static uint32_t win_frames(uint32_t rate) { return (rate * WINDOW_MS) / 1000u; }
-static uint32_t xfade_frames(uint32_t rate) { return (rate * XFADE_MS) / 1000u; }
+/* ---- helpers ------------------------------------------------------------- */
 
 static uint32_t os_volume(void)
 {
@@ -128,67 +133,53 @@ static uint32_t os_volume(void)
     return (0x7fffu * (uint32_t)v) / 100u;
 }
 
-static bool reserve(int16_t **pcm, uint32_t *cap, uint32_t bytes)
+static bool reserve(int16_t **pcm, uint32_t bytes)
 {
-    if (*pcm && *cap >= bytes) return true;
-
+    if (*pcm) return true;
     /* Refuse rather than risk the OS allocator, which panics and reboots the
-       device on failure. Picking a preset must never be able to do that. */
+       device on failure. Starting a preset must never be able to do that. */
     if (hb_os_heap_largest() < bytes + (128u * 1024u)) return false;
-
-    if (*pcm) { hb_os_free(*pcm); *pcm = (int16_t *)0; *cap = 0; }
     *pcm = (int16_t *)hb_os_alloc(bytes);
-    if (!*pcm) return false;
-    *cap = bytes;
+    return *pcm != (int16_t *)0;
+}
+
+static bool buffers_ready(void)
+{
+    uint32_t bytes = BUFFER_FRAMES * 4u;
+    if (!reserve(&g_win[0].pcm, bytes)) return false;
+    if (!reserve(&g_win[1].pcm, bytes)) return false;
+    if (!reserve(&g_scratch, bytes)) return false;
     return true;
 }
 
-static bool master_set(master_t *m, const int16_t *pcm, uint32_t frames,
-                       uint32_t advance, uint32_t rate, bool loop)
+/* Ask the engine for the next stretch of audio and shape its ends so it
+   crossfades with its neighbours. The pull is asked for the whole buffer,
+   crossfade tail included, because the tail is real audio that the next window
+   will also carry — the two overlap rather than one being a copy. */
+static bool fill_window(int idx)
 {
-    if (!reserve(&m->pcm, &m->capacity, frames * 4u)) return false;
+    window_t *w = &g_win[idx];
+    if (!s_pull || s_source_done) return false;
 
-    uint32_t words = frames * 2u;
-    for (uint32_t i = 0; i < words; i++) m->pcm[i] = pcm[i];
+    /* Ask for the window plus the overlap, but tell the source to advance
+       only by the window: the overlap is real audio that the NEXT window also
+       carries, so it has to be produced twice. */
+    uint32_t got = s_pull(g_scratch, BUFFER_FRAMES, WINDOW_FRAMES, s_pull_ctx);
+    if (got == 0) { s_source_done = true; return false; }
 
-    m->frames = frames;
-    m->advance = (advance && advance <= frames) ? advance : frames;
-    m->rate = rate;
-    m->loop = loop;
-    m->ready = true;
-    return true;
-}
+    for (uint32_t i = 0; i < BUFFER_FRAMES; i++) {
+        int32_t l = (i < got) ? g_scratch[2 * i + 0] : 0;
+        int32_t r = (i < got) ? g_scratch[2 * i + 1] : 0;
 
-/* Copy one window out of the master, wrapping if it loops, and apply the
-   crossfade shaping: fade the head in and the tail out, so consecutive windows
-   sum to exactly the original signal across their overlap. */
-static void window_fill(window_t *w, const master_t *m, uint32_t pos)
-{
-    const uint32_t win = win_frames(m->rate);
-    const uint32_t x   = xfade_frames(m->rate);
-    const uint32_t len = win + x;
-
-    for (uint32_t i = 0; i < len; i++) {
-        uint32_t src = pos + i;
-        if (m->loop) {
-            src %= m->advance;                 /* the loop period, not the buffer */
-        } else if (src >= m->frames) {
-            w->pcm[2 * i + 0] = 0;
-            w->pcm[2 * i + 1] = 0;
-            continue;
-        }
-        int32_t l = m->pcm[2 * src + 0];
-        int32_t r = m->pcm[2 * src + 1];
-
-        /* Linear gains that sum to one with the neighbouring window. Correct
-           here because the overlap is the SAME signal in both, not two
+        /* Linear gains summing to one with the neighbouring window. Correct
+           here because the overlap is the same signal in both, not two
            independent ones. */
-        if (i < x) {                           /* head: fade in */
-            int32_t g = (int32_t)((i * 4096u) / x);
+        if (i < XFADE_FRAMES) {
+            int32_t g = (int32_t)((i * 4096u) / XFADE_FRAMES);
             l = (l * g) >> 12;
             r = (r * g) >> 12;
-        } else if (i >= win) {                 /* tail: fade out */
-            int32_t g = 4096 - (int32_t)(((i - win) * 4096u) / x);
+        } else if (i >= WINDOW_FRAMES) {
+            int32_t g = 4096 - (int32_t)(((i - WINDOW_FRAMES) * 4096u) / XFADE_FRAMES);
             l = (l * g) >> 12;
             r = (r * g) >> 12;
         }
@@ -196,21 +187,24 @@ static void window_fill(window_t *w, const master_t *m, uint32_t pos)
         w->pcm[2 * i + 1] = (int16_t)r;
     }
 
-    w->frames = len;
-    w->advance = win;
+    w->frames = BUFFER_FRAMES;
+    w->filled = true;
+    return true;
 }
 
-static void window_arm(window_t *w, uint32_t rate)
+static bool play_window(int idx)
 {
-    uint8_t *d = w->desc;
+    window_t *w = &g_win[idx];
+    if (!w->filled || !w->pcm) return false;
 
+    uint8_t *d = w->desc;
     ((sfx_ctor_t)SFX_CTOR_ADDR)(d);
 
     *(volatile uint32_t *)(d + SFX_OFF_BUF_A)    = (uint32_t)(uintptr_t)w->pcm;
     *(volatile uint32_t *)(d + SFX_OFF_BUF_B)    = (uint32_t)(uintptr_t)w->pcm;
     *(volatile uint32_t *)(d + SFX_OFF_BUF_LEN)  = w->frames * 4u;
     d[SFX_OFF_TYPE] = SFX_TYPE_LPCM;
-    *(volatile uint32_t *)(d + SFX_OFF_RATE)     = rate;
+    *(volatile uint32_t *)(d + SFX_OFF_RATE)     = DEVICE_RATE;
     *(volatile uint32_t *)(d + SFX_OFF_CHANNELS) = 2;
     *(volatile uint32_t *)(d + SFX_OFF_BITS)     = 16;
     *(volatile uint32_t *)(d + SFX_OFF_TRIM_LO)  = 0;
@@ -219,57 +213,17 @@ static void window_arm(window_t *w, uint32_t rate)
     d[SFX_OFF_PLAYMODE] = 1;
     d[SFX_OFF_FLAGS] = 0;
     *(volatile void **)(d + SFX_OFF_NEXTSFX) = (void *)0;
-}
-
-/* Fill the idle window from the master at g_read_pos and play it. */
-static bool play_next_window(void)
-{
-    if (!g_cur.ready || !g_cur.rate) return false;
-
-    int idx = (g_playing == 0) ? 1 : 0;
-    window_t *w = &g_win[idx];
-
-    uint32_t len = win_frames(g_cur.rate) + xfade_frames(g_cur.rate);
-    if (!reserve(&w->pcm, &w->capacity, len * 4u)) return false;
-
-    window_fill(w, &g_cur, g_read_pos);
-    window_arm(w, g_cur.rate);
 
     void *player = ((sfx_player_inst_t)SFX_PLAYER_INST_ADDR)();
     if (!player) return false;
-    ((sfx_player_play_t)SFX_PLAYER_PLAY_ADDR)(player, w->desc,
-                                              (void *)0, (void *)0);
+    ((sfx_player_play_t)SFX_PLAYER_PLAY_ADDR)(player, d, (void *)0, (void *)0);
 
+    w->filled = false;
     g_playing = idx;
     g_started_ms = hb_time_uptime_ms();
+    g_frames_out += WINDOW_FRAMES;
     g_state = EN_AUDIO_PLAYING;
     return true;
-}
-
-/* Move the read cursor on by one window, following the master's own rules. */
-static bool advance_cursor(void)
-{
-    uint32_t win = win_frames(g_cur.rate);
-    g_read_pos += win;
-    g_frames_out += win;
-
-    if (g_cur.loop) {
-        if (g_read_pos >= g_cur.advance) g_read_pos -= g_cur.advance;
-        return true;
-    }
-    if (g_read_pos < g_cur.frames) return true;
-
-    /* This master is spent. Take the queued one if there is one. */
-    if (g_next_ready) {
-        master_t tmp = g_cur;
-        g_cur = g_next;
-        g_next = tmp;
-        g_next.ready = false;
-        g_next_ready = false;
-        g_read_pos = 0;
-        return true;
-    }
-    return false;
 }
 
 /* ---- the interface ------------------------------------------------------- */
@@ -283,97 +237,83 @@ bool en_audio_init(void)
 void en_audio_shutdown(void)
 {
     g_stopping = true;
+    s_pull = (en_audio_pull_fn)0;
     g_playing = -1;
-    g_cur.ready = g_next.ready = false;
-    g_next_ready = false;
+    g_filled_next = -1;
     g_state = EN_AUDIO_IDLE;
     /* Buffers are deliberately left allocated: the app is going away, and
        freeing one while a voice may still be reading it would be worse than
-       leaking for the few hundred milliseconds until the heap goes too. */
+       leaking for the moment until the heap goes too. */
 }
 
+bool en_audio_can_stream(void) { return true; }
+
+uint32_t en_audio_preferred_rate(void) { return DEVICE_RATE; }
+
+bool en_audio_start_stream(uint32_t sample_rate, en_audio_pull_fn pull,
+                           void *ctx)
+{
+    (void)sample_rate;             /* the descriptor is told DEVICE_RATE */
+    if (!pull) return false;
+    if (!buffers_ready()) { g_state = EN_AUDIO_FAILED; return false; }
+
+    s_pull = pull;
+    s_pull_ctx = ctx;
+    s_source_done = false;
+    g_frames_out = 0;
+    g_paused = false;
+    g_stopping = false;
+    g_win[0].filled = g_win[1].filled = false;
+    g_filled_next = -1;
+
+    /* If a window is still sounding, let it finish: starting another now would
+       sum with it rather than replace it. The tick picks the new source up at
+       the boundary, at most one window away. */
+    if (g_playing >= 0) return true;
+
+    if (!fill_window(0)) { g_state = EN_AUDIO_FAILED; return false; }
+    if (!play_window(0)) { g_state = EN_AUDIO_FAILED; return false; }
+    return true;
+}
+
+/* The file-shaped half of the interface is unreachable: the engine checks
+   en_audio_can_stream() and takes the pull path. Defined so the backend
+   satisfies audio.h in full. */
 bool en_audio_submit(const char *key, const int16_t *pcm,
                      uint32_t frames, uint32_t advance_frames,
                      uint32_t sample_rate, bool loop)
 {
-    (void)key;                        /* nothing on disk left to key */
-    if (!pcm || !frames) return false;
-
-    g_state = EN_AUDIO_PREPARING;
-
-    if (!master_set(&g_cur, pcm, frames, advance_frames, sample_rate, loop)) {
-        g_state = EN_AUDIO_FAILED;
-        return false;
-    }
-
-    g_next.ready = false;
-    g_next_ready = false;
-    g_read_pos = 0;
-    g_frames_out = 0;
-    g_paused = false;
-    g_stopping = false;
-
-    /* If a window is already sounding, let it finish: starting another now
-       would sum with it rather than replace it. The tick picks the new master
-       up at the boundary, at most WINDOW_MS away. */
-    if (g_playing >= 0) return true;
-
-    if (!play_next_window()) {
-        g_state = EN_AUDIO_FAILED;
-        return false;
-    }
-    return true;
+    (void)key; (void)pcm; (void)frames; (void)advance_frames;
+    (void)sample_rate; (void)loop;
+    return false;
 }
 
 bool en_audio_queue(const char *key, const int16_t *pcm,
                     uint32_t frames, uint32_t advance_frames,
                     uint32_t sample_rate)
 {
-    (void)key;
-    if (!pcm || !frames) return false;
-    if (!master_set(&g_next, pcm, frames, advance_frames, sample_rate, false))
-        return false;
-    g_next_ready = true;
-    return true;
-}
-
-bool en_audio_can_stream(void) { return false; }
-
-bool en_audio_start_stream(uint32_t sample_rate, en_audio_pull_fn pull,
-                           void *ctx)
-{
-    (void)sample_rate; (void)pull; (void)ctx;
+    (void)key; (void)pcm; (void)frames; (void)advance_frames;
+    (void)sample_rate;
     return false;
 }
 
-bool en_audio_wants_next(void)
-{
-    return g_cur.ready && !g_cur.loop && !g_next_ready && !g_stopping;
-}
+bool en_audio_wants_next(void) { return false; }
 
-double en_audio_remaining(void)
-{
-    if (!g_cur.ready) return 0.0;
-    if (g_cur.loop) return 1e9;
-    uint32_t left = (g_read_pos < g_cur.frames) ? g_cur.frames - g_read_pos : 0;
-    return (double)left / (double)g_cur.rate;
-}
+double en_audio_remaining(void) { return s_pull && !s_source_done ? 1e9 : 0.0; }
 
 void en_audio_stop(uint32_t fade_ms)
 {
     (void)fade_ms;
-    /* Takes effect at the next window boundary — half a second at worst,
-       rather than the eleven to eighteen seconds a whole loop would have
-       been. */
+    /* Lands at the next window boundary: half a second at worst, rather than
+       the whole loop length this used to take. */
     g_stopping = true;
-    g_next_ready = false;
 }
 
 void en_audio_set_paused(bool paused)
 {
     g_paused = paused;
     g_state = paused ? EN_AUDIO_PAUSED : EN_AUDIO_PLAYING;
-    /* Both directions land at the next boundary; nothing is torn off
+    /* Both directions land at the next boundary. Nothing is torn off
        mid-window, so neither is a click. */
 }
 
@@ -382,51 +322,86 @@ void en_audio_set_volume(int percent)
     if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
     g_volume = percent;
-    /* The descriptor's volume is read at play() time, so a change takes hold
-       within one window rather than instantly. */
+    /* Read at play() time, so it takes hold within one window. */
 }
 
 int en_audio_get_volume(void) { return g_volume; }
 
 void en_audio_tick(void)
 {
-    if (!g_cur.ready) return;
+    if (!s_pull) return;
 
-    /* Nothing playing and not stopped: this is the start, or a resume. */
+    uint32_t now = hb_time_uptime_ms();
+
+    /* Nothing sounding: either the very start, a resume, or we have just been
+       given the CPU back after the OS put another app in front of us. */
     if (g_playing < 0) {
-        if (!g_paused && !g_stopping) play_next_window();
+        if (g_paused || g_stopping || s_source_done) return;
+        if (g_filled_next >= 0) {
+            int idx = g_filled_next;
+            g_filled_next = -1;
+            play_window(idx);
+        } else if (fill_window(0)) {
+            play_window(0);
+        }
         return;
     }
 
-    uint32_t dur = (win_frames(g_cur.rate) * 1000u) / g_cur.rate;
-    if (hb_time_uptime_ms() - g_started_ms < dur) return;
+    uint32_t elapsed = now - g_started_ms;
+
+    /* Starved: the frame callback stopped being run, which is what happens
+       when RetailOS brings its own Music app to the front. Whatever was
+       sounding finished long ago and in silence. Drop the stale timing and
+       start again from the next window rather than replaying a backlog. */
+    if (elapsed > STARVED_MS) {
+        g_playing = -1;
+        g_filled_next = -1;
+        g_win[0].filled = g_win[1].filled = false;
+        return;                         /* next tick starts a fresh window */
+    }
+
+    /* Mid-window: render the next one now, so it is ready well before it is
+       needed and the work never lands on a boundary. This is the whole reason
+       there is no visible rendering stage any more. */
+    if (g_filled_next < 0 && !g_stopping && !g_paused && !s_source_done) {
+        int idx = (g_playing == 0) ? 1 : 0;
+        if (fill_window(idx)) g_filled_next = idx;
+    }
+
+    if (elapsed < WINDOW_MS) return;
 
     if (g_stopping) {
         g_playing = -1;
-        g_cur.ready = false;
+        s_pull = (en_audio_pull_fn)0;
         g_state = EN_AUDIO_IDLE;
         return;
     }
     if (g_paused) {
-        g_playing = -1;              /* hold position; resume refills here */
+        g_playing = -1;                 /* resume picks up from here */
         return;
     }
 
-    if (!advance_cursor()) {
+    if (g_filled_next >= 0) {
+        int idx = g_filled_next;
+        g_filled_next = -1;
+        play_window(idx);
+    } else if (s_source_done) {
         g_playing = -1;
-        g_cur.ready = false;
-        g_state = EN_AUDIO_IDLE;     /* ran dry: the program is over */
-        return;
+        s_pull = (en_audio_pull_fn)0;
+        g_state = EN_AUDIO_IDLE;        /* the program is over */
+    } else {
+        /* The render did not get done in time — a very busy frame. Fill and
+           play now; one late window is better than a dropout. */
+        int idx = (g_playing == 0) ? 1 : 0;
+        if (fill_window(idx)) play_window(idx);
     }
-    play_next_window();
 }
 
 en_audio_state_t en_audio_state(void) { return g_state; }
 
 double en_audio_elapsed(void)
 {
-    if (!g_cur.rate) return 0.0;
-    return (double)g_frames_out / (double)g_cur.rate;
+    return (double)g_frames_out / (double)DEVICE_RATE;
 }
 
 const char *en_audio_backend_name(void) { return "RetailOS sfx, PCM windows"; }
