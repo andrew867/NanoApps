@@ -72,6 +72,31 @@ en_cap_err_t en_cap_record_stop(void);
    either the buffer or a recording in progress. */
 en_cap_err_t en_cap_save_live(const char *path, uint32_t ms);
 
+/*
+ * Playing out of the ring.
+ *
+ * Opening the capture device clocks IIS2, but the tuner's audio still has to be
+ * carried from IIS2 to IIS0 for anything to be heard - the n31-fm helper does
+ * it with arecord piped into aplay. Here the player does it, reading through
+ * these, which is why the player is not an optional extra.
+ *
+ * Positions are absolute frame counts rather than "behind live". A reader that
+ * asks for an offset from a moving target drifts, because the target moves
+ * while the read is in flight; a cursor the reader advances itself cannot.
+ */
+
+/* Frames captured since the stream started. The newest sample is at
+   en_cap_total_frames() - 1. */
+uint64_t en_cap_total_frames(void);
+
+/* Copy up to `frames` starting at absolute frame `at`. Returns how many were
+   available; a reader that has fallen out of the window gets what is left and
+   should re-anchor. */
+uint32_t en_cap_read_from(uint64_t at, void *buf, uint32_t frames);
+
+/* The oldest frame the ring still holds. */
+uint64_t en_cap_oldest_frame(void);
+
 const char *en_cap_strerror(en_cap_err_t e);
 
 #endif /* RADIOPLUS_CAPTURE_H */

@@ -394,6 +394,7 @@ void en_settings_default(en_settings_t *s)
     s->khz = 0;                 /* 0 means "the bottom of whatever band" */
     s->rds_on = true;
     s->live_seconds = 30;
+    s->ta_record = false;
 }
 
 uint32_t en_settings_save(const en_settings_t *s, char *buf, uint32_t cap)
@@ -408,6 +409,7 @@ uint32_t en_settings_save(const en_settings_t *s, char *buf, uint32_t cap)
     en_json_uint(&j, "khz", s->khz);
     en_json_bool(&j, "rds", s->rds_on);
     en_json_uint(&j, "live_seconds", s->live_seconds);
+    en_json_bool(&j, "ta_record", s->ta_record);
 
     /* Written as hex bytes rather than a number, because a register payload is
        a byte string of its own length and turning it into an integer would
@@ -458,6 +460,9 @@ bool en_settings_load(en_settings_t *s, const char *json, uint32_t len)
 
     v = find_key(json, end, "live_seconds");
     if (v && read_uint(v, end, &n) && n) s->live_seconds = (uint8_t)n;
+
+    v = find_key(json, end, "ta_record");
+    if (v) s->ta_record = (*v == 't');
 
     const char *arr = find_key(json, end, "registers");
     if (arr && *arr == '[') {

@@ -15,6 +15,7 @@
 
 #include "../model.h"
 
+#include <stdio.h>
 #include <string.h>
 
 rp_model_t rp_model;
@@ -96,6 +97,9 @@ void rp_model_refresh(void)
         rp_model.capture_ok = true;
         rp_model.live_ms = 21000;
         rp_model.live_cap_ms = 30000;
+        rp_model.behind_ms = 8000;      /* mid-scrub, to see the control */
+        rp_model.behind_max_ms = 30000;
+        rp_model.play_ok = true;
         rp_model.can_raw = true;
         rp_model.backend = "bcm2078-bt at /sys/devices/platform/soc/bcm2078";
         rp_model.capture_backend = "tinyalsa hw:0,1  44100 Hz 2 ch  30s buffer";
@@ -150,6 +154,42 @@ void rp_act_preset_toggle(void)
         en_preset_add(&rp_model.presets, &e);
     en_preset_sort(&rp_model.presets);
 }
+
+/* Playback, faked just enough that the controls have something to move. */
+void rp_act_play_file(const char *name)
+{
+    if (!name) return;
+    rp_model.play_file = true;
+    rp_model.play_paused = false;
+    rp_model.play_pos_ms = 0;
+    rp_model.play_len_ms = 214000;
+    snprintf(rp_model.play_name, sizeof rp_model.play_name, "%s", name);
+}
+
+void rp_act_play_live(void)
+{
+    rp_model.play_file = false;
+    rp_model.behind_ms = 0;
+    rp_model.play_name[0] = 0;
+}
+
+void rp_act_nudge(int32_t ms)
+{
+    if (rp_model.play_file) {
+        int64_t p = (int64_t)rp_model.play_pos_ms + ms;
+        if (p < 0) p = 0;
+        if (p > (int64_t)rp_model.play_len_ms) p = rp_model.play_len_ms;
+        rp_model.play_pos_ms = (uint32_t)p;
+        return;
+    }
+    int64_t b = (int64_t)rp_model.behind_ms - ms;
+    if (b < 0) b = 0;
+    if (b > (int64_t)rp_model.behind_max_ms) b = rp_model.behind_max_ms;
+    rp_model.behind_ms = (uint32_t)b;
+}
+
+void rp_act_pause_toggle(void) { rp_model.play_paused = !rp_model.play_paused; }
+void rp_act_ta_record(bool on) { rp_model.ta_record = on; }
 
 /* A shadow of the chip, so the register editor can be driven in the preview.
    Values persist for the run, which is enough to see a toggle stick. */

@@ -70,7 +70,8 @@ static rp_screen_t s_current = RP_SCREEN_NOW;
 static lv_obj_t *s_freq, *s_unit, *s_ps, *s_pty, *s_rt;
 static lv_obj_t *s_seg[14], *s_rssi_lbl, *s_stereo, *s_ta_badge;
 static lv_obj_t *s_live_fill, *s_live_lbl, *s_rec_dot, *s_rec_lbl;
-static lv_obj_t *s_band_lbl, *s_rec_btn_lbl;
+static lv_obj_t *s_band_lbl, *s_rec_btn_lbl, *s_tl_lbl, *s_tr_lbl;
+static lv_obj_t *s_live_btn, *s_live_head, *s_bar_row;
 static lv_obj_t *s_dots[RP_SCREEN_COUNT];
 
 /* Dial */
@@ -78,7 +79,8 @@ static lv_obj_t *s_dial_freq, *s_dial_grid, *s_dial_note;
 
 /* Presets, library, settings */
 static lv_obj_t *s_preset_list, *s_library_list;
-static lv_obj_t *s_set_region, *s_set_std, *s_set_backend, *s_set_capture;
+static lv_obj_t *s_set_region, *s_set_std, *s_set_backend, *s_set_capture,
+                *s_set_ta;
 static lv_obj_t *s_adv_list;
 
 /* The register being edited, and its live payload. */
@@ -274,9 +276,62 @@ static void on_gesture(lv_event_t *e)
 
 /* ---- Now Playing ---------------------------------------------------------- */
 
-static void on_seek_down(lv_event_t *e) { (void)e; rp_act_seek(false); }
-static void on_seek_up(lv_event_t *e)   { (void)e; rp_act_seek(true); }
-static void on_record(lv_event_t *e)    { (void)e; rp_act_record_toggle(); }
+/* True when the headphones are carrying the radio as it happens. Everything
+   contextual on this screen turns on this one question. */
+static bool at_live(void)
+{
+    return !rp_model.play_file && rp_model.behind_ms == 0;
+}
+
+static void on_left(lv_event_t *e)
+{
+    (void)e;
+    if (at_live()) rp_act_seek(false);
+    else rp_act_nudge(-15000);
+}
+
+static void on_right(lv_event_t *e)
+{
+    (void)e;
+    if (at_live()) rp_act_seek(true);
+    else rp_act_nudge(15000);
+}
+
+static void on_middle(lv_event_t *e)
+{
+    (void)e;
+    if (at_live()) rp_act_record_toggle();
+    else rp_act_pause_toggle();
+}
+
+static void on_go_live(lv_event_t *e) { (void)e; rp_act_play_live(); }
+
+/* Tapping the buffer bar seeks to that point, which is how every buffered
+   radio behaves and saves inventing a control for entering the scrub. */
+static void on_bar_tap(lv_event_t *e)
+{
+    (void)e;
+    lv_point_t p;
+    lv_indev_get_point(lv_indev_active(), &p);
+
+    int32_t x = p.x - MARGIN;
+    if (x < 0) x = 0;
+    if (x > CONTENT_W) x = CONTENT_W;
+
+    if (rp_model.play_file) {
+        if (rp_model.play_len_ms)
+            rp_act_nudge((int32_t)((int64_t)x * rp_model.play_len_ms / CONTENT_W)
+                         - (int32_t)rp_model.play_pos_ms);
+        return;
+    }
+
+    /* The bar runs oldest on the left to live on the right, so distance from
+       the right edge is how far behind the tap is. */
+    uint32_t span = rp_model.behind_max_ms;
+    if (!span) return;
+    uint32_t behind = (uint32_t)((int64_t)(CONTENT_W - x) * span / CONTENT_W);
+    rp_act_nudge((int32_t)rp_model.behind_ms - (int32_t)behind);
+}
 
 static void build_now(void)
 {
@@ -351,16 +406,32 @@ static void build_now(void)
     /* The live buffer. Shown as how much has been captured rather than as a
        scrubber with a handle: there is nothing to drag to yet, and a control
        that looks draggable and is not is worse than a readout. */
-    lv_obj_t *live_cap = label(s, "LIVE", F_CAPTION, C_TEXT_MUTE);
-    lv_obj_set_pos(live_cap, MARGIN, 328);
-
-    panel(s, MARGIN, 350, CONTENT_W, 3, C_SURFACE_2);
-    s_live_fill = panel(s, MARGIN, 350, 0, 3, C_LIVE);
+    s_tl_lbl = label(s, "", F_CAPTION, C_LIVE);
+    lv_obj_set_pos(s_tl_lbl, MARGIN, 328);
 
     s_live_lbl = label(s, "", F_CAPTION, C_TEXT_MUTE);
     lv_obj_set_style_text_align(s_live_lbl, LV_TEXT_ALIGN_RIGHT, 0);
-    lv_obj_set_width(s_live_lbl, CONTENT_W);
+    lv_obj_set_width(s_live_lbl, CONTENT_W - 52);
     lv_obj_set_pos(s_live_lbl, MARGIN, 328);
+
+    /* Shown only when it would do something. A LIVE button that is already
+       live is a button that teaches you it does nothing. */
+    s_live_btn = panel(s, RP_SCREEN_W - MARGIN - 46, 322, 46, 26, C_SURFACE_2);
+    lv_obj_set_style_radius(s_live_btn, 3, 0);
+    lv_obj_add_flag(s_live_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_live_btn, on_go_live, LV_EVENT_CLICKED, 0);
+    lv_obj_set_ext_click_area(s_live_btn, 12);
+    lv_obj_center(label(s_live_btn, "LIVE", F_CAPTION, C_LIVE));
+
+    /* The bar is inside a taller row so the whole strip is tappable - a 3 px
+       target would be a decoration, not a control. */
+    s_bar_row = panel(s, 0, 344, RP_SCREEN_W, 22, C_BG);
+    lv_obj_add_flag(s_bar_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_bar_row, on_bar_tap, LV_EVENT_CLICKED, 0);
+
+    panel(s_bar_row, MARGIN, 8, CONTENT_W, 3, C_SURFACE_2);
+    s_live_fill = panel(s_bar_row, MARGIN, 8, 0, 3, C_LIVE);
+    s_live_head = panel(s_bar_row, MARGIN, 4, 3, 11, C_TEXT);
 
     /* Transport. Three targets across the full width, each well over the
        minimum, with the record button given the middle and the most weight. */
@@ -368,22 +439,24 @@ static void build_now(void)
 
     lv_obj_t *dn = panel(s, MARGIN, ty, 64, th, C_SURFACE);
     lv_obj_add_flag(dn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(dn, on_seek_down, LV_EVENT_CLICKED, 0);
+    lv_obj_add_event_cb(dn, on_left, LV_EVENT_CLICKED, 0);
     lv_obj_set_style_bg_color(dn, lv_color_hex(C_SURFACE_2), LV_STATE_PRESSED);
-    lv_obj_center(label(dn, LV_SYMBOL_PREV, F_BODY, C_TEXT));
+    s_tl_lbl = label(dn, LV_SYMBOL_PREV, F_BODY, C_TEXT);
+    lv_obj_center(s_tl_lbl);
 
     lv_obj_t *rec = panel(s, MARGIN + 72, ty, 72, th, C_SURFACE);
     lv_obj_add_flag(rec, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(rec, on_record, LV_EVENT_CLICKED, 0);
+    lv_obj_add_event_cb(rec, on_middle, LV_EVENT_CLICKED, 0);
     lv_obj_set_style_bg_color(rec, lv_color_hex(C_SURFACE_2), LV_STATE_PRESSED);
     s_rec_btn_lbl = label(rec, "REC", F_BODY, C_REC);
     lv_obj_center(s_rec_btn_lbl);
 
     lv_obj_t *up = panel(s, MARGIN + 152, ty, 64, th, C_SURFACE);
     lv_obj_add_flag(up, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(up, on_seek_up, LV_EVENT_CLICKED, 0);
+    lv_obj_add_event_cb(up, on_right, LV_EVENT_CLICKED, 0);
     lv_obj_set_style_bg_color(up, lv_color_hex(C_SURFACE_2), LV_STATE_PRESSED);
-    lv_obj_center(label(up, LV_SYMBOL_NEXT, F_BODY, C_TEXT));
+    s_tr_lbl = label(up, LV_SYMBOL_NEXT, F_BODY, C_TEXT);
+    lv_obj_center(s_tr_lbl);
 }
 
 static void refresh_now(void)
@@ -444,35 +517,95 @@ static void refresh_now(void)
     pill_set(s_stereo, rp_model.stereo, C_SIGNAL);
     pill_set(s_ta_badge, rp_model.rds.ta, C_TA);
 
-    /* Live buffer fill. */
-    int w = 0;
-    if (rp_model.live_cap_ms)
-        w = (int)((uint64_t)rp_model.live_ms * CONTENT_W / rp_model.live_cap_ms);
-    if (w > CONTENT_W) w = CONTENT_W;
-    lv_obj_set_width(s_live_fill, w);
+    /* The buffer strip. How much has been captured, and where in it the
+       headphones are - which is the same picture whether that is the live edge
+       or ten minutes back. */
+    bool live = at_live();
 
-    buf[0] = 0;
-    if (rp_model.capture_ok) {
+    int w = 0, head = 0;
+    if (rp_model.play_file) {
+        if (rp_model.play_len_ms)
+            head = (int)((uint64_t)rp_model.play_pos_ms * CONTENT_W
+                         / rp_model.play_len_ms);
+        w = CONTENT_W;
+    } else {
+        if (rp_model.live_cap_ms)
+            w = (int)((uint64_t)rp_model.live_ms * CONTENT_W
+                      / rp_model.live_cap_ms);
+        head = w;
+        if (rp_model.behind_max_ms && rp_model.behind_ms)
+            head = w - (int)((uint64_t)rp_model.behind_ms * w
+                             / rp_model.behind_max_ms);
+    }
+    if (w > CONTENT_W) w = CONTENT_W;
+    if (head < 0) head = 0;
+    if (head > CONTENT_W) head = CONTENT_W;
+
+    lv_obj_set_width(s_live_fill, w);
+    lv_obj_set_pos(s_live_head, MARGIN + head - 1, 4);
+    lv_obj_set_style_bg_color(s_live_head,
+                              lv_color_hex(live ? C_LIVE : C_TEXT), 0);
+
+    /* Left of the row says what is playing; right says how much there is. */
+    if (rp_model.play_file) {
+        lv_label_set_text(s_tl_lbl, "");
+        buf[0] = 0;
+        fmt_time(n, sizeof n, rp_model.play_pos_ms);
+        cat(buf, n, sizeof buf);
+        cat(buf, " / ", sizeof buf);
+        fmt_time(n, sizeof n, rp_model.play_len_ms);
+        cat(buf, n, sizeof buf);
+        lv_label_set_text(s_live_lbl, buf);
+    } else if (!rp_model.capture_ok) {
+        lv_label_set_text(s_live_lbl, "no capture");
+    } else if (live) {
+        buf[0] = 0;
         fmt_time(n, sizeof n, rp_model.live_ms);
         cat(buf, n, sizeof buf);
         cat(buf, " buffered", sizeof buf);
+        lv_label_set_text(s_live_lbl, buf);
     } else {
-        cat(buf, "no capture", sizeof buf);
+        buf[0] = 0;
+        cat(buf, "-", sizeof buf);
+        fmt_time(n, sizeof n, rp_model.behind_ms);
+        cat(buf, n, sizeof buf);
+        cat(buf, " behind", sizeof buf);
+        lv_label_set_text(s_live_lbl, buf);
     }
-    lv_label_set_text(s_live_lbl, buf);
+
+    if (live) lv_obj_add_flag(s_live_btn, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_remove_flag(s_live_btn, LV_OBJ_FLAG_HIDDEN);
 
     /* Recording. The dot and the elapsed time appear together and only while
        recording; a permanent readout showing 0:00 would be noise. */
     if (rp_model.recording) {
         lv_obj_remove_flag(s_rec_dot, LV_OBJ_FLAG_HIDDEN);
         lv_obj_remove_flag(s_rec_lbl, LV_OBJ_FLAG_HIDDEN);
-        fmt_time(buf, sizeof buf, rp_model.rec_ms);
+        buf[0] = 0;
+        if (rp_model.ta_recording) cat(buf, "TA ", sizeof buf);
+        fmt_time(n, sizeof n, rp_model.rec_ms);
+        cat(buf, n, sizeof buf);
         lv_label_set_text(s_rec_lbl, buf);
-        lv_label_set_text(s_rec_btn_lbl, "STOP");
     } else {
         lv_obj_add_flag(s_rec_dot, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_rec_lbl, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(s_rec_btn_lbl, "REC");
+    }
+
+    /* The transport means different things depending on where the headphones
+       are, so it says so rather than leaving the user to find out. */
+    if (live) {
+        lv_label_set_text(s_tl_lbl, LV_SYMBOL_PREV);
+        lv_label_set_text(s_tr_lbl, LV_SYMBOL_NEXT);
+        lv_label_set_text(s_rec_btn_lbl,
+                          rp_model.recording ? "STOP" : "REC");
+        lv_obj_set_style_text_color(s_rec_btn_lbl, lv_color_hex(C_REC), 0);
+    } else {
+        lv_label_set_text(s_tl_lbl, LV_SYMBOL_LEFT " 15");
+        lv_label_set_text(s_tr_lbl, "15 " LV_SYMBOL_RIGHT);
+        lv_label_set_text(s_rec_btn_lbl,
+                          rp_model.play_paused ? LV_SYMBOL_PLAY
+                                               : LV_SYMBOL_PAUSE);
+        lv_obj_set_style_text_color(s_rec_btn_lbl, lv_color_hex(C_TEXT), 0);
     }
 }
 
@@ -641,6 +774,12 @@ static void refresh_presets(void)
 
 /* ---- Recordings ------------------------------------------------------------ */
 
+static void on_library_pick(lv_event_t *e)
+{
+    rp_act_play_file((const char *)lv_event_get_user_data(e));
+    rp_ui_show(RP_SCREEN_NOW);
+}
+
 static void build_library(void)
 {
     lv_obj_t *s = s_screen[RP_SCREEN_LIBRARY];
@@ -667,7 +806,8 @@ static void refresh_library(void)
 
     int y = 0;
     for (uint8_t i = 0; i < rp_model.library_count; i++) {
-        lv_obj_t *r = row(s_library_list, y, 46, 0, 0);
+        lv_obj_t *r = row(s_library_list, y, 46, on_library_pick,
+                          rp_model.library[i]);
 
         /* One line, truncated. LV_LABEL_LONG_DOT needs a height as well as a
            width - given only a width it wraps instead, and the second line
@@ -683,6 +823,12 @@ static void refresh_library(void)
 }
 
 /* ---- Settings -------------------------------------------------------------- */
+
+static void on_ta_toggle(lv_event_t *e)
+{
+    (void)e;
+    rp_act_ta_record(!rp_model.ta_record);
+}
 
 static void on_open_advanced(lv_event_t *e)
 {
@@ -741,7 +887,16 @@ static void build_settings(void)
     lv_obj_set_pos(cap, MARGIN, 10);
     hairline(s, 32);
 
-    int y = 44;
+    /* Scrolls, because the content has outgrown the screen. The alternative
+       was squeezing the two backend rows until the sysfs path truncated again,
+       and a path that cannot be read is worth less than a scroll. */
+    lv_obj_t *body = panel(s, 0, 40, RP_SCREEN_W, RP_SCREEN_H - 66, C_BG);
+    lv_obj_add_flag(body, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(body, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(body, LV_SCROLLBAR_MODE_OFF);
+    s = body;
+
+    int y = 4;
 
     lv_obj_t *r = setting_row(s, y, 48, "Region", 0, on_region_next);
     s_set_region = row_value(r, C_SIGNAL);
@@ -766,15 +921,22 @@ static void build_settings(void)
     lv_obj_set_pos(s_set_capture, MARGIN, 30);
     y += 88;
 
+    r = setting_row(s, y, 48, "Record traffic", 0, on_ta_toggle);
+    s_set_ta = row_value(r, C_TA);
+    lv_obj_set_pos(s_set_ta, MARGIN, 14);
+    y += 48;
+
     r = setting_row(s, y, 48, "Advanced", 0, on_open_advanced);
     lv_obj_t *chev = label(r, LV_SYMBOL_RIGHT, F_CAPTION, C_TEXT_MUTE);
     lv_obj_set_style_text_align(chev, LV_TEXT_ALIGN_RIGHT, 0);
     lv_obj_set_width(chev, CONTENT_W);
     lv_obj_set_pos(chev, MARGIN, 16);
 
+    /* Last item in the scroll rather than pinned to the bottom, so it cannot
+       land on top of whatever the last row happens to be. */
     lv_obj_t *stamp = label(s, "build " __DATE__ " " __TIME__,
                             F_CAPTION, C_TEXT_MUTE);
-    lv_obj_set_pos(stamp, MARGIN, RP_SCREEN_H - 42);
+    lv_obj_set_pos(stamp, MARGIN, y + 60);
 }
 
 static void refresh_settings(void)
@@ -787,6 +949,11 @@ static void refresh_settings(void)
     lv_label_set_text(s_set_capture,
                       rp_model.capture_backend ? rp_model.capture_backend
                                                : "not started");
+    lv_label_set_text(s_set_ta, rp_model.ta_record ? "On" : "Off");
+    lv_obj_set_style_text_color(s_set_ta,
+                                lv_color_hex(rp_model.ta_record ? C_TA
+                                                                : C_TEXT_MUTE),
+                                0);
 }
 
 /* ---- Advanced: the register explorer --------------------------------------- */

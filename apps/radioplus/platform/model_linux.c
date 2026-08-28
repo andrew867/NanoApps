@@ -15,6 +15,7 @@
 #include "../model.h"
 #include "tuner.h"
 #include "capture.h"
+#include "player.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -37,6 +38,7 @@ static en_settings_t s_settings;
 static FILE    *s_sidecar;
 static en_sidecar_t s_sc;
 static uint32_t s_rec_started_ms;
+static bool     s_ta_prev;
 static char     s_rec_stem[512];   /* directory plus a dated, named stem */
 
 static uint32_t now_ms(void)
@@ -120,6 +122,7 @@ static void settings_save(void)
                  rp_model.region->name);
     s_settings.khz = rp_model.khz;
     s_settings.rds_on = rp_model.rds_on;
+    s_settings.ta_record = rp_model.ta_record;
 
     char buf[2048];
     uint32_t n = en_settings_save(&s_settings, buf, sizeof buf);
@@ -212,6 +215,12 @@ static void bring_up(void)
     en_cap_err_t ce = en_cap_start(s_settings.live_seconds);
     rp_model.capture_ok = (ce == EN_CAP_OK);
     rp_model.capture_backend = en_cap_backend();
+
+    /* And the other half of the audio path. Capture clocks IIS2; the player
+       carries what arrives there to the headphones on IIS0. Without it the
+       radio is silent however well it is tuned. */
+    rp_model.play_ok = (en_play_start() == EN_PLAY_OK);
+    rp_model.ta_record = s_settings.ta_record;
 
     presets_load();
     library_scan();
@@ -307,6 +316,16 @@ void rp_model_refresh(void)
         }
     }
 
+    en_play_state_t ps;
+    en_play_state(&ps);
+    rp_model.play_file = (ps.source == EN_SRC_FILE);
+    rp_model.play_paused = ps.paused;
+    rp_model.play_pos_ms = ps.pos_ms;
+    rp_model.play_len_ms = ps.len_ms;
+    rp_model.behind_ms = ps.behind_ms;
+    rp_model.behind_max_ms = ps.behind_max_ms;
+    snprintf(rp_model.play_name, sizeof rp_model.play_name, "%s", ps.name);
+
     en_cap_state_t cs;
     en_cap_state(&cs);
     rp_model.capture_ok = cs.running;
@@ -319,6 +338,33 @@ void rp_model_refresh(void)
     /* A recording that stopped itself - a full disk, most likely - has to be
        noticed here, because the capture thread cannot close the sidecar. */
     if (s_sidecar && !cs.recording) sidecar_close(cs.recorded_ms);
+
+    /*
+     * Traffic announcements.
+     *
+     * The TA flag goes up for the duration of the announcement, so the edges
+     * are the whole signal: start on the rising edge, stop on the falling one.
+     * A recording already running by hand is left alone - the user pressing
+     * record outranks the station raising a flag, and stopping their recording
+     * because an announcement ended would be an unpleasant surprise.
+     *
+     * The prefill matters more here than anywhere else. By the time the flag is
+     * seen the announcement has already begun, so without reaching back into
+     * the buffer every automatic recording would start mid-sentence.
+     */
+    if (rp_model.ta_record && rp_model.tuner_ok) {
+        bool ta = rp_model.rds.ta;
+        if (ta && !s_ta_prev && !cs.recording) {
+            rp_act_record_toggle();
+            rp_model.ta_recording = rp_model.recording;
+        } else if (!ta && s_ta_prev && rp_model.ta_recording) {
+            rp_act_record_toggle();
+            rp_model.ta_recording = false;
+        }
+        s_ta_prev = ta;
+    } else {
+        s_ta_prev = false;
+    }
 }
 
 /* ---- actions -------------------------------------------------------------- */
@@ -431,6 +477,43 @@ void rp_act_preset_toggle(void)
 
     en_preset_sort(&rp_model.presets);
     presets_save();
+}
+
+/* ---- playback and the live buffer ----------------------------------------- */
+
+void rp_act_play_file(const char *name)
+{
+    if (!name || !*name) return;
+
+    char path[600];
+    snprintf(path, sizeof path, "%s/%s", s_rec_dir, name);
+    en_play_file(path);
+}
+
+void rp_act_play_live(void)
+{
+    /* One button, one meaning, whatever is playing: back to the live edge of
+       the radio. From a recording that also closes the file. */
+    en_play_go_live();
+}
+
+void rp_act_nudge(int32_t ms)
+{
+    en_play_nudge(ms);
+}
+
+void rp_act_pause_toggle(void)
+{
+    en_play_state_t ps;
+    en_play_state(&ps);
+    en_play_pause(!ps.paused);
+}
+
+void rp_act_ta_record(bool on)
+{
+    rp_model.ta_record = on;
+    s_settings.ta_record = on;
+    settings_save();
 }
 
 /* ---- the register explorer ------------------------------------------------ */

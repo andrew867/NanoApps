@@ -42,7 +42,8 @@ LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_n31.h\"
 CORE_SRCS := $(CORE)/fmcmd.c $(CORE)/fmreg.c $(CORE)/rds.c $(CORE)/region.c \
              $(CORE)/wav.c $(CORE)/store.c
 
-PLAT_SRCS := $(PLAT)/tuner_linux.c $(PLAT)/capture_linux.c $(PLAT)/model_linux.c
+PLAT_SRCS := $(PLAT)/tuner_linux.c $(PLAT)/capture_linux.c \
+             $(PLAT)/player_linux.c $(PLAT)/model_linux.c
 
 APP      := $(BUILD)/radioplus
 APP_SRCS := main_n31.c ../ui.c $(CORE_SRCS) $(PLAT_SRCS)

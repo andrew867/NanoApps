@@ -139,6 +139,9 @@ int main(int argc, char **argv)
 
     /* One more of Now Playing mid-recording, because the recording state
        changes several things at once and is worth seeing as a whole. */
+    /* At the live edge, so the transport is in its record state rather than
+       its playback one - the two are the same three buttons. */
+    rp_act_play_live();
     rp_act_record_toggle();
     rp_model_refresh();
     rp_ui_show(RP_SCREEN_NOW);

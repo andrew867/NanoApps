@@ -34,6 +34,7 @@
 #include "../model.h"
 #include "../platform/tuner.h"
 #include "../platform/capture.h"
+#include "../platform/player.h"
 
 #define FRAME_MS 33          /* about 30 Hz, which is more than enough */
 
@@ -158,6 +159,7 @@ int main(int argc, char **argv)
        process otherwise. */
     printf("\nradioplus: stopping\n");
     en_cap_record_stop();
+    en_play_stop();
     en_cap_stop();
     en_tuner_shutdown();
     return 0;

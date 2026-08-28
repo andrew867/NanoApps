@@ -41,6 +41,20 @@ typedef struct {
     uint32_t live_pos_ms;    /* how far behind live we are; 0 is live */
     uint32_t overruns;
 
+    /* Playback. The radio and a recording share one player, so "what is
+       coming out of the headphones" is one question with one answer. */
+    bool     play_file;          /* a recording rather than the radio */
+    char     play_name[96];
+    uint32_t play_pos_ms;
+    uint32_t play_len_ms;
+    bool     play_paused;
+    uint32_t behind_ms;          /* how far behind live; 0 is live */
+    uint32_t behind_max_ms;      /* how far back the buffer allows */
+    bool     play_ok;
+
+    bool     ta_record;          /* auto-record traffic announcements */
+    bool     ta_recording;       /* one is being recorded right now */
+
     /* Presets and recordings */
     en_presets_t presets;
     uint8_t  library_count;
@@ -81,5 +95,12 @@ bool rp_act_reg_read(uint8_t addr, uint8_t *buf, uint8_t len);
 void rp_act_reg_write(uint8_t addr, const uint8_t *buf, uint8_t len);
 void rp_act_reg_revert(uint8_t addr);
 bool rp_act_reg_overridden(uint8_t addr);
+
+/* Playback and the live buffer. */
+void rp_act_play_file(const char *name);
+void rp_act_play_live(void);        /* jump to the front of the buffer */
+void rp_act_nudge(int32_t ms);      /* negative goes back */
+void rp_act_pause_toggle(void);
+void rp_act_ta_record(bool on);
 
 #endif /* RADIOPLUS_MODEL_H */

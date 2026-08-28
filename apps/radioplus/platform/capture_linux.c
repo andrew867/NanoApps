@@ -5,11 +5,13 @@
  * driving the headphone codec. They are separate devices, so capture does not
  * contend with playback and a recording can run while listening.
  *
- * One detail from the n31-fm helper is load-bearing: the SoC side of IIS2 is
- * clocked by the capture PCM, so tuner audio is not merely unrecorded but
- * inaudible until something opens the capture device. Opening it is therefore
- * not just how recording works - it is how the radio makes any sound at all.
- * That is why capture starts with the tuner rather than with the record button.
+ * One detail from the n31-fm helper is load-bearing, and easy to half-remember.
+ * The SoC side of IIS2 is clocked by the capture PCM, so tuner audio is not
+ * merely unrecorded but inaudible until something opens the capture device.
+ * That is necessary and not sufficient: the audio then has to be carried from
+ * IIS2 to IIS0, which n31-fm does with arecord piped into aplay and this app
+ * does in the player. Capture starts with the tuner rather than with the record
+ * button because of the first half; the radio is silent without the second.
  *
  * The reader runs on its own thread, feeding a ring in memory and, when one is
  * running, a WAV file. Neither consumer can stall the other: a file write that
@@ -53,6 +55,7 @@ static uint32_t  s_ring_bytes;
 static uint32_t  s_ring_used;      /* bytes currently held, up to s_ring_bytes */
 static uint32_t  s_ring_head;      /* where the next byte is written */
 static uint32_t  s_overruns;
+static uint64_t  s_total;     /* frames captured since the stream began */
 
 static FILE     *s_rec;
 static uint32_t  s_rec_bytes;
@@ -88,6 +91,7 @@ static void ring_write(const uint8_t *p, uint32_t n)
     s_ring_head = (s_ring_head + n) % s_ring_bytes;
     s_ring_used += n;
     if (s_ring_used > s_ring_bytes) s_ring_used = s_ring_bytes;
+    s_total += n / CAP_FRAME;
 }
 
 /* Copy the most recent `want` bytes out, oldest first. Returns how many. */
@@ -190,6 +194,7 @@ en_cap_err_t en_cap_start(uint32_t live_seconds)
         return EN_CAP_NO_MEMORY;
     }
     s_ring_used = s_ring_head = s_overruns = 0;
+    s_total = 0;
 
     s_running = true;
     if (pthread_create(&s_thread, 0, reader, 0) != 0) {
@@ -238,6 +243,53 @@ void en_cap_state(en_cap_state_t *out)
     out->recording = s_rec != 0;
     out->overruns = s_overruns;
     pthread_mutex_unlock(&s_lock);
+}
+
+uint64_t en_cap_total_frames(void)
+{
+    pthread_mutex_lock(&s_lock);
+    uint64_t t = s_total;
+    pthread_mutex_unlock(&s_lock);
+    return t;
+}
+
+uint64_t en_cap_oldest_frame(void)
+{
+    pthread_mutex_lock(&s_lock);
+    uint64_t oldest = s_total - (s_ring_used / CAP_FRAME);
+    pthread_mutex_unlock(&s_lock);
+    return oldest;
+}
+
+uint32_t en_cap_read_from(uint64_t at, void *buf, uint32_t frames)
+{
+    if (!buf || !frames) return 0;
+
+    pthread_mutex_lock(&s_lock);
+
+    uint32_t held = s_ring_used / CAP_FRAME;
+    uint64_t oldest = s_total - held;
+
+    /* A reader that has fallen behind the window gets the oldest audio still
+       held rather than silence or a fault: the alternative is a gap the reader
+       cannot see and cannot fix. */
+    if (at < oldest) at = oldest;
+    if (at >= s_total) { pthread_mutex_unlock(&s_lock); return 0; }
+
+    uint64_t avail = s_total - at;
+    if (frames > avail) frames = (uint32_t)avail;
+
+    uint32_t back = (uint32_t)((s_total - at) * CAP_FRAME);
+    uint32_t start = (s_ring_head + s_ring_bytes - back) % s_ring_bytes;
+    uint32_t want = frames * CAP_FRAME;
+
+    uint32_t first = s_ring_bytes - start;
+    if (first > want) first = want;
+    memcpy(buf, s_ring + start, first);
+    if (want > first) memcpy((uint8_t *)buf + first, s_ring, want - first);
+
+    pthread_mutex_unlock(&s_lock);
+    return frames;
 }
 
 const char *en_cap_backend(void)

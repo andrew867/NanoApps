@@ -133,6 +133,11 @@ typedef struct {
     uint32_t khz;            /* where to come back to */
     bool     rds_on;
     uint8_t  live_seconds;   /* how much live buffer to allocate */
+
+    /* Off by default, deliberately. A radio that starts writing files on its
+       own the first time a station announces traffic would be a surprise, and
+       a surprise that fills a disk. */
+    bool     ta_record;
     en_overrides_t overrides;
 } en_settings_t;
 
