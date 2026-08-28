@@ -451,3 +451,122 @@ Route 2 is worth one more pass before committing to route 1.
    payload and should parse against the register table, which would confirm the
    whole shape.
 3. Only then decide between calling `TRFTuner` and driving `0xFC15` directly.
+
+---
+
+# Phase 0d — route 2: the real HCI send, verified on 1.1.2
+
+Route 2 is answered. Radio+ can issue `0xFC15` itself on RetailOS, which means
+every register in the command list is reachable rather than whatever `TRFTuner`
+chose to abstract.
+
+## The API
+
+All three verified in `osos.live.bin` (1.1.2), which is what the device runs:
+
+| Address | Signature | Notes |
+|---|---|---|
+| **`0x0854F878`** | `uart_open(port=1, baud=115200)` | three instructions, tail-calls `0x08172BCC`; returns the handle in r0, null on failure |
+| **`0x08410820`** | `hci_send(handle, buf, len)` | returns 0 on success, 7 if the handle is null; 3000 ms timeout, length passed by reference |
+| **`0x0840DA00`** | `hci_wait_event(14, handle, buf, buflen)` | checks `buf[0] == 4`, the H4 event packet type |
+
+The call pattern, straight from the bring-up sequence at `0x0854f584`:
+
+```
+854f59a: bl   0x854f878     ; handle = uart_open(1, 115200)
+854f59e: movs.w r8, r0      ; null -> bail out
+854f5ac: ldr  r1,[pc]       ; -> command table 0x08754d98
+854f5ae: movs r2, #4        ; length
+854f5b0: mov  r0, r8
+854f5b2: bl   0x8410820     ; hci_send(handle, cmd, 4)
+854f5b6: mov.w sl, #2048    ; event buffer size
+854f5ba: movs r0, #14
+854f5be: mov  r2, sp        ; event buffer
+854f5c0: mov  r1, r8
+854f5c2: bl   0x840da00     ; hci_wait_event(14, handle, buf, 2048)
+854f5cc: adds r1, r1, #4    ; next command in the table, send again
+```
+
+## Why this is trustworthy
+
+The command table at `0x08754d98` decodes to opcodes that are recognisable
+without any interpretation on our part:
+
+```
+01 03 0c 00   ->  0x0C03  HCI_Reset
+01 01 10 00   ->  0x1001  HCI_Read_Local_Version_Information
+01 09 10 00   ->  0x1009  HCI_Read_BD_ADDR
+```
+
+Three standard HCI opcodes in the canonical bring-up order. That confirms the H4
+framing from the firmware side — `01 <ocf_lo> <ogf_hi> <len> <payload...>` —
+rather than us asserting it. The port index and baud rate also agree with the
+`docs-internal` Bluetooth notes, which were reverse-engineered separately.
+
+So an FM register write becomes:
+
+```
+01 15 FC <len> <I2C_address> <Read_Write_Mode> <payload...>
+```
+
+and a read is the same with `Read_Write_Mode = 1`, answered through
+`hci_wait_event`. Every register in the command list is reachable this way.
+
+## The version trap, which cost a wrong turn
+
+The Bluetooth notes in `docs-internal` were written against `osos.dec.bin`,
+which is **1.0.2**. The device runs **1.1.2**. Addresses do not carry across:
+`sub_422794` from those notes disassembles to arithmetic noise in 1.1.2, which
+is exactly what happened on the first attempt and briefly looked like the notes
+being wrong rather than the image being the wrong one.
+
+`re/port.py` carries an address between builds by code signature. It takes the
+bytes at the 1.0.2 address, masks the operands that are allowed to move — BL,
+B.W and BLX pairs, and PC-relative loads, all of which encode distances rather
+than destinations — and looks for the same code in 1.1.2:
+
+| Function | 1.0.2 | 1.1.2 |
+|---|---|---|
+| `hci_send` | `0x08422794` | **`0x08410820`** (unique on 16 bytes) |
+| `hci_wait_event` | `0x0841F4C2` | **`0x0840DA00`** (unique on 40 bytes) |
+| handle acquisition | `0x08570360` | no match; the function changed, found through callers instead |
+
+Any address taken from those notes has to go through this first. Reading a 1.0.2
+address in the 1.1.2 image produces plausible-looking instructions, not an
+error, which is the whole danger.
+
+## A tool bug worth recording
+
+`re/callers.py` decodes every BL and BLX in the image to find callers, because
+Thumb-2 encodes a call as a distance and the callee address never appears
+anywhere to be searched for. Its first version reported **zero** callers for the
+send — and zero for the trace dispatcher, which plainly has hundreds. That
+second number is what made it obviously a bug rather than a finding.
+
+Bits 15 down to 12 of the second halfword are `1, 1, J1, 1`, so the nibble is
+`0xD` or `0xF` for BL depending on `J1`, and `0xC` or `0xE` for BLX. Matching
+the nibble against `0xD` and `0xC` alone silently drops about half of all
+branches. Fixed by masking `J1` out and testing bits 15, 14 and 12.
+
+The habit that caught it: run a new search tool against something whose answer
+is already known before believing a negative result from it.
+
+## Caution before this is called on hardware
+
+`uart_open` opens the transport. If the OS Bluetooth stack is already up it owns
+that UART, and opening it a second time is a conflict rather than a shortcut.
+The FM path should reuse the existing handle when the stack is running and only
+open one when it is not. The readiness global noted earlier — `0x0896dd00`, BSS,
+null-checked before anything is attempted — is very likely exactly that
+distinction, and should be resolved before any of this runs on a live device.
+
+## Consequence for the design
+
+Route 2 wins. The RetailOS backend targets `0xFC15` directly, which means both
+platform backends speak the same language — a raw `FM_RDS_Command` — so the
+whole register table becomes shared, testable, pure C99 in `core/`, exactly the
+way Entrain's DSP was.
+
+The `TRFTuner` work is not wasted. It stays the fallback if issuing HCI
+alongside a running OS stack turns out to be unsafe, and `TRFTunerPresetList` is
+still likely the cheapest way to read the presets the stock app has saved.
