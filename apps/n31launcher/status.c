@@ -57,6 +57,45 @@ static bool exists(const char *path)
 /* ---- battery -------------------------------------------------------------- */
 
 /*
+ * The gauge is derived from voltage and it is noisy: it moved nine points in
+ * two minutes on a device that was sitting still, because the rail sags under
+ * load and recovers. Shown raw that reads as a fault in the status bar rather
+ * than as a property of the measurement.
+ *
+ * So it is averaged over about half a minute. Long enough to sit still, short
+ * enough to follow a real discharge - which on a battery this size is a point
+ * every few minutes, far slower than the window.
+ *
+ * The window is filled with the first reading rather than with zeros, or the
+ * bar would climb from empty over the first half minute of every boot.
+ */
+#define BATT_WINDOW 30
+
+static int  s_batt_hist[BATT_WINDOW];
+static int  s_batt_n;
+static int  s_batt_at;
+
+static int smooth_battery(int pct)
+{
+    if (s_batt_n == 0) {
+        for (int i = 0; i < BATT_WINDOW; i++) s_batt_hist[i] = pct;
+        s_batt_n = BATT_WINDOW;
+        s_batt_at = 0;
+        return pct;
+    }
+
+    s_batt_hist[s_batt_at] = pct;
+    s_batt_at = (s_batt_at + 1) % BATT_WINDOW;
+
+    int sum = 0;
+    for (int i = 0; i < BATT_WINDOW; i++) sum += s_batt_hist[i];
+
+    /* Rounded, not truncated: truncating makes the bar read one point low
+       for most of the window. */
+    return (sum + BATT_WINDOW / 2) / BATT_WINDOW;
+}
+
+/*
  * The battery's own `status` reads "Unknown" on this PMIC, so charging comes
  * from the charger supply instead. Both are found by type rather than by name.
  */
@@ -81,7 +120,7 @@ static void read_power(n31_status_t *s)
             if (read_int(path, &pct)) {
                 if (pct < 0) pct = 0;
                 if (pct > 100) pct = 100;
-                s->battery_pct = pct;
+                s->battery_pct = smooth_battery(pct);
                 s->have_battery = true;
             }
 

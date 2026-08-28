@@ -162,6 +162,7 @@ typedef struct {
     lv_obj_t *icon;        /* moved a couple of pixels by the accelerometer */
     int       icon_x, icon_y;
     int       depth;       /* per tile, so they do not move as one flat sheet */
+    int       last_dx, last_dy;   /* to skip redraws that change nothing */
 } tile_t;
 
 static lv_obj_t *s_home;
@@ -242,7 +243,14 @@ static void build_status_bar(void)
     s_ic_play = label(s_tray, LV_SYMBOL_PLAY,      F_CAPTION, C_OK);
     s_ic_fm   = label(s_tray, "FM",                F_CAPTION, C_RADIO);
     s_ic_batt = label(s_tray, LV_SYMBOL_BATTERY_FULL, F_CAPTION, C_TEXT_DIM);
+
+    /* Fixed width, right-aligned. Digits are not all the same width, so a
+       label that shrink-wraps its text drags the battery icon left and right
+       as the reading changes - which looks like the icon is twitching. Sized
+       for "100%", which is the widest it ever gets. */
     s_ic_pct  = label(s_tray, "", F_CAPTION, C_TEXT_DIM);
+    lv_obj_set_width(s_ic_pct, 34);
+    lv_obj_set_style_text_align(s_ic_pct, LV_TEXT_ALIGN_RIGHT, 0);
 }
 
 static void build_home(void)
@@ -350,17 +358,50 @@ void n31_ui_status_bar(const n31_status_t *st)
  */
 void n31_ui_tilt(int tilt_x, int tilt_y)
 {
+    /*
+     * Smoothed, in sixteenths, because the accelerometer is noisy enough that
+     * feeding it straight to a position makes the icons jitter between two
+     * pixels while the device is sitting still. This is a first-order filter
+     * with a time constant of about half a second: it follows a real tilt
+     * without chasing the noise on top of it.
+     */
+    static int sx, sy;
+    static bool primed;
+
+    if (!primed) {
+        sx = tilt_x * 16;
+        sy = tilt_y * 16;
+        primed = true;
+    } else {
+        sx += (tilt_x * 16 - sx) / 6;
+        sy += (tilt_y * 16 - sy) / 6;
+    }
+
     for (int i = 0; i < 3; i++) {
         tile_t *t = &s_tile[i];
         if (!t->icon) continue;
 
-        int dx = -tilt_x * t->depth / 300;
-        int dy =  tilt_y * t->depth / 300;
+        /*
+         * The icons move WITH the tilt, not against it. They sit behind the
+         * glass, so tilting the device to the right should show more of what
+         * is to their left - which reads as the icon sliding right. The other
+         * way round looks like the screen is sliding off its mount.
+         */
+        int dx =  sx * t->depth / (300 * 16);
+        int dy = -sy * t->depth / (300 * 16);
 
         if (dx < -3) dx = -3;
         if (dx > 3)  dx = 3;
         if (dy < -3) dy = -3;
         if (dy > 3)  dy = 3;
+
+        /* Per tile, because they have different depths: tile 0 can be
+           steady on the pixel while the deeper one has moved. Skipping the
+           set_pos is what keeps this from invalidating three areas every
+           frame while the device sits still. */
+        if (dx == t->last_dx && dy == t->last_dy) continue;
+        t->last_dx = dx;
+        t->last_dy = dy;
 
         lv_obj_set_pos(t->icon, t->icon_x + dx, t->icon_y + dy);
     }
