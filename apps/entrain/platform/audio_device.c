@@ -1,27 +1,36 @@
 /*
- * audio_device.c — audio.h on the iPod, over the OS sound-effect player.
+ * audio_device.c — audio.h on the iPod under RetailOS, playing PCM from RAM.
  *
- * The device cannot be streamed to. It can only be handed a file, and only a
- * file under 1 MiB (AUDIO_NOTES.md). So this backend:
+ * This backend used to render WAV files, write them under /Apps/Data and hand
+ * the paths to SoundEffectDescriptor::loadFile. That is gone. Confirmed on
+ * device by harnesses/audio_spike T9: the OS sound player will play a buffer
+ * we allocate and fill ourselves, with no file anywhere.
  *
- *   1. writes the submitted PCM to a WAV under /Apps/Data/Entrain/cache,
- *      keyed by the realised parameters, and skips the write if that key is
- *      already on disk — which is what makes a second play instant;
- *   2. loads it and plays it;
- *   3. re-arms on a timer, because the duration is known exactly (we rendered
- *      it) and no completion signal is confirmed yet.
+ * What makes it work, read out of RetailOS 1.1.2 and then verified by ear:
  *
- * That last point is the fallback the notes committed to — "rung 3" — chosen
- * deliberately so v1 does not depend on the play() callback turning out to
- * work. If harness T3b confirms the callback fires, EN_DEVICE_USE_CALLBACK
- * turns the timer into a signal and the join gets tighter. Nothing else
- * changes.
+ *   voice::setSource (VA 0x0862fd24) stores the DESCRIPTOR pointer at
+ *   voice+0x78 — it does not copy the audio — and dispatches on a container
+ *   type at desc+0x10. Type 0 computes framesPerPacket = 1 and
+ *   bytesPerFrame = (bits/8) * channels, then frames = desc[0x0C] /
+ *   bytesPerFrame. That is linear PCM and nothing else.
  *
- * Known limitation, stated plainly: there is no confirmed way to stop a
- * buffer that is already playing. en_audio_stop therefore stops re-arming and
- * lets the current buffer finish, so a stop can take up to one loop length
- * (11-18 s) to fall silent. Finding a stop primitive is the top follow-up in
- * AUDIO_NOTES.md.
+ * So loadFile was only ever a parser: it decoded a file into a heap buffer and
+ * filled in exactly the fields this file now fills in directly. Doing it
+ * ourselves removes, in one go:
+ *
+ *   - the 1 MiB ceiling, which was a limit on the FILE, not on the buffer;
+ *   - every FAT write, with its wear and its latency;
+ *   - the whole cache-key class of bug, where two chunks collided on one path;
+ *   - re-reading and re-decoding the same loop file every time it wrapped.
+ *
+ * A join is now one play() call on a descriptor already pointing at ready
+ * samples — cheap enough to land exactly on the boundary instead of being
+ * started early and overlapped, which is what made loop wraps audible.
+ *
+ * Ownership: these buffers come from hb_os_alloc and are never handed to
+ * loadFile, so the OS never frees them. The descriptor is reconstructed before
+ * every play, and its constructor zeroes the buffer pointers without freeing,
+ * so there is no path to a double free.
  */
 
 #include "audio.h"
@@ -30,211 +39,149 @@
 #include "hb_sdk.h"
 #include "hb_heap.h"
 
-#include "../core/wavout.h"
-
-/* The firmware entry points. The SDK wrappers hardcode the offset/size and
-   callback arguments to zero; this backend wants them, so it calls through
-   directly, exactly as harnesses/audio_spike does. */
 #define SFX_CTOR_ADDR        (0x08417efcu | 1u)
-#define SFX_LOADFILE_ADDR    (0x08417f78u | 1u)
 #define SFX_PLAYER_INST_ADDR (0x08417eb8u | 1u)
 #define SFX_PLAYER_PLAY_ADDR (0x0841828cu | 1u)
 
+/* Descriptor layout, from SoundEffectDescriptor::ctor (VA 0x08417efc) and
+   voice::setSource (VA 0x0862fd24). */
+#define SFX_OFF_BUF_A    0x04   /* decoded PCM buffer */
+#define SFX_OFF_BUF_B    0x08   /* the same pointer; loadFile sets both */
+#define SFX_OFF_BUF_LEN  0x0C   /* length in bytes */
+#define SFX_OFF_TYPE     0x10   /* container type; 0 = linear PCM */
+#define SFX_OFF_RATE     0x14
+#define SFX_OFF_CHANNELS 0x18
+#define SFX_OFF_BITS     0x1C
 #define SFX_OFF_VOLUME   0x24
+#define SFX_OFF_TRIM_LO  0x38   /* leading trim, subtracted from the frames */
+#define SFX_OFF_TRIM_HI  0x3C   /* trailing trim */
 #define SFX_OFF_PLAYMODE 0x51
 #define SFX_OFF_FLAGS    0x52
 #define SFX_OFF_NEXTSFX  0x54
 
-#define VOL_MAIN 0
+#define SFX_TYPE_LPCM 0
 
 typedef void *(*sfx_ctor_t)(void *self);
-typedef int   (*sfx_loadfile_t)(void *self, const char *path, int volume,
-                                uint32_t offset, uint32_t size);
 typedef void *(*sfx_player_inst_t)(void);
 typedef void  (*sfx_player_play_t)(void *player, void *desc,
                                    void *cb, void *cbdata);
 
-/* Load the next buffer this long before the current one ends. Loading is the
-   expensive step — it reads and decodes the whole file — so doing it ahead of
-   the boundary leaves only the cheap play() call to happen on it.
-
-   Note this is a PRELOAD lead, not a playback lead. An earlier version started
-   the next copy 120 ms early on the theory that overlapping the same waveform
-   is harmless. It is not: restarting a loop early puts the new copy at phase
-   zero while the old one is still 120 ms from its end, so the two are at
-   unrelated phases and the sum comb-filters — which is exactly the "stops and
-   fades in suddenly, not phase consistent" artefact heard on the device. */
-#define PRELOAD_LEAD_MS 900
-
-/* Refuse to load if the OS heap could not take the loader's copy. The loader
-   allocates 1.2x the file plus 8 KB through an allocator that panics rather
-   than failing, so this check is what stands between a large preset and a
-   reboot. */
-#define HEAP_SAFETY_BYTES (256u * 1024u)
-
+/* Two slots, matching audio.h: what plays now and what plays next. Each owns
+   its buffer and descriptor, so preparing one never disturbs the other. */
 typedef struct {
-    char     path[128];
+    uint8_t  desc[0x80];
+    int16_t *pcm;
+    uint32_t capacity;      /* bytes allocated */
     uint32_t frames;
     uint32_t rate;
     bool     loop;
-    bool     valid;
-} clip_t;
+    bool     ready;
+} slot_t;
 
-static uint8_t  g_desc_a[0x80];
-static uint8_t  g_desc_b[0x80];
-static uint8_t *g_desc_playing = g_desc_a;
-
-static clip_t   g_cur, g_next;
-static bool     g_preloaded;       /* the spare descriptor holds the next clip */
+static slot_t   g_slot[2];
+static int      g_playing = -1;    /* index of the sounding slot, or -1 */
+static int      g_pending = -1;    /* index queued to follow it */
 static uint32_t g_started_ms;
-static uint32_t g_elapsed_ms;      /* accumulated across re-arms */
+static uint32_t g_elapsed_ms;
 static bool     g_paused;
 static bool     g_stopping;
 static int      g_volume = 45;
 static en_audio_state_t g_state = EN_AUDIO_IDLE;
 
-/* ---- small helpers ------------------------------------------------------- */
+/* ---- helpers ------------------------------------------------------------- */
 
-static void str_cpy(char *d, const char *s, int cap)
+static uint32_t slot_ms(const slot_t *s)
 {
-    int i = 0;
-    while (s[i] && i < cap - 1) { d[i] = s[i]; i++; }
-    d[i] = 0;
+    if (!s->ready || !s->rate) return 0;
+    return (uint32_t)(((uint64_t)s->frames * 1000ull) / s->rate);
 }
 
-static void str_cat(char *d, const char *s, int cap)
-{
-    int n = 0;
-    while (d[n] && n < cap - 1) n++;
-    while (*s && n < cap - 1) d[n++] = *s++;
-    d[n] = 0;
-}
-
-static uint32_t clip_ms(const clip_t *c)
-{
-    if (!c->valid || !c->rate) return 0;
-    return (uint32_t)(((uint64_t)c->frames * 1000ull) / c->rate);
-}
-
-/* OS volume is 0..0x7fff. */
 static uint32_t os_volume(void)
 {
-    uint32_t v = (uint32_t)g_volume;
-    if (v > 100) v = 100;
-    return (0x7fffu * v) / 100u;
+    int v = g_volume < 0 ? 0 : (g_volume > 100 ? 100 : g_volume);
+    return (0x7fffu * (uint32_t)v) / 100u;
 }
 
-/* ---- writing the cache file ---------------------------------------------- */
-
-static bool write_clip(const char *path, const int16_t *pcm, uint32_t frames,
-                       uint32_t rate)
+/* Grow a slot's buffer if it cannot hold `bytes`. Buffers persist between
+   submits: a preset replays one size forever and a program's chunks are all
+   the same length, so after the first allocation this never allocates again. */
+static bool slot_reserve(slot_t *s, uint32_t bytes)
 {
-    if (hb_fs_size(path) == en_wav_size(frames, 2))
-        return true;    /* already cached, byte for byte */
+    if (s->pcm && s->capacity >= bytes) return true;
 
-    uint8_t hdr[EN_WAV_HEADER_BYTES];
-    en_wav_header(hdr, rate, 2, frames);
+    /* Refuse rather than let the OS allocator panic — it reboots the device on
+       failure, and picking a preset should never be able to do that. */
+    if (hb_os_heap_largest() < bytes + (128u * 1024u)) return false;
 
-    if (!hb_fs_stream_open(path)) return false;
-    if (!hb_fs_stream_write(hdr, EN_WAV_HEADER_BYTES)) {
-        hb_fs_stream_close();
-        return false;
-    }
-    /* In chunks, so a large preset does not need a second copy of itself in
-       RAM while it is written. */
-    const uint32_t CHUNK = 32768;
-    uint32_t left = frames * 4u;
-    const uint8_t *p = (const uint8_t *)pcm;
-    while (left) {
-        uint32_t n = left < CHUNK ? left : CHUNK;
-        if (!hb_fs_stream_write(p, n)) {
-            hb_fs_stream_close();
-            return false;
-        }
-        p += n;
-        left -= n;
-    }
-    return hb_fs_stream_close();
-}
-
-/* ---- the 4-step play ceremony -------------------------------------------- */
-
-/* sdk/hb_audio.c warns that the OS audio subsystem panics if these calls run
-   back to back without display activity between them. An LVGL surface app is
-   compositing continuously, which supplies that traffic — apps/files/files.c
-   relies on the same thing — so no explicit interleaving is needed here. This
-   is the one assumption in this file that wants confirming on hardware before
-   the screen-blank feature ships. */
-static bool load_clip(uint8_t *desc, const clip_t *c)
-{
-    if (!c->valid) return false;
-
-    uint32_t bytes = en_wav_size(c->frames, 2);
-    if (hb_os_heap_largest() < bytes + bytes / 5u + HEAP_SAFETY_BYTES)
-        return false;
-
-    ((sfx_ctor_t)SFX_CTOR_ADDR)(desc);
-    if (((sfx_loadfile_t)SFX_LOADFILE_ADDR)(desc, c->path, VOL_MAIN, 0, 0) != 0)
-        return false;
-
-    *(volatile uint32_t *)(desc + SFX_OFF_VOLUME) = os_volume();
-    desc[SFX_OFF_PLAYMODE] = 1;
-    desc[SFX_OFF_FLAGS] = 0;
-    *(volatile void **)(desc + SFX_OFF_NEXTSFX) = (void *)0;
+    /* No NULL here: this translation unit is freestanding and does not pull in
+       stddef.h. */
+    if (s->pcm) { hb_os_free(s->pcm); s->pcm = (int16_t *)0; s->capacity = 0; }
+    s->pcm = (int16_t *)hb_os_alloc(bytes);
+    if (!s->pcm) return false;
+    s->capacity = bytes;
     return true;
 }
 
-static bool play_desc(uint8_t *desc)
+static void slot_fill(slot_t *s, const int16_t *pcm, uint32_t frames,
+                      uint32_t rate, bool loop)
 {
+    uint32_t words = frames * 2u;
+    for (uint32_t i = 0; i < words; i++) s->pcm[i] = pcm[i];
+
+    s->frames = frames;
+    s->rate = rate;
+    s->loop = loop;
+    s->ready = true;
+}
+
+/* Point a freshly constructed descriptor at the slot's buffer: everything
+   loadFile used to fill in, filled in directly. */
+static void slot_arm_descriptor(slot_t *s)
+{
+    uint8_t *d = s->desc;
+
+    ((sfx_ctor_t)SFX_CTOR_ADDR)(d);
+
+    *(volatile uint32_t *)(d + SFX_OFF_BUF_A)    = (uint32_t)(uintptr_t)s->pcm;
+    *(volatile uint32_t *)(d + SFX_OFF_BUF_B)    = (uint32_t)(uintptr_t)s->pcm;
+    *(volatile uint32_t *)(d + SFX_OFF_BUF_LEN)  = s->frames * 4u;
+    d[SFX_OFF_TYPE] = SFX_TYPE_LPCM;
+    *(volatile uint32_t *)(d + SFX_OFF_RATE)     = s->rate;
+    *(volatile uint32_t *)(d + SFX_OFF_CHANNELS) = 2;
+    *(volatile uint32_t *)(d + SFX_OFF_BITS)     = 16;
+    *(volatile uint32_t *)(d + SFX_OFF_TRIM_LO)  = 0;
+    *(volatile uint32_t *)(d + SFX_OFF_TRIM_HI)  = 0;
+
+    *(volatile uint32_t *)(d + SFX_OFF_VOLUME)   = os_volume();
+    d[SFX_OFF_PLAYMODE] = 1;
+    d[SFX_OFF_FLAGS] = 0;
+    *(volatile void **)(d + SFX_OFF_NEXTSFX) = (void *)0;
+}
+
+/* Play a slot. No file I/O and no decode, so this is cheap enough to sit on a
+   boundary rather than being started early. */
+static bool slot_play(int idx)
+{
+    slot_t *s = &g_slot[idx];
+    if (!s->ready || !s->pcm || !s->frames) return false;
+
+    slot_arm_descriptor(s);
+
     void *player = ((sfx_player_inst_t)SFX_PLAYER_INST_ADDR)();
     if (!player) return false;
-    ((sfx_player_play_t)SFX_PLAYER_PLAY_ADDR)(player, desc,
+    ((sfx_player_play_t)SFX_PLAYER_PLAY_ADDR)(player, s->desc,
                                               (void *)0, (void *)0);
-    return true;
-}
 
-static uint8_t *spare_desc(void)
-{
-    return (g_desc_playing == g_desc_a) ? g_desc_b : g_desc_a;
-}
-
-/* Load into the descriptor that is NOT playing. Safe to call well before the
-   boundary; that is the whole point. */
-static bool preload(const clip_t *c)
-{
-    if (g_preloaded) return true;
-    if (!load_clip(spare_desc(), c)) return false;
-    g_preloaded = true;
-    return true;
-}
-
-/* Play whatever is already loaded in the spare descriptor and make it current.
-   Nothing here touches the filesystem, so it is cheap enough to sit exactly on
-   the boundary. */
-static bool play_preloaded(void)
-{
-    uint8_t *spare = spare_desc();
-    if (!g_preloaded) return false;
-    if (!play_desc(spare)) return false;
-    g_desc_playing = spare;
-    g_preloaded = false;
+    g_playing = idx;
     g_started_ms = hb_time_uptime_ms();
     g_state = EN_AUDIO_PLAYING;
     return true;
-}
-
-static bool arm_and_play(const clip_t *c)
-{
-    g_preloaded = false;
-    if (!preload(c)) return false;
-    return play_preloaded();
 }
 
 /* ---- the interface ------------------------------------------------------- */
 
 bool en_audio_init(void)
 {
-    hb_fs_mkdir(en_sys_cache_dir());
     g_state = EN_AUDIO_IDLE;
     return true;
 }
@@ -242,45 +189,36 @@ bool en_audio_init(void)
 void en_audio_shutdown(void)
 {
     g_stopping = true;
-    g_cur.valid = false;
-    g_next.valid = false;
+    g_playing = -1;
+    g_pending = -1;
+    g_slot[0].ready = g_slot[1].ready = false;
     g_state = EN_AUDIO_IDLE;
-}
-
-static void clip_path(char *out, int cap, const char *key)
-{
-    str_cpy(out, en_sys_cache_dir(), cap);
-    str_cat(out, "/", cap);
-    str_cat(out, key && key[0] ? key : "tmp", cap);
-    str_cat(out, ".wav", cap);
+    /* The buffers are deliberately left allocated. The app is going away and
+       the OS heap goes with it, and freeing one while a voice may still be
+       reading it would be worse than leaking for a few milliseconds. */
 }
 
 bool en_audio_submit(const char *key, const int16_t *pcm,
                      uint32_t frames, uint32_t sample_rate, bool loop)
 {
+    (void)key;                    /* nothing on disk left to key */
     if (!pcm || !frames) return false;
 
-    clip_t c;
-    clip_path(c.path, (int)sizeof c.path, key);
-    c.frames = frames;
-    c.rate = sample_rate;
-    c.loop = loop;
-    c.valid = true;
-
     g_state = EN_AUDIO_PREPARING;
-    if (!write_clip(c.path, pcm, frames, sample_rate)) {
+
+    if (!slot_reserve(&g_slot[0], frames * 4u)) {
         g_state = EN_AUDIO_FAILED;
         return false;
     }
+    slot_fill(&g_slot[0], pcm, frames, sample_rate, loop);
 
-    g_cur = c;
-    g_next.valid = false;
-    g_preloaded = false;
+    g_slot[1].ready = false;
+    g_pending = -1;
     g_paused = false;
     g_stopping = false;
     g_elapsed_ms = 0;
 
-    if (!arm_and_play(&g_cur)) {
+    if (!slot_play(0)) {
         g_state = EN_AUDIO_FAILED;
         return false;
     }
@@ -290,22 +228,18 @@ bool en_audio_submit(const char *key, const int16_t *pcm,
 bool en_audio_queue(const char *key, const int16_t *pcm,
                     uint32_t frames, uint32_t sample_rate)
 {
+    (void)key;
     if (!pcm || !frames) return false;
 
-    clip_t c;
-    clip_path(c.path, (int)sizeof c.path, key);
-    c.frames = frames;
-    c.rate = sample_rate;
-    c.loop = false;
-    c.valid = true;
-
-    if (!write_clip(c.path, pcm, frames, sample_rate)) return false;
-    g_next = c;
+    int idx = (g_playing == 0) ? 1 : 0;
+    if (!slot_reserve(&g_slot[idx], frames * 4u)) return false;
+    slot_fill(&g_slot[idx], pcm, frames, sample_rate, false);
+    g_pending = idx;
     return true;
 }
 
-/* This backend plays buffers, not a continuous feed, so the engine takes the
-   submit/queue path. */
+/* The pull interface is the Linux port's; here the engine still hands over
+   finished buffers. */
 bool en_audio_can_stream(void) { return false; }
 
 bool en_audio_start_stream(uint32_t sample_rate, en_audio_pull_fn pull,
@@ -317,14 +251,15 @@ bool en_audio_start_stream(uint32_t sample_rate, en_audio_pull_fn pull,
 
 bool en_audio_wants_next(void)
 {
-    return g_cur.valid && !g_cur.loop && !g_next.valid && !g_stopping;
+    return g_playing >= 0 && !g_slot[g_playing].loop
+        && g_pending < 0 && !g_stopping;
 }
 
 double en_audio_remaining(void)
 {
-    if (!g_cur.valid) return 0.0;
-    if (g_cur.loop) return 1e9;
-    uint32_t dur = clip_ms(&g_cur);
+    if (g_playing < 0) return 0.0;
+    if (g_slot[g_playing].loop) return 1e9;
+    uint32_t dur = slot_ms(&g_slot[g_playing]);
     uint32_t played = hb_time_uptime_ms() - g_started_ms;
     return played >= dur ? 0.0 : (double)(dur - played) / 1000.0;
 }
@@ -332,21 +267,19 @@ double en_audio_remaining(void)
 void en_audio_stop(uint32_t fade_ms)
 {
     (void)fade_ms;
-    /* No stop primitive is known, so this stops re-arming and lets the
-       current buffer run out. See the file header. */
+    /* Still no confirmed way to silence a buffer already in flight, so a stop
+       lands at the next boundary. Buffers are far shorter than the old loop
+       files, so the wait is correspondingly shorter. */
     g_stopping = true;
-    g_next.valid = false;
-    g_cur.loop = false;
+    g_pending = -1;
+    if (g_playing >= 0) g_slot[g_playing].loop = false;
 }
 
 void en_audio_set_paused(bool paused)
 {
-    /* Same limitation: pausing cannot silence what is already playing, so it
-       takes effect at the end of the current buffer. Resuming restarts from
-       the loop's beginning, which for a steady tone is indistinguishable. */
     g_paused = paused;
     g_state = paused ? EN_AUDIO_PAUSED : EN_AUDIO_PLAYING;
-    if (!paused && g_cur.valid) arm_and_play(&g_cur);
+    if (!paused && g_playing >= 0) slot_play(g_playing);
 }
 
 void en_audio_set_volume(int percent)
@@ -354,46 +287,38 @@ void en_audio_set_volume(int percent)
     if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
     g_volume = percent;
-    /* The descriptor's volume is read when play() is called, so a change takes
-       effect at the next re-arm rather than immediately. */
+    /* Read when play() is called, so this takes effect at the next boundary. */
 }
 
 int en_audio_get_volume(void) { return g_volume; }
 
 void en_audio_tick(void)
 {
-    if (!g_cur.valid || g_paused) return;
+    if (g_playing < 0 || g_paused) return;
 
-    uint32_t dur = clip_ms(&g_cur);
+    uint32_t dur = slot_ms(&g_slot[g_playing]);
     if (!dur) return;
 
     uint32_t played = hb_time_uptime_ms() - g_started_ms;
-
-    /* Well before the boundary: get the next buffer decoded and sitting in the
-       spare descriptor, so the boundary itself costs only a play() call. */
-    if (!g_stopping && !g_preloaded && played + PRELOAD_LEAD_MS >= dur) {
-        if (g_cur.loop)            preload(&g_cur);
-        else if (g_next.valid)     preload(&g_next);
-    }
-
-    if (played < dur) return;        /* not yet: no early start, no overlap */
+    if (played < dur) return;          /* exactly on the boundary, never early */
 
     g_elapsed_ms += dur;
 
     if (g_stopping) {
-        g_cur.valid = false;
+        g_playing = -1;
         g_state = EN_AUDIO_IDLE;
         return;
     }
 
-    if (g_cur.loop) {
-        if (!play_preloaded()) arm_and_play(&g_cur);
-    } else if (g_next.valid) {
-        g_cur = g_next;
-        g_next.valid = false;
-        if (!play_preloaded()) arm_and_play(&g_cur);
+    if (g_slot[g_playing].loop) {
+        slot_play(g_playing);          /* the same samples again */
+    } else if (g_pending >= 0) {
+        int next = g_pending;
+        g_pending = -1;
+        g_slot[g_playing].ready = false;
+        slot_play(next);
     } else {
-        g_cur.valid = false;
+        g_playing = -1;
         g_state = EN_AUDIO_IDLE;       /* ran dry: the program is over */
     }
 }
@@ -402,9 +327,9 @@ en_audio_state_t en_audio_state(void) { return g_state; }
 
 double en_audio_elapsed(void)
 {
-    if (!g_cur.valid) return (double)g_elapsed_ms / 1000.0;
+    if (g_playing < 0) return (double)g_elapsed_ms / 1000.0;
     uint32_t played = hb_time_uptime_ms() - g_started_ms;
     return (double)(g_elapsed_ms + played) / 1000.0;
 }
 
-const char *en_audio_backend_name(void) { return "hb_audio (OS sfx player)"; }
+const char *en_audio_backend_name(void) { return "RetailOS sfx, PCM from RAM"; }

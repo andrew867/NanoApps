@@ -23,7 +23,46 @@ the disassembly or refute it.
 
 ---
 
-## Headline: loads are capped at 1 MiB
+## Update: the file path is no longer used at all
+
+**Confirmed on hardware (harness T9): the OS sound player will play a PCM
+buffer we allocate and fill ourselves, with no file anywhere.**
+
+`voice::setSource` (VA `0x0862fd24`) stores the *descriptor pointer* at
+`voice+0x78` — it never copies the audio — and dispatches on a container type
+at `desc+0x10`. Type 0 computes `framesPerPacket = 1` and
+`bytesPerFrame = (bits/8) * channels`, then
+`frames = desc[0x0C] / bytesPerFrame`. That is linear PCM and nothing else.
+
+So `loadFile` was only ever a parser. It decoded a file into a heap buffer and
+filled in these fields:
+
+| Offset | Set to |
+| --- | --- |
+| 0x04, 0x08 | the PCM buffer |
+| 0x0C | its length in bytes |
+| 0x10 | 0, for linear PCM |
+| 0x14 / 0x18 / 0x1C | sample rate / channels / bits |
+| 0x38, 0x3C | 0, no leading or trailing trim |
+
+`platform/audio_device.c` now fills them in directly. What that deletes:
+
+- **the 1 MiB ceiling**, which was a limit on the *file*, not on the buffer;
+- every FAT write, with its wear and its latency;
+- the cache-key bugs, since there are no paths to collide;
+- re-reading and re-decoding the loop file on every wrap.
+
+A join is now a single `play()` call on a descriptor already pointing at ready
+samples. That is cheap enough to land exactly on the boundary, which is what
+finally removed the audible artefact at loop wraps.
+
+Everything below this section describes the file path, and is kept because it
+is how the descriptor was mapped in the first place — but the loader ceiling it
+agonises over no longer constrains the app.
+
+---
+
+## Headline: loads are capped at 1 MiB (superseded — see above)
 
 `SoundEffectDescriptor::loadFile` (VA `0x08417f78`) at VA `0x08418018`:
 

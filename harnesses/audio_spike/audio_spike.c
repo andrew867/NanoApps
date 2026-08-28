@@ -904,21 +904,28 @@ static void test_subrange(void)
 static int16_t *g_t9_pcm;
 
 /* A 220 / 227 Hz pair, one per ear, so a working result is unmistakable: two
-   clear tones beating seven times a second. A cheap triangle rather than a
-   sine table - this is a plumbing test, not an audio-quality one. */
+   clear tones beating seven times a second.
+ *
+ * The first version of this used a hand-rolled "triangle" that was discontinuous
+ * at every zero crossing - it jumped 32767 units each cycle, so it came out as a
+ * harsh buzz and made a working audio path sound broken. Use a real triangle:
+ * fold the top bit of the phase, which is continuous by construction. */
 static void t9_fill(int16_t *dst, uint32_t frames, uint32_t rate,
                     uint32_t phase_l_start, uint32_t phase_r_start)
 {
     uint32_t pl = phase_l_start, pr = phase_r_start;
     uint32_t step_l = (uint32_t)(220.0 * 4294967296.0 / (double)rate);
     uint32_t step_r = (uint32_t)(227.0 * 4294967296.0 / (double)rate);
+
     for (uint32_t i = 0; i < frames; i++) {
-        int32_t l = (int32_t)((pl >> 16) & 0xFFFF) - 32768;
-        int32_t r = (int32_t)((pr >> 16) & 0xFFFF) - 32768;
-        l = (l < 0) ? (-l - 16384) : (16384 - l);
-        r = (r < 0) ? (-r - 16384) : (16384 - r);
-        dst[2 * i + 0] = (int16_t)l;
-        dst[2 * i + 1] = (int16_t)r;
+        /* phase -> 0..65535 -> triangle -32768..32767, no discontinuity */
+        uint32_t a = (pl >> 15) & 0x1FFFF;      /* 0..131071, two ramps */
+        int32_t  l = (a < 65536u) ? (int32_t)a - 32768 : 98303 - (int32_t)a;
+        uint32_t b = (pr >> 15) & 0x1FFFF;
+        int32_t  r = (b < 65536u) ? (int32_t)b - 32768 : 98303 - (int32_t)b;
+
+        dst[2 * i + 0] = (int16_t)(l / 2);      /* half scale, leave headroom */
+        dst[2 * i + 1] = (int16_t)(r / 2);
         pl += step_l;
         pr += step_r;
     }
