@@ -1,0 +1,45 @@
+# Headless preview of the Radio+ interface.
+#
+# Renders every screen into a memory buffer and writes PNGs. No display, no SDL,
+# no hardware - which is what makes it possible to look at all six screens side
+# by side while laying them out, rather than one at a time on an iPod.
+#
+#   cd host && make -f Makefile.preview shots
+#
+# The LVGL archive is shared with the Entrain host build rather than rebuilt:
+# the two apps use the same lv_conf, and compiling LVGL twice for the same
+# settings costs minutes and buys nothing.
+
+CC     ?= cc
+BUILD  := build
+LVGL   ?= ../../../lvgl
+LVLIB  ?= ../../entrain/host/build/liblvgl_host.a
+CORE   := ../core
+PLAT   := ../platform
+
+LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_host.h\" \
+             -I$(LVGL) -I$(LVGL)/src -I$(LVGL)/include -I$(LVGL)/.. -I..
+
+CFLAGS := -O1 -g -std=gnu99 -Wall -Wextra -Wno-unused-parameter
+
+SRCS := preview.c ../ui.c $(PLAT)/model_host.c \
+        $(CORE)/fmcmd.c $(CORE)/fmreg.c $(CORE)/rds.c $(CORE)/region.c \
+        $(CORE)/wav.c $(CORE)/store.c
+
+.PHONY: shots clean check
+shots: $(BUILD)/preview
+	@mkdir -p shots
+	@./$(BUILD)/preview shots
+	@python3 tobmp.py shots && rm -f shots/*.bmp
+	@ls shots/
+
+check:
+	@test -f $(LVLIB) || { echo "no LVGL archive at $(LVLIB)"; \
+	  echo "build it once from the entrain host target"; exit 1; }
+
+$(BUILD)/preview: $(SRCS) $(wildcard $(CORE)/*.h $(PLAT)/*.h ../*.h) | check
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(LV_CFLAGS) -o $@ $(SRCS) $(LVLIB) -lm -lpthread
+
+clean:
+	rm -rf $(BUILD) shots
