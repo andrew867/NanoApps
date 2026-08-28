@@ -47,20 +47,36 @@
  * No crossfade length fixes that, because the crossfade IS the defect.
  *
  * One field has to be right for any of this to work, and it is not obvious.
- * descriptor+0x34 is the block's length in MILLISECONDS, and setSource turns it
- * into the voice's remaining-sample counter at voice+0x48. The constructor
- * leaves it zero and voice::start never touches it, so leaving it alone means
- * the counter is zero — and then the exhaustion path computes the shortfall to
- * carry into the next buffer as `samples_wanted - 0`, the whole mixer pass
- * rather than the true remainder. The mixer re-enters at 0x86312e0 with that as
- * its new target, so every transition emitted a pass worth of samples too many.
- * A few samples out, once per block, heard as a faint click about once a
- * second.
+ * descriptor+0x34 feeds the voice's counter at voice+0x48:
  *
- * So the duration is set, and it has to convert back exactly: the OS computes
- * ms * rate / 1000 in integers, and 22050/1000 is 441/20, so a block only
- * survives the round trip if it is a whole number of milliseconds — a multiple
- * of 441 frames. Block lengths are therefore fixed multiples of 441.
+ *     862fd54: ldr r0, [r4, #0x34]    ; descriptor+0x34
+ *     862fd58: ldr r6, [r5, #0x0C]    ; the voice's rate
+ *     862fd5c: mul r0, r0, r6
+ *     862fd60: bl  0x842d93c          ; / 1000
+ *     862fd64: str r0, [r5, #0x48]
+ *
+ * The constructor leaves it zero and voice::start never touches it, so the
+ * counter was zero. The exhaustion path then computes the shortfall to carry
+ * into the next buffer as `samples_wanted - 0` — the whole mixer pass rather
+ * than the true remainder — and the mixer re-enters at 0x86312e0 with that as
+ * its target, emitting a pass worth of samples too many at every transition. A
+ * few milliseconds out, once per block: a faint click.
+ *
+ * The counter has to hold the block's frame count. Getting there needs one more
+ * fact, and assuming it wrongly is worth a block of silence: voice+0x0C is the
+ * mixer's OUTPUT rate, not the descriptor's. VA 0x8631610 gives it away, since
+ * it compares voice+0x0C against descriptor+0x14 to decide whether any
+ * resampling is needed at all. So a block stated in its own milliseconds
+ * converts to twice its length on a 44100 mixer, and the voice counts on for a
+ * whole block after the PCM has run out — which is audible as exactly that: a
+ * block of sound, a block of silence.
+ *
+ * So the duration is computed backwards from the sample count instead,
+ * ms = frames * 1000 / output_rate, against the rate read off the live voice.
+ * The value is only used when it converts back to exactly the frame count;
+ * anything else falls back to zero, which is the behaviour that played
+ * correctly all along, just with the mis-accounting above. Block lengths are
+ * stated in frames and chosen to divide cleanly at any plausible mixer rate.
  *
  * Pause and stop do not wait for a block boundary. The voice reads our buffer
  * live, which is what makes the completion flag meaningful, and it cuts both
@@ -113,16 +129,19 @@
    of 44.1k for carriers that never go above a few hundred hertz. */
 #define DEVICE_RATE 22050u
 
-/* A whole number of milliseconds, and a multiple of 20 so that the frame count
-   is a multiple of 441 and the OS's ms * rate / 1000 converts back to exactly
-   the length we rendered. See the header: getting this wrong is a click at
-   every boundary.
-
-   With the chain doing the joining, the value itself is no longer an audio
-   quality knob at all — it is the app's worst-case response time to a retune or
-   a preset change, and how much rendering has to fit between one block being
-   linked and the voice reaching it. */
-#define BLOCK_MS 1200
+/* Block length, in FRAMES rather than milliseconds, because frames are what
+   has to come out exact.
+ *
+ * 28224 divides cleanly at every mixer rate worth worrying about: it is 64x441,
+ * so 22050 and 44100 both give whole milliseconds, and 588x48, so 48000 does
+ * too. (The previous 26460 was a multiple of 441 but not of 48, so it would
+ * have been inexact on a 48k mixer.) At 22050 it is 1.28 seconds.
+ *
+ * With the chain doing the joining, the length is no longer an audio quality
+ * knob at all — it is the app's worst-case response time to a retune or a
+ * preset change, and how much rendering has to fit between one block being
+ * linked and the voice reaching it. */
+#define BLOCK_FRAMES 28224u
 
 /* Blocks in the ring. Two would be enough never to leave the chain empty — one
    sounding, one queued behind it — and the third is slack for a frame that runs
@@ -145,26 +164,21 @@
 #define FADE_MS 80
 
 /* The block chained to itself while paused, purely to keep the voice chain and
-   the DAC alive so resuming is a ramp and not a cold start. A multiple of 20 ms
-   for the same reason as BLOCK_MS. */
-#define QUIET_MS 240
+   the DAC alive so resuming is a ramp and not a cold start. 7056 = 16x441 =
+   147x48, exact for the same rates as BLOCK_FRAMES; 320 ms at 22050. */
+#define QUIET_FRAMES 7056u
 
 #define MS_FRAMES(ms) ((DEVICE_RATE * (uint32_t)(ms)) / 1000u)
 
-#define BLOCK_FRAMES  MS_FRAMES(BLOCK_MS)
 #define SAFETY_FRAMES MS_FRAMES(SAFETY_MS)
 #define FADE_FRAMES   MS_FRAMES(FADE_MS)
-#define QUIET_FRAMES  MS_FRAMES(QUIET_MS)
 #define CHUNK_FRAMES  MS_FRAMES(CHUNK_MS)
+#define BLOCK_MS      ((BLOCK_FRAMES * 1000u) / DEVICE_RATE)
 
 /* Nothing has run us for this long and the chain has certainly run dry: the OS
    put another app in front. Whatever was queued finished long ago and unheard,
    so start clean rather than carrying on from stale state. */
 #define STARVED_MS (BLOCK_MS * SLOTS * 3)
-
-/* Exact for any multiple of 441 frames, which every block is by construction:
-   22050/1000 = 441/20, so frames/441*20 is the length in whole milliseconds. */
-#define FRAMES_MS(f) (((f) / 441u) * 20u)
 
 typedef void *(*sfx_ctor_t)(void *self);
 typedef void *(*sfx_player_inst_t)(void);
@@ -204,6 +218,7 @@ static bool             s_source_done;
 
 static bool g_paused;
 static bool g_stopping;
+static uint32_t g_out_rate;         /* the mixer's rate, read off a live voice */
 static bool g_quiet_armed;          /* the silence block is looping */
 static bool g_fade_in;              /* next block handed over ramps up */
 static int  g_volume = 45;
@@ -215,6 +230,42 @@ static uint32_t os_volume(void)
 {
     int v = g_volume < 0 ? 0 : (g_volume > 100 ? 100 : g_volume);
     return (0x7fffu * (uint32_t)v) / 100u;
+}
+
+/* What to put in descriptor+0x34 so that voice+0x48 comes out holding exactly
+ * `frames`.
+ *
+ * setSource computes ms * output_rate / 1000, so this inverts that — and only
+ * answers when the inversion is exact. Zero is the honest fallback: it is what
+ * the constructor leaves and what played correctly before any of this, just
+ * with a pass worth of mis-accounting at each transition. A wrong non-zero
+ * value is far worse, because the voice keeps counting after the PCM has run
+ * out and pads the difference with silence. */
+static uint32_t duration_ms(uint32_t frames)
+{
+    if (!g_out_rate || !frames) return 0;
+
+    uint32_t num = frames * 1000u;          /* 28224000 — no overflow */
+    if (num % g_out_rate) return 0;         /* would not round-trip */
+
+    uint32_t ms = num / g_out_rate;
+    if ((ms * g_out_rate) / 1000u != frames) return 0;   /* belt and braces */
+    return ms;
+}
+
+/* Take the mixer's rate off the voice the OS actually handed us, rather than
+   assuming it. setSource leaves the voice at descriptor+0x48, and the voice
+   keeps the output rate at +0x0C — 0x8631610 compares the two to decide whether
+   to resample, which is what makes it the output rate and not ours. */
+static void learn_rate(const slot_t *s)
+{
+    if (g_out_rate) return;
+
+    uint32_t v = *(volatile const uint32_t *)(s->desc + SFX_OFF_VOICE);
+    if (!v || (v & 3u)) return;
+
+    uint32_t r = *(volatile const uint32_t *)(uintptr_t)(v + 0x0Cu);
+    if (r >= 8000u && r <= 192000u) g_out_rate = r;
 }
 
 /* Set a descriptor up to describe a slot's buffer. Everything the OS needs is
@@ -237,8 +288,9 @@ static void desc_build(slot_t *s)
     /* The one the constructor leaves at zero. setSource turns it into the
        voice's remaining-sample count, and the chain transition subtracts the
        mixer pass from it to work out how much of that pass the NEXT buffer
-       owes. Zero here means every transition over-produces by a pass. */
-    *(volatile uint32_t *)(d + SFX_OFF_DURATION) = FRAMES_MS(s->frames);
+       owes. Zero means every transition over-produces by a pass; too large
+       means the voice pads with silence once the PCM runs out. */
+    *(volatile uint32_t *)(d + SFX_OFF_DURATION) = duration_ms(s->frames);
     *(volatile uint32_t *)(d + SFX_OFF_VOLUME)   = os_volume();
     d[SFX_OFF_PLAYMODE] = 1;
     d[SFX_OFF_FLAGS] = 0;
@@ -309,10 +361,10 @@ static bool build_step(int idx)
                           s_pull_ctx);
     if (got == 0) {
         /* The program ended part-way through. Whatever is already rendered is
-           real audio and gets played, rounded down to a whole number of
-           milliseconds so the duration still converts exactly. */
+           real audio and gets played at its true length — duration_ms() will
+           decline to state a duration that does not convert exactly, and a
+           block with no successor has nothing to hand over to anyway. */
         s_source_done = true;
-        b->fill -= b->fill % 441u;
         if (b->fill == 0) { b->state = SLOT_FREE; return false; }
         b->frames = b->fill;
         b->state = SLOT_READY;
@@ -376,6 +428,22 @@ static bool play_slot(int idx)
     if (!player) return false;
     ((sfx_player_play_t)SFX_PLAYER_PLAY_ADDR)(player, b->desc,
                                               (void *)0, (void *)0);
+
+    /* Only now does a voice exist to read the mixer rate from, so the
+       descriptor just handed over went out with a zero duration - the safe
+       value, but the one that leaves this block's join mis-counted. Every
+       later block gets an exact duration through the descriptor; this one is
+       corrected by writing the counter the OS would have computed straight
+       into the voice.
+
+       Safe to do while it sounds: voice+0x48 is written only by setSource and
+       touched only by the exhaustion path, which this block will not reach for
+       another second. */
+    learn_rate(b);
+
+    uint32_t v = *(volatile uint32_t *)(b->desc + SFX_OFF_VOICE);
+    if (g_out_rate && v && !(v & 3u) && duration_ms(b->frames))
+        *(volatile uint32_t *)(uintptr_t)(v + 0x48u) = b->frames;
 
     enqueue(idx);
     g_head_start_ms = hb_time_uptime_ms();

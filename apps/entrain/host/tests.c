@@ -489,51 +489,71 @@ static void test_crossfade_combs(void)
     free(pcm);
 }
 
-/* The block length has to survive a round trip through milliseconds.
+/* The block length has to survive a round trip through the OS's milliseconds.
  *
  * The OS is told how long each block is in milliseconds (descriptor+0x34) and
- * converts it back with ms * rate / 1000 in integer arithmetic, to get the
- * voice's remaining-sample count. If that does not land on exactly the number
- * of frames we rendered, the chain transition miscounts by the difference and
- * clicks once per block - which is what it did.
+ * turns it into the voice's remaining-sample counter with
+ * ms * output_rate / 1000, in integer arithmetic. That counter has to come out
+ * holding exactly the number of frames we rendered. Too small and the chain
+ * transition miscounts and clicks; too large and the voice pads with silence
+ * once the PCM has run out, which sounded like a block of audio followed by a
+ * block of nothing.
  *
- * 22050/1000 is 441/20, so the round trip is lossless only for multiples of
- * 441 frames. These are the shipped numbers from audio_device.c. */
+ * The rate in that sum is the MIXER's, not ours, and it is read off the live
+ * voice at run time — so the block length has to divide cleanly at every rate a
+ * mixer plausibly runs at, not just at 22050. */
 static void test_block_duration(void)
 {
-    section("block length converts to milliseconds and back exactly");
+    section("block length converts to the OS sample count exactly");
 
-    const uint32_t rate = 22050;
-    const uint32_t block_ms = 1200;          /* BLOCK_MS */
-    const uint32_t quiet_ms = 240;           /* QUIET_MS */
+    /* The shipped values from audio_device.c. */
+    const uint32_t block_frames = 28224;
+    const uint32_t quiet_frames = 7056;
 
-    const uint32_t cases[] = { block_ms, quiet_ms };
-    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
-        uint32_t frames = (rate * cases[i]) / 1000u;
+    /* Every rate the mixer might be running at. */
+    const uint32_t rates[] = { 22050, 44100, 48000 };
+    const uint32_t blocks[] = { block_frames, quiet_frames };
 
-        CHECK(frames % 441u == 0,
-              "%u ms is %u frames, not a multiple of 441",
-              cases[i], frames);
+    for (size_t b = 0; b < sizeof blocks / sizeof blocks[0]; b++) {
+        for (size_t r = 0; r < sizeof rates / sizeof rates[0]; r++) {
+            uint32_t frames = blocks[b], rate = rates[r];
 
-        /* What the app puts in descriptor+0x34... */
-        uint32_t ms = (frames / 441u) * 20u;
-        /* ...and what the OS makes of it. */
-        uint32_t back = (ms * rate) / 1000u;
+            /* What duration_ms() computes... */
+            uint32_t num = frames * 1000u;
+            CHECK(num % rate == 0,
+                  "%u frames does not state exactly at %u Hz", frames, rate);
+            uint32_t ms = num / rate;
 
-        printf("  %4u ms -> %6u frames -> %4u ms -> %6u samples\n",
-               cases[i], frames, ms, back);
-        CHECK(ms == cases[i], "%u ms round-tripped to %u", cases[i], ms);
-        CHECK(back == frames,
-              "%u ms converts to %u samples, not the %u rendered",
-              ms, back, frames);
+            /* ...and what setSource makes of it. */
+            uint32_t counter = (ms * rate) / 1000u;
+
+            printf("  %5u frames @ %6u Hz -> %4u ms -> counter %5u\n",
+                   frames, rate, ms, counter);
+            CHECK(counter == frames,
+                  "%u frames at %u Hz gives a counter of %u",
+                  frames, rate, counter);
+        }
     }
 
-    /* And the failure that was actually shipping: an arbitrary length, such as
-       the zero-crossing search used to pick, does not round trip. */
-    uint32_t odd = 27563;                    /* a real cut from the old code */
-    uint32_t odd_ms = (odd * 1000u) / rate;
-    uint32_t odd_back = (odd_ms * rate) / 1000u;
-    printf("  an unaligned %u frames -> %u ms -> %u samples (%d out)\n",
+    /* And the two ways it went wrong on device, both reproduced here.
+
+       Stating a block in its OWN milliseconds rather than against the mixer
+       rate: 28224 frames is 1280 ms at 22050, but a 44100 mixer reads that as
+       56448 samples — twice the buffer — so the voice pads the difference with
+       silence. That was the block of sound, block of silence. */
+    uint32_t own_ms = (block_frames * 1000u) / 22050u;
+    uint32_t at_44k = (own_ms * 44100u) / 1000u;
+    printf("  stating %u ms (its own rate) to a 44100 mixer -> %u samples,"
+           " %u too many\n", own_ms, at_44k, at_44k - block_frames);
+    CHECK(at_44k == block_frames * 2u,
+          "expected exactly double, got %u", at_44k);
+
+    /* And a length that does not divide: the counter lands short, and a
+       counter that is short by even one sample is a click per block. */
+    uint32_t odd = 26460;                   /* fine at 44.1k, not at 48k */
+    uint32_t odd_ms = (odd * 1000u) / 48000u;
+    uint32_t odd_back = (odd_ms * 48000u) / 1000u;
+    printf("  %u frames @ 48000 Hz -> %u ms -> counter %u (%d out)\n",
            odd, odd_ms, odd_back, (int)odd_back - (int)odd);
     CHECK(odd_back != odd, "expected the unaligned case to lose samples");
 }
