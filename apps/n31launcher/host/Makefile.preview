@@ -1,10 +1,18 @@
-# Headless preview of the launcher. See ../../radioplus/host/Makefile.preview -
-# same approach, same shared LVGL archive.
+# Headless preview of the launcher: renders every screen to PNG with no device
+# and no framebuffer. Worth using - every layout bug in this app was found in a
+# picture and was invisible in the source.
+#
+# LVGL is compiled from the vendored source into this app's own build directory,
+# so a fresh clone builds. Point LVLIB at a prebuilt library to skip that.
 
 CC     ?= cc
+AR     ?= ar
 BUILD  := build
 LVGL   ?= ../../../lvgl
-LVLIB  ?= ../../entrain/host/build/liblvgl_host.a
+LV_CONF := lv_conf_host.h
+
+LVLIB_OWN := $(BUILD)/liblvgl_host.a
+LVLIB     ?= $(LVLIB_OWN)
 
 LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_host.h\" \
              -I$(LVGL) -I$(LVGL)/src -I$(LVGL)/include -I$(LVGL)/.. -I..
@@ -19,7 +27,32 @@ shots: $(BUILD)/preview
 	@python3 tobmp.py shots && rm -f shots/*.bmp
 	@ls shots/
 
-$(BUILD)/preview: $(SRCS) $(wildcard ../*.h)
+
+# LVGL, built here rather than borrowed from another app's build directory.
+# That directory is gitignored, so depending on it meant this could not be built
+# from a fresh clone - and it dangles the moment you check out a branch that
+# does not carry that app.
+#
+# All of src/ is compiled, which is what a liblvgl.a normally is: the parts this
+# app does not use are dropped at link time by --gc-sections, and picking a
+# subset by hand is how you discover a missing symbol six months later. It is a
+# few hundred files, so the first build takes a while - pass -j.
+LV_SRCS := $(shell find $(LVGL)/src -name '*.c')
+LV_OBJS := $(patsubst $(LVGL)/%.c,$(BUILD)/lvgl/%.o,$(LV_SRCS))
+
+$(BUILD)/lvgl/%.o: $(LVGL)/%.c
+	@mkdir -p $(dir $@)
+	@$(CC) $(CFLAGS) $(LV_CFLAGS) -c -o $@ $<
+
+# Coarse, but right: the config decides what LVGL compiles to, so changing it
+# has to rebuild all of it.
+$(LV_OBJS): $(LV_CONF)
+
+$(LVLIB_OWN): $(LV_OBJS)
+	@echo "AR $@"
+	@$(AR) rcs $@ $^
+
+$(BUILD)/preview: $(SRCS) $(wildcard ../*.h) $(LVLIB)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(LV_CFLAGS) -o $@ $(SRCS) $(LVLIB) -lm -lpthread
 

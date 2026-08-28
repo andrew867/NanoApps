@@ -80,11 +80,13 @@ make -f Makefile.n31             # the ARM binary
 make -f Makefile.n31 push        # to /tmp on a device at 192.168.7.2
 ```
 
-The ARM build reuses the LVGL static library from the Entrain app rather than
-building its own copy of the same configuration:
+Both targets compile LVGL from the vendored source into their own build
+directory, so a fresh clone of this app alone builds. That is a few hundred
+files the first time — pass `-j`. If you already have a library built against
+the same `lv_conf`, skip it:
 
 ```bash
-make -f Makefile.n31 LVLIB=/path/to/liblvgl_n31.a
+make -f Makefile.n31 -j8 LVLIB=/path/to/liblvgl_n31.a
 ```
 
 `Makefile.preview` renders all four screens headlessly. It is worth using: every
