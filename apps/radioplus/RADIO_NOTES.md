@@ -333,3 +333,112 @@ different class entirely. Offsets alone do not identify an object.
    thread to pull, and that is where `0xFC15` should surface.
 3. Locate the Live Pause cache buffer, using `Radio Live Pause Cache`
    (`0x284f7c`) and the `HandleBuffer*` handlers (`0x267a40`–`0x267ab8`).
+
+---
+
+# Phase 0c — naming the slots: what worked, what did not
+
+## Naming from log strings is impossible here, and that is a finding
+
+The obvious way to name a vtable slot is to find a caller that logs what it is
+doing, and RetailOS looks like it should oblige. The strings are there and they
+name the operations outright:
+
+```
+2c5db4  We have a frequency event
+2c5dd0  [Tune] [%s] New frequency is %d kHz (old was %d)
+2c5e1c  [Seek] [%s] New frequency is %d kHz (old was %d)
+2c5e68  Our RSSI is %d (original = 0x%x)
+2c5e8c  Our SNR is %d (original = 0x%x)
+2c5700  fnRssiThreshold: %d. fnNoiseThreshold: %d
+1b4de4  "frequency " / " : rssi " / " : snr "     (the Tuner_Readings.log format)
+1b3428  UNKNOWN / ACCESSORY / INTERNAL            (the "Tuner Used :" enum)
+```
+
+**None of them is referenced by address.** Not one. And that is not a broken
+search: the same tool finds the type_info name reference at `0x0878bbc4` and the
+`TRFTuner` vptr reference at `0x08027a64` immediately.
+
+The reason is that RetailOS logs by index, not by pointer. `0x0841acf4` is the
+dispatcher: it takes an event id, bails with `103` if a global is clear, and
+otherwise compares the id against a whitelist — `0x83`, `0x36`, `0x84`, `0x85`,
+`0x86`, `0x87`, `0x89`, `0x35`, `0x75`, `0x82`, `0x97`, `0xb0`, `0xa3`, `0x61`,
+… — all branching to one place. Call sites pass a small constant id and the
+arguments; the text is looked up elsewhere. So the strings are data in a table
+and the code never mentions them.
+
+That also explains the `RdsData*` block: a 12-byte stride with no individual
+references is a table indexed by field number, not a set of pointers.
+
+**Consequence for this project:** slots cannot be named from strings. They get
+named from call sites or from device observation, and until then they stay
+unnamed. `INTERNAL`/`ACCESSORY` does independently confirm the two-tuner split
+(RTXC and IAP respectively).
+
+## The FM opcode appears exactly once
+
+`0xFC15` is materialised in the whole image exactly once, at **`0x0854ce72`**,
+as `movw r0, #0xFC15`. `re/findimm.py` finds it by searching for the MOVW
+*encoding*, which is necessary because a 16-bit immediate lives in the
+instruction rather than in a literal pool — searching for the bytes finds
+nothing.
+
+The function around it:
+
+```
+854ce54: ldr  r0,[pc]        -> global 0x0896dd00 ; deref, bail if null
+854ce5c: ldr  r0,[pc]        -> template 0x08d09f74
+854ce5e: ldrd r1,r2,[r0]     \
+854ce62: ldr  r0,[r0,#8]      >  12 bytes of canned payload onto the stack
+854ce64: strd r1,r2,[sp]     /
+854ce68: add.w r2, sp, #1     ; payload pointer, one byte in
+854ce6c: ldrb.w r1,[sp]       ; that first byte is the payload LENGTH
+854ce72: movw r0, #0xFC15     ; opcode
+854ce76: bl   0x80f731e
+854ce7a: cbz  r0, <return 0>  ; zero is success
+854ce86: bl   0x841bacc       ; else trace(0x41, line 503) and return 114
+```
+
+**Correction to a reading I made an hour ago:** I took `0x080f731e` for the HCI
+send. It is not. It is three instructions of argument shuffling in front of
+`0x0841acf4` with event id `0xB4` — a *trace* wrapper. So `0x0854ce54` logs an
+FM command; it does not transmit one. Recording the mistake because the same
+over-reading of RetailOS has now cost this project twice on the Entrain side,
+and the pattern is always the same: a function whose shape fits the hypothesis,
+adopted before following it one level down.
+
+What the site is still worth:
+
+- It **localises the FM HCI code** to `0x0854xxxx`, which is a small
+  neighbourhood to search for the real send.
+- It gives the **command shape**: `(opcode, length, payload)` with the length as
+  a leading byte of the buffer.
+- It names two data anchors: a readiness global at **`0x0896dd00`** (checked
+  non-null before anything is attempted) and a canned 12-byte command template
+  at **`0x08d09f74`**.
+
+## Where this leaves the two builds
+
+Nothing found so far blocks the Linux target: that path goes through the
+documented UART HCI transport and does not need any of this.
+
+For RetailOS there are now two candidate routes and neither is proven:
+
+1. **Call `TRFTuner` through its vtable.** Located and mapped, but unnamed, and
+   the class is abstract with concrete leaves that are themselves abstract at
+   slots 4, 5, 11 and 12 — so an instance has to be obtained rather than
+   constructed. The vptr reference at `0x08027a64` is the thread.
+2. **Find the real HCI send and issue `0xFC15` directly.** Strictly better if it
+   exists, because it exposes every register in the command list rather than
+   whatever `TRFTuner` chose to abstract. The search area is now small.
+
+Route 2 is worth one more pass before committing to route 1.
+
+## Next
+
+1. Disassemble outward from `0x0854ce54` for the function that actually
+   transmits, and identify the readiness global at `0x0896dd00`.
+2. Decode the 12-byte template at `0x08d09f74` — it is a real `FM_RDS_Command`
+   payload and should parse against the register table, which would confirm the
+   whole shape.
+3. Only then decide between calling `TRFTuner` and driving `0xFC15` directly.
