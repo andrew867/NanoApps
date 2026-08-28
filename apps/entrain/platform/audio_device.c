@@ -1,76 +1,70 @@
 /*
  * audio_device.c — audio.h on the iPod under RetailOS.
  *
- * Generates audio a block at a time straight into RAM. No files, no loop, and
- * no crossfade.
+ * Generates audio a block at a time straight into RAM, and hands the blocks to
+ * the OS as a CHAIN, so the sound hardware runs them together and there is no
+ * join left for us to get wrong.
  *
- * Four findings from RetailOS 1.1.2 shape this, all confirmed on device:
+ * The chain is the whole design, and it comes from RetailOS 1.1.2 itself. When
+ * a voice finishes a buffer, its completion handler does this before any
+ * teardown:
  *
- *   1. The OS sound player will play a buffer we allocate and fill ourselves.
- *      voice::setSource (VA 0x0862fd24) stores the DESCRIPTOR pointer at
- *      voice+0x78 rather than copying the audio, and its container-type table
- *      (desc+0x10) has a type 0 whose framesPerPacket = 1 and
- *      bytesPerFrame = (bits/8) * channels — linear PCM and nothing else.
- *      loadFile was only ever a parser, so we skip it: no files, no FAT
- *      writes, and no 1 MiB ceiling (which limited the FILE, not the buffer).
+ *     8631580: ldr r0, [r4, #0x78]   ; r0 = voice->descriptor
+ *     8631584: ldr r1, [r0, #0x54]   ; r1 = descriptor+0x54
+ *     8631588: cmp r1, #0
+ *     863158c: beq <tear down>
+ *     8631590: mov r0, r4
+ *     8631594: bl  0x862fd24         ; voice::setSource(voice, next)
+ *     863159c: bl  0x8630154         ; voice::start(voice)
  *
- *   2. One voice playing one buffer sounds clean. Worth stating plainly,
- *      because everything below exists to preserve that.
+ * descriptor+0x54 is a NEXT pointer. A voice reaching the end of one buffer
+ * re-arms itself from it immediately, inside its own completion handler, on the
+ * audio task. That is a sample-exact join: not a short gap, not a small step —
+ * the same continuous stream, concatenated by the hardware.
  *
- *   3. Nothing can silence a voice that is already playing, and the pool MIXES
- *      rather than cutting — a second play() sums with the first.
+ * Everything else follows from that:
  *
- *   4. play() is cheap once no file is involved, but WHEN the new voice starts
- *      is not ours to choose. We arm from a UI tick, so the start lands
- *      somewhere inside a frame period.
+ *   - voice::setSource (VA 0x0862fd24) writes descriptor+0x64 = 1 when a voice
+ *     takes a descriptor up, and the completion handler writes it back to 0. So
+ *     each block carries its own "finished" flag, and which buffers are free to
+ *     render into stops being a timing estimate and becomes a fact.
  *
- * (3) and (4) together are what wrecked the previous two versions. Both tried
- * to hide the join by overlapping consecutive buffers and crossfading. But
- * consecutive buffers are consecutive samples of ONE signal, so overlapping
- * them sums that signal with a time-shifted copy of itself — a comb filter,
- * whose notches sweep as the timing drifts. That is a wobble, and it is worse
- * than the click it was meant to hide. Lengthening the crossfade only slowed
- * the wobble down. No crossfade length fixes it, because the crossfade IS the
- * defect.
+ *   - setSource also applies rate, channels, bit depth and volume from the
+ *     descriptor (VAs 0x8631610, 0x86306c8, 0x8630440, 0x86304a4), so a chained
+ *     descriptor is set up as completely as one passed to play(). play() is
+ *     only needed to get the first voice going.
  *
- * So this joins the way a DDS does: it never resets a phase, and it never sums
- * two copies of anything.
+ *   - The UI tick no longer has to be punctual, only to keep up. It renders
+ *     ahead and links blocks onto the tail; the join itself is the audio task's
+ *     business. Nothing here spins on the clock any more.
  *
- *   - The renderer carries its phase accumulators across blocks, so block N+1
- *     opens on the sample after block N closes. Phase stays continuous through
- *     glides, retunes and program joins by construction, not by fading.
+ * The two versions before this one tried to hide the join with a crossfade, and
+ * both sounded wrong. Overlapping consecutive buffers does not blend two
+ * sounds: consecutive buffers are consecutive samples of ONE signal, so an
+ * overlap sums that signal with a time-shifted copy of itself, which is a comb
+ * filter whose notches sweep as the timing drifts. The host tests measure it —
+ * half a carrier period of misalignment, 2.5 ms, cancels the carrier outright.
+ * No crossfade length fixes that, because the crossfade IS the defect.
  *
- *   - Each block is cut where BOTH channels are crossing zero. The renderer
- *     produces a block plus a slack, en_zero_cut() picks the quietest boundary
- *     in that slack, and the block is committed at exactly that length. So when
- *     the next voice starts late, the gap is silence between two samples that
- *     were already near zero: no step at either end.
+ * Blocks are still cut on a zero crossing (en_zero_cut) even though a chained
+ * join is sample-exact and does not need it. It costs a few milliseconds of
+ * render, and it is what makes the fallback safe: if the chain is ever broken —
+ * the OS puts another app in front and stops running us for longer than the
+ * audio we had queued — the restart is a fresh play(), and that join is only as
+ * good as wherever the previous block happened to stop.
  *
- *   - The join is deliberately biased LATE, and armed to the millisecond
- *     rather than to the frame. Early is the one case a cut point cannot
- *     rescue — it overlaps a block's last milliseconds with the next block's
- *     first, and both are full-scale that far from the boundary, which the
- *     tests measure at 199% of peak. So the tick spins out the last few
- *     milliseconds to the deadline instead of arming whenever the next frame
- *     lands, which took the gap from a frame period down to two or three
- *     milliseconds — under a cycle of the carrier.
- *
- *   - Blocks are built a slice per frame, starting a whole block ahead, so the
- *     work never lands on a boundary and no single frame carries enough of it
- *     to be seen. Rendering a block in one callback was tens of milliseconds
- *     and hitched the UI every time — the visible rendering stage again, just
- *     moved somewhere else.
- *
- * Pause and stop do not tear a block off mid-flight. The voice reads our buffer
- * live, so they write a short fade to zero into the part of it that has not
- * been reached yet, then silence. While paused the backend keeps arming a short
- * silent block, which holds the DAC and the voice chain up so resuming is a
- * ramp rather than a cold start.
+ * Pause and stop do not wait for a block boundary. The voice reads our buffer
+ * live, which is what makes the completion flag meaningful, and it cuts both
+ * ways: they write a short fade to zero into the part of the sounding block the
+ * voice has not reached yet, and silence the rest. A silent block is then
+ * chained to ITSELF, so the voice loops silence for nothing while paused, the
+ * DAC stays up, and resuming is a matter of pointing that block's next at real
+ * audio again.
  *
  * Ownership: buffers come from hb_os_alloc and are never handed to loadFile, so
- * the OS never frees them. The descriptor is rebuilt before every play and its
- * constructor zeroes the buffer pointers without freeing, so there is no path
- * to a double free.
+ * the OS never frees them. Descriptors live in this file for the life of the
+ * app and are rebuilt before each handover, and the constructor zeroes the
+ * buffer pointers without freeing, so there is no path to a double free.
  */
 
 #include "audio.h"
@@ -84,8 +78,9 @@
 #define SFX_PLAYER_INST_ADDR (0x08417eb8u | 1u)
 #define SFX_PLAYER_PLAY_ADDR (0x0841828cu | 1u)
 
-/* Descriptor layout, from SoundEffectDescriptor::ctor (VA 0x08417efc) and
-   voice::setSource (VA 0x0862fd24). */
+/* Descriptor layout, from SoundEffectDescriptor::ctor (VA 0x08417efc),
+   voice::setSource (VA 0x0862fd24) and the completion handler (VA 0x08631580).
+   The last two are the ones this file leans on. */
 #define SFX_OFF_BUF_A    0x04
 #define SFX_OFF_BUF_B    0x08
 #define SFX_OFF_BUF_LEN  0x0C
@@ -96,9 +91,11 @@
 #define SFX_OFF_VOLUME   0x24
 #define SFX_OFF_TRIM_LO  0x38
 #define SFX_OFF_TRIM_HI  0x3C
+#define SFX_OFF_VOICE    0x48   /* setSource writes the voice here */
 #define SFX_OFF_PLAYMODE 0x51
 #define SFX_OFF_FLAGS    0x52
-#define SFX_OFF_NEXTSFX  0x54
+#define SFX_OFF_NEXT     0x54   /* the chain: followed at end of buffer */
+#define SFX_OFF_PLAYING  0x64   /* byte: 1 while a voice holds it, 0 when done */
 
 #define SFX_TYPE_LPCM 0
 
@@ -106,52 +103,39 @@
    of 44.1k for carriers that never go above a few hundred hertz. */
 #define DEVICE_RATE 22050u
 
-/* Block length. Also the app's worst-case response time to a retune or a
-   preset change, so it does not want to grow without reason — and now the
-   joins are silent there is nothing to buy by growing it. */
-#define BLOCK_MS 2500
+/* Block length. With the chain doing the joining this is no longer an audio
+   quality knob at all — it is the app's worst-case response time to a retune or
+   a preset change, and how much rendering has to fit between one block being
+   linked and the voice reaching it. Short enough to feel immediate. */
+#define BLOCK_MS 1200
 
-/* Search room for the zero crossing. A binaural pair only crosses zero in both
-   channels together once per beat period, so this has to cover the slowest
-   beat on offer: half a hertz is a two second period, and half of that reaches
-   a crossing from anywhere in the cycle. */
-#define SLACK_MS 1000
+/* Search room for the zero crossing. Only matters once the chain has been
+   broken and a restart has to butt-join; see the header. */
+#define SLACK_MS 800
 
-/* How far ahead of the estimated play cursor an in-place write has to stay.
-   The cursor comes from the wall clock, so it is only good to a frame period or
-   so; this is the margin for that plus anything the DAC has prefetched. */
+/* Blocks in the ring. Two would be enough never to leave the chain empty — one
+   sounding, one queued behind it — and the third is slack for a frame that runs
+   long. */
+#define SLOTS 3
+
+/* How much audio one tick will render. A block is over a second of lead time
+   but only tens of milliseconds of work, so the work wants spreading rather
+   than hurrying: rendering a whole block in one callback hitched the UI every
+   time, which is the visible rendering stage this design exists to avoid. */
+#define CHUNK_MS 250
+
+/* How far ahead of the estimated play cursor an in-place write has to stay. The
+   cursor comes from the wall clock, so it is only good to a frame period or so;
+   this is the margin for that plus anything the DAC has prefetched. */
 #define SAFETY_MS 250
 
 /* Fade to and from silence for pause, resume and stop. Long enough not to
    click, short enough to feel immediate. */
 #define FADE_MS 80
 
-/* What gets armed while paused, purely to keep the voice chain and the DAC
-   alive so resuming is a ramp and not a cold start. */
+/* The block chained to itself while paused, purely to keep the voice chain and
+   the DAC alive so resuming is a ramp and not a cold start. */
 #define QUIET_MS 250
-
-/* Deliberately join late.
- *
- * Early is the one failure that no cut point can rescue: it overlaps a block's
- * last milliseconds with the next block's first, and both are full-scale that
- * far from the boundary, so they comb and they clip. The tests measure 200% of
- * peak. Late merely leaves a gap, and a gap between two samples the cut chooser
- * has already put on a zero crossing is a couple of milliseconds of silence
- * with no step at either end.
- *
- * So aim a shade past the end of the block and never before it. */
-#define JOIN_BIAS_MS 2
-
-/* How close to the deadline the tick will hold the frame and poll the clock
-   rather than going away and coming back.
- *
- * This is the whole reason the join is measured in milliseconds. Arming from
- * the frame callback meant arming whenever the next frame happened to land -
- * 16 to 30 ms late, every block, which is an audible stutter. Spinning out the
- * last few milliseconds costs one dropped frame every couple of seconds and
- * buys two orders of magnitude of accuracy. Bounded by construction: the tick
- * only enters the spin once the deadline is within this. */
-#define SPIN_MAX_MS 35
 
 #define MS_FRAMES(ms) ((DEVICE_RATE * (uint32_t)(ms)) / 1000u)
 
@@ -163,20 +147,10 @@
 #define QUIET_FRAMES  MS_FRAMES(QUIET_MS)
 #define CHUNK_FRAMES  MS_FRAMES(CHUNK_MS)
 
-/* How much audio one tick will render.
- *
- * A block is a couple of seconds of lead time but only tens of milliseconds of
- * work, so the work wants spreading rather than hurrying: rendering a whole
- * block in one callback hitched the UI every time, which is the visible
- * rendering stage this design exists to avoid. At this size a tick costs a few
- * milliseconds and a block takes a dozen ticks to build - a fraction of the
- * time available. */
-#define CHUNK_MS 300
-
-/* Nothing has run us for this long: the OS put another app in front. Whatever
-   was sounding finished long ago and unheard, so start clean rather than
-   replaying a backlog. */
-#define STARVED_MS (BLOCK_MS * 3)
+/* Nothing has run us for this long and the chain has certainly run dry: the OS
+   put another app in front. Whatever was queued finished long ago and unheard,
+   so start clean rather than carrying on from stale state. */
+#define STARVED_MS (BLOCK_MS * SLOTS * 3)
 
 typedef void *(*sfx_ctor_t)(void *self);
 typedef void *(*sfx_player_inst_t)(void);
@@ -188,24 +162,32 @@ typedef void  (*sfx_player_play_t)(void *player, void *desc,
 #define BUILD_PEEK 1        /* rendering the slack to choose the cut */
 #define BUILD_TAIL 2        /* committing the tail the cut chose */
 
+/* Slot states. */
+#define SLOT_FREE   0       /* nothing in it; may be rendered into */
+#define SLOT_BUILD  1       /* part-rendered */
+#define SLOT_READY  2       /* rendered, not yet handed to the OS */
+#define SLOT_QUEUED 3       /* handed over: sounding, or waiting in the chain */
+
 typedef struct {
     uint8_t  desc[0x80];
     int16_t *pcm;
     uint32_t frames;        /* committed length, chosen by en_zero_cut */
     uint32_t fill;          /* how much of the body is rendered so far */
     uint8_t  stage;
-    bool     ready;
-} block_t;
+    uint8_t  state;
+    bool     seen_playing;  /* the OS has had it: its flag was seen set */
+} slot_t;
 
-#define BLK_A 0
-#define BLK_B 1
-#define BLK_Q 2             /* the silence armed while paused */
+static slot_t g_slot[SLOTS];
+static slot_t g_quiet;              /* self-chained silence, for pause */
 
-static block_t  g_blk[3];
-static int      g_playing = -1;    /* index of the sounding block, or -1 */
-static int      g_pending = -1;    /* rendered and waiting its turn */
-static uint32_t g_started_ms;      /* when g_playing was armed */
-static uint32_t g_playing_ms;      /* how long g_playing lasts */
+/* The queue is short and strictly FIFO — the chain plays blocks in the order
+   they were linked — so it is an array and a count, not a ring. */
+static uint8_t g_q[SLOTS];
+static uint8_t g_qn;
+
+static uint32_t g_head_start_ms;    /* when g_q[0] was first seen sounding */
+static uint32_t g_last_tick_ms;
 static uint64_t g_frames_out;
 
 static en_audio_pull_fn s_pull;
@@ -214,17 +196,62 @@ static bool             s_source_done;
 
 static bool g_paused;
 static bool g_stopping;
-static bool g_fade_in;             /* next armed block ramps up from silence */
+static bool g_quiet_armed;          /* the silence block is looping */
+static bool g_fade_in;              /* next block handed over ramps up */
 static int  g_volume = 45;
 static en_audio_state_t g_state = EN_AUDIO_IDLE;
 
-/* ---- helpers ------------------------------------------------------------- */
+/* ---- descriptors --------------------------------------------------------- */
 
 static uint32_t os_volume(void)
 {
     int v = g_volume < 0 ? 0 : (g_volume > 100 ? 100 : g_volume);
     return (0x7fffu * (uint32_t)v) / 100u;
 }
+
+/* Set a descriptor up to describe a slot's buffer. Everything the OS needs is
+   here: setSource applies the format and the volume itself, so a descriptor
+   reached through the chain is as complete as one passed to play(). */
+static void desc_build(slot_t *s)
+{
+    uint8_t *d = s->desc;
+    ((sfx_ctor_t)SFX_CTOR_ADDR)(d);
+
+    *(volatile uint32_t *)(d + SFX_OFF_BUF_A)    = (uint32_t)(uintptr_t)s->pcm;
+    *(volatile uint32_t *)(d + SFX_OFF_BUF_B)    = (uint32_t)(uintptr_t)s->pcm;
+    *(volatile uint32_t *)(d + SFX_OFF_BUF_LEN)  = s->frames * 4u;
+    d[SFX_OFF_TYPE] = SFX_TYPE_LPCM;
+    *(volatile uint32_t *)(d + SFX_OFF_RATE)     = DEVICE_RATE;
+    *(volatile uint32_t *)(d + SFX_OFF_CHANNELS) = 2;
+    *(volatile uint32_t *)(d + SFX_OFF_BITS)     = 16;
+    *(volatile uint32_t *)(d + SFX_OFF_TRIM_LO)  = 0;
+    *(volatile uint32_t *)(d + SFX_OFF_TRIM_HI)  = 0;
+    *(volatile uint32_t *)(d + SFX_OFF_VOLUME)   = os_volume();
+    d[SFX_OFF_PLAYMODE] = 1;
+    d[SFX_OFF_FLAGS] = 0;
+    *(volatile uint32_t *)(d + SFX_OFF_NEXT) = 0;
+    d[SFX_OFF_PLAYING] = 0;
+}
+
+/* The OS sets this when a voice takes the descriptor up and clears it when the
+   buffer has been played out. Volatile because the writer is the audio task. */
+static bool desc_playing(const slot_t *s)
+{
+    return *(volatile const uint8_t *)(s->desc + SFX_OFF_PLAYING) != 0;
+}
+
+/* Link `next` onto the end of `s`. A single aligned 32-bit store, so the audio
+   task reading it at completion sees either the old value or the new one and
+   never a torn pointer — which is what makes it safe to do this from the tick
+   with no lock. Worst case the store lands just too late, the voice tears down,
+   and the tick notices an empty chain and restarts. */
+static void desc_chain(slot_t *s, slot_t *next)
+{
+    *(volatile uint32_t *)(s->desc + SFX_OFF_NEXT) =
+        next ? (uint32_t)(uintptr_t)next->desc : 0u;
+}
+
+/* ---- buffers ------------------------------------------------------------- */
 
 static bool reserve(int16_t **pcm, uint32_t bytes)
 {
@@ -238,37 +265,31 @@ static bool reserve(int16_t **pcm, uint32_t bytes)
 
 static bool buffers_ready(void)
 {
-    if (!reserve(&g_blk[BLK_A].pcm, CAP_FRAMES * 4u)) return false;
-    if (!reserve(&g_blk[BLK_B].pcm, CAP_FRAMES * 4u)) return false;
-    if (!reserve(&g_blk[BLK_Q].pcm, QUIET_FRAMES * 4u)) return false;
+    for (int i = 0; i < SLOTS; i++)
+        if (!reserve(&g_slot[i].pcm, CAP_FRAMES * 4u)) return false;
 
-    for (uint32_t i = 0; i < QUIET_FRAMES * 2u; i++) g_blk[BLK_Q].pcm[i] = 0;
-    g_blk[BLK_Q].frames = QUIET_FRAMES;
-    g_blk[BLK_Q].ready = true;
+    if (!reserve(&g_quiet.pcm, QUIET_FRAMES * 4u)) return false;
+    for (uint32_t i = 0; i < QUIET_FRAMES * 2u; i++) g_quiet.pcm[i] = 0;
+    g_quiet.frames = QUIET_FRAMES;
     return true;
 }
 
-/* Where the sounding block has most likely got to. Derived from the wall clock,
-   so it is an estimate — every use of it keeps SAFETY_FRAMES clear. */
-static uint32_t play_cursor(void)
-{
-    if (g_playing < 0) return 0;
-    uint32_t elapsed = hb_time_uptime_ms() - g_started_ms;
-    return MS_FRAMES(elapsed);
-}
+/* ---- rendering ----------------------------------------------------------- */
 
-/* One slice of building a block. Returns true once the block is ready to arm.
+/* One slice of building a block. Returns true once it is ready to hand over.
  *
  * Only the slack is ever rendered twice, and only because the cut has to see it
  * before deciding how much of it to keep: peeking renders without moving the
  * source on, so committing afterwards re-renders the identical samples that
- * were measured. The body needs no such thing - it is kept whatever the cut
- * says - so it is committed as it goes. */
+ * were measured. The body needs no such thing — it is kept whatever the cut
+ * says — so it is committed as it goes. */
 static bool build_step(int idx)
 {
-    block_t *b = &g_blk[idx];
-    if (b->ready) return true;
+    slot_t *b = &g_slot[idx];
+    if (b->state == SLOT_READY) return true;
     if (!s_pull || s_source_done) return false;
+
+    b->state = SLOT_BUILD;
 
     if (b->stage == BUILD_BODY) {
         uint32_t want = BLOCK_FRAMES - b->fill;
@@ -278,12 +299,12 @@ static bool build_step(int idx)
                               s_pull_ctx);
         if (got == 0) {
             /* The program ended part-way through. Whatever is already rendered
-               is real audio and gets played; there is simply nothing to cut
-               against, so it stands as it is. */
+               is real audio and gets played; there is simply nothing left to
+               cut against, so it stands as it is. */
             s_source_done = true;
-            if (b->fill == 0) return false;
+            if (b->fill == 0) { b->state = SLOT_FREE; return false; }
             b->frames = b->fill;
-            b->ready = true;
+            b->state = SLOT_READY;
             return true;
         }
         b->fill += got;
@@ -297,8 +318,8 @@ static bool build_step(int idx)
         if (got == 0) {
             s_source_done = true;
             b->frames = BLOCK_FRAMES;
-            b->ready = true;
             b->stage = BUILD_BODY;
+            b->state = SLOT_READY;
             return true;
         }
         uint32_t n = en_zero_cut(b->pcm, BLOCK_FRAMES, BLOCK_FRAMES + got);
@@ -313,11 +334,12 @@ static bool build_step(int idx)
     if (tail && s_pull(b->pcm + (uint32_t)BLOCK_FRAMES * 2u, tail, tail,
                        s_pull_ctx) == 0) {
         s_source_done = true;
+        b->state = SLOT_FREE;
         return false;
     }
     b->fill = 0;
     b->stage = BUILD_BODY;
-    b->ready = true;
+    b->state = SLOT_READY;
     return true;
 }
 
@@ -326,17 +348,17 @@ static bool build_step(int idx)
    milliseconds is the difference between starting and not. */
 static bool build_now(int idx)
 {
-    g_blk[idx].fill = 0;
-    g_blk[idx].stage = BUILD_BODY;
-    g_blk[idx].ready = false;
+    g_slot[idx].fill = 0;
+    g_slot[idx].stage = BUILD_BODY;
+    g_slot[idx].state = SLOT_FREE;
     for (int guard = 0; guard < 64; guard++)
         if (build_step(idx)) return true;
     return false;
 }
 
-/* Ramp the head of a block up from silence, in place. Used on the first block
-   of a run and on the first after a resume, so neither starts as a step. */
-static void fade_in_head(block_t *b)
+/* Ramp the head of a block up from silence, in place, so the first block of a
+   run and the first after a resume do not start as a step. */
+static void fade_in_head(slot_t *b)
 {
     uint32_t n = FADE_FRAMES < b->frames ? FADE_FRAMES : b->frames;
     for (uint32_t i = 0; i < n; i++) {
@@ -346,75 +368,135 @@ static void fade_in_head(block_t *b)
     }
 }
 
-/* Fade the SOUNDING block down to zero and silence its remainder, in place and
- * ahead of the play cursor.
- *
- * This is what makes pause and stop immediate. The voice reads our buffer live,
- * so rewriting the part it has not reached yet takes effect within a fade
- * rather than at the end of the block — and it does that without starting a
- * second voice, which would sum rather than replace. */
-static void fade_out_live(void)
+/* ---- handing blocks to the OS -------------------------------------------- */
+
+static void enqueue(int idx)
 {
-    if (g_playing < 0) return;
-    block_t *b = &g_blk[g_playing];
-    if (!b->pcm) return;
-
-    uint32_t from = play_cursor() + SAFETY_FRAMES;
-    if (from >= b->frames) return;      /* it ends before a fade could finish */
-
-    uint32_t n = FADE_FRAMES;
-    if (from + n > b->frames) n = b->frames - from;
-
-    for (uint32_t i = 0; i < n; i++) {
-        uint32_t k = from + i;
-        int32_t g = 4096 - (int32_t)((i * 4096u) / n);
-        b->pcm[2 * k + 0] = (int16_t)((b->pcm[2 * k + 0] * g) >> 12);
-        b->pcm[2 * k + 1] = (int16_t)((b->pcm[2 * k + 1] * g) >> 12);
-    }
-    for (uint32_t k = from + n; k < b->frames; k++) {
-        b->pcm[2 * k + 0] = 0;
-        b->pcm[2 * k + 1] = 0;
-    }
+    g_slot[idx].state = SLOT_QUEUED;
+    g_slot[idx].seen_playing = false;
+    g_q[g_qn++] = (uint8_t)idx;
+    g_frames_out += g_slot[idx].frames;
 }
 
-static bool arm(int idx)
+/* Start a voice on a block. Only needed to get going, or to recover after the
+   chain has run dry — everything after that is chained. */
+static bool play_slot(int idx)
 {
-    block_t *b = &g_blk[idx];
-    if (!b->ready || !b->pcm || !b->frames) return false;
+    slot_t *b = &g_slot[idx];
+    if (b->state != SLOT_READY || !b->pcm || !b->frames) return false;
 
-    if (g_fade_in && idx != BLK_Q) { fade_in_head(b); g_fade_in = false; }
-
-    uint8_t *d = b->desc;
-    ((sfx_ctor_t)SFX_CTOR_ADDR)(d);
-
-    *(volatile uint32_t *)(d + SFX_OFF_BUF_A)    = (uint32_t)(uintptr_t)b->pcm;
-    *(volatile uint32_t *)(d + SFX_OFF_BUF_B)    = (uint32_t)(uintptr_t)b->pcm;
-    *(volatile uint32_t *)(d + SFX_OFF_BUF_LEN)  = b->frames * 4u;
-    d[SFX_OFF_TYPE] = SFX_TYPE_LPCM;
-    *(volatile uint32_t *)(d + SFX_OFF_RATE)     = DEVICE_RATE;
-    *(volatile uint32_t *)(d + SFX_OFF_CHANNELS) = 2;
-    *(volatile uint32_t *)(d + SFX_OFF_BITS)     = 16;
-    *(volatile uint32_t *)(d + SFX_OFF_TRIM_LO)  = 0;
-    *(volatile uint32_t *)(d + SFX_OFF_TRIM_HI)  = 0;
-    *(volatile uint32_t *)(d + SFX_OFF_VOLUME)   = os_volume();
-    d[SFX_OFF_PLAYMODE] = 1;
-    d[SFX_OFF_FLAGS] = 0;
-    *(volatile void **)(d + SFX_OFF_NEXTSFX) = (void *)0;
+    if (g_fade_in) { fade_in_head(b); g_fade_in = false; }
+    desc_build(b);
 
     void *player = ((sfx_player_inst_t)SFX_PLAYER_INST_ADDR)();
     if (!player) return false;
-    ((sfx_player_play_t)SFX_PLAYER_PLAY_ADDR)(player, d, (void *)0, (void *)0);
+    ((sfx_player_play_t)SFX_PLAYER_PLAY_ADDR)(player, b->desc,
+                                              (void *)0, (void *)0);
 
-    g_playing = idx;
-    g_started_ms = hb_time_uptime_ms();
-    g_playing_ms = (b->frames * 1000u) / DEVICE_RATE;
-
-    if (idx != BLK_Q) {
-        b->ready = false;
-        g_frames_out += b->frames;
-        g_state = EN_AUDIO_PLAYING;
-    }
+    enqueue(idx);
+    g_head_start_ms = hb_time_uptime_ms();
+    g_state = EN_AUDIO_PLAYING;
     return true;
+}
+
+/* Link a ready block onto the end of the chain. This is the normal path: the
+   voice picks it up itself when it reaches the end of the block in front. */
+static bool chain_slot(int idx)
+{
+    slot_t *b = &g_slot[idx];
+    if (b->state != SLOT_READY || !g_qn) return false;
+
+    if (g_fade_in) { fade_in_head(b); g_fade_in = false; }
+    desc_build(b);
+    desc_chain(&g_slot[g_q[g_qn - 1]], b);
+    enqueue(idx);
+    return true;
+}
+
+/* Where the sounding block has most likely got to. Derived from the wall clock,
+   so it is an estimate — every use of it keeps SAFETY_FRAMES clear. */
+static uint32_t play_cursor(void)
+{
+    return MS_FRAMES(hb_time_uptime_ms() - g_head_start_ms);
+}
+
+/* Break the chain and fade the sounding block to zero in place, ahead of the
+ * play cursor.
+ *
+ * This is what makes pause and stop immediate. The voice reads our buffer live,
+ * so rewriting the part it has not reached yet takes effect within a fade
+ * rather than at the end of a block — and it does that without starting a
+ * second voice, which would sum rather than replace, because nothing can
+ * silence a voice that is already sounding. */
+static void silence_now(void)
+{
+    for (uint8_t i = 0; i < g_qn; i++) {
+        slot_t *b = &g_slot[g_q[i]];
+        desc_chain(b, (slot_t *)0);
+
+        if (i > 0) {
+            /* Queued but not reached yet: zero it outright. */
+            for (uint32_t k = 0; k < b->frames * 2u; k++) b->pcm[k] = 0;
+            continue;
+        }
+
+        uint32_t from = play_cursor() + SAFETY_FRAMES;
+        if (from >= b->frames) continue;   /* ends before a fade could finish */
+
+        uint32_t n = FADE_FRAMES;
+        if (from + n > b->frames) n = b->frames - from;
+        for (uint32_t k = 0; k < n; k++) {
+            uint32_t j = from + k;
+            int32_t g = 4096 - (int32_t)((k * 4096u) / n);
+            b->pcm[2 * j + 0] = (int16_t)((b->pcm[2 * j + 0] * g) >> 12);
+            b->pcm[2 * j + 1] = (int16_t)((b->pcm[2 * j + 1] * g) >> 12);
+        }
+        for (uint32_t j = from + n; j < b->frames; j++) {
+            b->pcm[2 * j + 0] = 0;
+            b->pcm[2 * j + 1] = 0;
+        }
+    }
+}
+
+/* Chain the silent block to ITSELF, so the voice loops it for nothing. The DAC
+   and the voice chain stay up while paused, which is why resuming is a ramp
+   rather than a cold start — and it costs no rendering at all. */
+static void arm_quiet(void)
+{
+    if (g_quiet_armed && desc_playing(&g_quiet)) return;
+
+    desc_build(&g_quiet);
+    desc_chain(&g_quiet, &g_quiet);
+
+    if (g_qn) {
+        /* Hand over from whatever is still sounding rather than starting a
+           second voice on top of it: the pool mixes, it does not replace. */
+        desc_chain(&g_slot[g_q[g_qn - 1]], &g_quiet);
+    } else {
+        void *player = ((sfx_player_inst_t)SFX_PLAYER_INST_ADDR)();
+        if (!player) return;
+        ((sfx_player_play_t)SFX_PLAYER_PLAY_ADDR)(player, g_quiet.desc,
+                                                  (void *)0, (void *)0);
+    }
+    g_quiet_armed = true;
+}
+
+static void release_quiet(void)
+{
+    if (!g_quiet_armed) return;
+    desc_chain(&g_quiet, (slot_t *)0);   /* let it run out */
+    g_quiet_armed = false;
+}
+
+static void drop_queue(void)
+{
+    for (uint8_t i = 0; i < g_qn; i++) {
+        slot_t *b = &g_slot[g_q[i]];
+        b->state = SLOT_FREE;
+        b->stage = BUILD_BODY;
+        b->fill = 0;
+    }
+    g_qn = 0;
 }
 
 /* ---- the interface ------------------------------------------------------- */
@@ -427,11 +509,11 @@ bool en_audio_init(void)
 
 void en_audio_shutdown(void)
 {
-    fade_out_live();
+    silence_now();
+    release_quiet();
     g_stopping = true;
     s_pull = (en_audio_pull_fn)0;
-    g_playing = -1;
-    g_pending = -1;
+    drop_queue();
     g_state = EN_AUDIO_IDLE;
     /* Buffers are deliberately left allocated: the app is going away, and
        freeing one while a voice may still be reading it would be worse than
@@ -449,10 +531,11 @@ bool en_audio_start_stream(uint32_t sample_rate, en_audio_pull_fn pull,
     if (!pull) return false;
     if (!buffers_ready()) { g_state = EN_AUDIO_FAILED; return false; }
 
-    /* Anything already sounding is stale content. Fade it out where it stands
-       rather than letting it run: the new source would otherwise sum with it,
-       not replace it. */
-    fade_out_live();
+    /* Whatever is queued belongs to the old source. Fade it out where it stands
+       and take the blocks back: letting it run would sum with the new audio,
+       since the pool mixes and nothing can cut a sounding voice short. */
+    silence_now();
+    drop_queue();
 
     s_pull = pull;
     s_pull_ctx = ctx;
@@ -461,28 +544,29 @@ bool en_audio_start_stream(uint32_t sample_rate, en_audio_pull_fn pull,
     g_paused = false;
     g_stopping = false;
     g_fade_in = true;
-    g_blk[BLK_A].ready = g_blk[BLK_B].ready = false;
-    g_blk[BLK_A].stage = g_blk[BLK_B].stage = BUILD_BODY;
-    g_blk[BLK_A].fill  = g_blk[BLK_B].fill  = 0;
-    g_pending = -1;
 
-    /* Never the block that is sounding. The voice reads our buffer live — that
-       is what makes the in-place pause fade work — so rendering into it would
-       rewrite audio out from under the DAC. */
-    int first = (g_playing == BLK_A) ? BLK_B : BLK_A;
-    if (!build_now(first)) { g_state = EN_AUDIO_FAILED; return false; }
-    g_pending = first;
-
-    /* If real audio is still sounding, its fade has to finish before new audio
-       goes on top of it: the pool mixes, so the two would sum. The tick arms
-       the pending block the moment the old one ends — one block at worst.
-       Pause silence is not real audio and can simply be played over. */
-    if (g_playing < 0 || g_playing == BLK_Q) {
-        if (!arm(first)) { g_state = EN_AUDIO_FAILED; return false; }
-        g_pending = -1;
+    for (int i = 0; i < SLOTS; i++) {
+        g_slot[i].state = SLOT_FREE;
+        g_slot[i].stage = BUILD_BODY;
+        g_slot[i].fill = 0;
     }
 
-    g_state = EN_AUDIO_PLAYING;
+    if (!build_now(0)) { g_state = EN_AUDIO_FAILED; return false; }
+
+    /* Silence is chainable, so hand over from it rather than starting a second
+       voice underneath it. */
+    if (g_quiet_armed) {
+        if (g_fade_in) { fade_in_head(&g_slot[0]); g_fade_in = false; }
+        desc_build(&g_slot[0]);
+        desc_chain(&g_quiet, &g_slot[0]);
+        enqueue(0);
+        g_head_start_ms = hb_time_uptime_ms();
+        g_quiet_armed = false;
+        g_state = EN_AUDIO_PLAYING;
+        return true;
+    }
+
+    if (!play_slot(0)) { g_state = EN_AUDIO_FAILED; return false; }
     return true;
 }
 
@@ -514,7 +598,7 @@ double en_audio_remaining(void) { return s_pull && !s_source_done ? 1e9 : 0.0; }
 void en_audio_stop(uint32_t fade_ms)
 {
     (void)fade_ms;                 /* the fade length is fixed at FADE_MS */
-    fade_out_live();
+    silence_now();
     g_stopping = true;
 }
 
@@ -524,10 +608,12 @@ void en_audio_set_paused(bool paused)
     g_paused = paused;
 
     if (paused) {
-        /* Immediate, and without stopping the voice: the sounding buffer is
-           faded to zero in place, ahead of the cursor. The tick then keeps a
-           silent block armed so the DAC never goes down. */
-        fade_out_live();
+        /* Immediate, and without stopping the voice: the sounding block is
+           faded to zero in place ahead of the cursor and the chain is broken,
+           then silence is chained to itself so the DAC never goes down. */
+        silence_now();
+        drop_queue();
+        arm_quiet();
         g_state = EN_AUDIO_PAUSED;
     } else {
         g_fade_in = true;          /* come back up, do not step */
@@ -540,7 +626,7 @@ void en_audio_set_volume(int percent)
     if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
     g_volume = percent;
-    /* Read at arm time, so it takes hold within one block. */
+    /* Read when a descriptor is built, so it takes hold within a block. */
 }
 
 int en_audio_get_volume(void) { return g_volume; }
@@ -549,76 +635,79 @@ void en_audio_tick(void)
 {
     if (!s_pull) return;
 
-    uint32_t elapsed = hb_time_uptime_ms() - g_started_ms;
+    uint32_t now = hb_time_uptime_ms();
+    uint32_t since = now - g_last_tick_ms;
+    g_last_tick_ms = now;
 
     /* Starved: the frame callback stopped being run, which is what happens when
-       RetailOS brings its own Music app to the front. Drop the stale timing and
-       start again rather than replaying a backlog nobody heard. */
-    if (g_playing >= 0 && elapsed > STARVED_MS) {
-        g_playing = -1;
+       RetailOS brings its own Music app to the front. Everything queued has
+       long since played out unheard, so start clean rather than carrying on
+       from stale state. */
+    if (g_qn && since > STARVED_MS) {
+        drop_queue();
         g_fade_in = true;
-        elapsed = 0;
     }
 
-    /* Keep the chain alive while paused. Nothing is rendered and the source
-       does not move, so the program holds exactly where it was.
-       Re-armed BEFORE the previous one runs out: waiting for it to end would
-       leave a frame period of nothing between them, which is the very gap this
-       is here to prevent. Silence over silence is still silence, so overlapping
-       costs nothing. */
-    if (g_paused) {
-        if (g_playing < 0 || elapsed + (QUIET_MS / 4) >= g_playing_ms)
-            arm(BLK_Q);
-        return;
+    /* Reclaim. The chain is strictly FIFO — blocks finish in the order they
+       were linked — so only the front of the queue can be the one to retire.
+       The flag is the OS's own: set by setSource when a voice takes the
+       descriptor up, cleared by the completion handler when the buffer has been
+       played out. Waiting to see it set first is what distinguishes a block
+       that has finished from one that has not started. */
+    while (g_qn) {
+        slot_t *h = &g_slot[g_q[0]];
+        if (desc_playing(h)) { h->seen_playing = true; break; }
+        if (!h->seen_playing) break;      /* queued, not reached yet */
+
+        h->state = SLOT_FREE;
+        h->stage = BUILD_BODY;
+        h->fill = 0;
+        for (uint8_t i = 1; i < g_qn; i++) g_q[i - 1] = g_q[i];
+        g_qn--;
+        g_head_start_ms = now;
     }
+
+    if (g_paused) { arm_quiet(); return; }
 
     if (g_stopping) {
-        if (g_playing < 0 || elapsed >= g_playing_ms) {
-            g_playing = -1;
+        if (!g_qn) {
+            release_quiet();
             s_pull = (en_audio_pull_fn)0;
             g_state = EN_AUDIO_IDLE;
         }
         return;
     }
 
-    /* Build the next block a slice per tick, starting as soon as there is a
-       free one. A block of lead time against a dozen ticks of work, so it is
-       always finished long before the boundary and no single frame carries
-       enough of it to be seen. */
-    if (g_pending < 0 && !s_source_done) {
-        int idx = (g_playing == BLK_A) ? BLK_B : BLK_A;
-        if (build_step(idx)) g_pending = idx;
+    /* Build one slice into whichever block is free, then hand over anything
+       ready. A block of lead time against a few milliseconds of work per tick,
+       so the chain is extended long before the voice reaches its end and no
+       single frame carries enough of the rendering to be seen. */
+    int ready = -1;
+    for (int i = 0; i < SLOTS; i++) {
+        if (g_slot[i].state == SLOT_READY) { ready = i; break; }
+        if (g_slot[i].state == SLOT_FREE || g_slot[i].state == SLOT_BUILD) {
+            if (build_step(i)) ready = i;
+            break;                        /* one slice per tick, no more */
+        }
     }
 
-    /* Hold until the sounding block is actually finished, to the millisecond.
-       Anything else and the join is as ragged as the frame rate. */
-    if (g_playing >= 0) {
-        uint32_t due = g_started_ms + g_playing_ms + JOIN_BIAS_MS;
-        int32_t  left = (int32_t)(due - hb_time_uptime_ms());
-        if (left > SPIN_MAX_MS) return;         /* plenty of time; come back */
-
-        /* Counted, not just conditioned on the clock. This runs inside the
-           frame callback, so a clock that stopped advancing would take the
-           whole device down with it rather than merely sounding wrong. The
-           bound is generous — a spin only ever has SPIN_MAX_MS to cover — and
-           overrunning it costs one ragged join, not a lock-up. */
-        for (uint32_t guard = 0; left > 0 && guard < 4000000u; guard++)
-            left = (int32_t)(due - hb_time_uptime_ms());
+    if (ready >= 0) {
+        if (g_qn) {
+            chain_slot(ready);
+        } else {
+            /* The chain ran dry — a very long stall, or the very first block.
+               A fresh voice has to be started, and that join is the one the
+               zero-crossing cut exists for. */
+            release_quiet();
+            play_slot(ready);
+        }
+        return;
     }
 
-    if (g_pending >= 0) {
-        int idx = g_pending;
-        g_pending = -1;
-        arm(idx);
-    } else if (s_source_done) {
-        g_playing = -1;
+    if (!g_qn && s_source_done) {
+        release_quiet();
         s_pull = (en_audio_pull_fn)0;
-        g_state = EN_AUDIO_IDLE;        /* the program is over */
-    } else {
-        /* The build did not finish in time — a very long stall. Finish it in
-           one go and arm; one hitched frame is better than a dropout. */
-        int idx = (g_playing == BLK_A) ? BLK_B : BLK_A;
-        if (build_now(idx)) arm(idx);
+        g_state = EN_AUDIO_IDLE;          /* the program is over */
     }
 }
 
@@ -629,4 +718,4 @@ double en_audio_elapsed(void)
     return (double)g_frames_out / (double)DEVICE_RATE;
 }
 
-const char *en_audio_backend_name(void) { return "RetailOS sfx, phase-locked PCM"; }
+const char *en_audio_backend_name(void) { return "RetailOS sfx, chained PCM"; }

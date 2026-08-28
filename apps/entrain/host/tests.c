@@ -498,8 +498,8 @@ static void test_zero_cut(void)
     section("zero-crossing cut");
 
     const uint32_t sr = 22050;
-    const uint32_t block = (sr * 2500u) / 1000u;   /* BLOCK_MS  */
-    const uint32_t cap   = block + sr;             /* + SLACK_MS */
+    const uint32_t block = (sr * 1200u) / 1000u;   /* BLOCK_MS  */
+    const uint32_t cap   = block + (sr * 800u) / 1000u;  /* + SLACK_MS */
 
     int16_t *pcm = malloc((size_t)cap * 2 * sizeof *pcm);
     join_signal(pcm, cap, sr);
@@ -581,8 +581,8 @@ static void test_zero_cut_range(void)
     section("zero-crossing cut across the range");
 
     const uint32_t sr = 22050;
-    const uint32_t block = (sr * 2500u) / 1000u;
-    const uint32_t cap   = block + sr;
+    const uint32_t block = (sr * 1200u) / 1000u;
+    const uint32_t cap   = block + (sr * 800u) / 1000u;
     int16_t *pcm = malloc((size_t)cap * 2 * sizeof *pcm);
 
     static const struct { en_mode_t mode; double carrier, beat; } cases[] = {
