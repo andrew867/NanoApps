@@ -44,7 +44,7 @@ typedef struct {
     /* Presets and recordings */
     en_presets_t presets;
     uint8_t  library_count;
-    char     library[12][40];
+    char     library[12][96];   /* a dated, named recording is ~34 chars */
 
     bool     can_raw;        /* show the register explorer at all */
     const char *backend;

@@ -1,20 +1,33 @@
-# Cross-build of the Radio+ Linux backend for the N31.
+# Radio+ for the N31 Linux port.
 #
 # Control goes through the bcm2078-bt driver sysfs interface and audio through
-# tinyalsa on hw:0,1 - nothing here opens a UART or builds an HCI packet, which
+# tinyalsa on hw:0,1. Nothing here opens a UART or builds an HCI packet - that
 # is the driver's job.
 #
-#   cd host && make -f Makefile.n31          compile-check everything
-#   cd host && make -f Makefile.n31 clean
+#   cd host && make -f Makefile.n31            build the app
+#   cd host && make -f Makefile.n31 objs       compile-check only
+#   cd host && make -f Makefile.n31 push       send it to the device
+#   cd host && make -f Makefile.n31 run        push and run it
+#
+# LVGL and tinyalsa are shared with the Entrain ARM build rather than rebuilt:
+# the two apps use the same lv_conf, and cross-compiling LVGL twice costs
+# several minutes and buys nothing.
 
 IPOD_ROOT ?= /mnt/c/src/ipod/artifacts/linux-n31
 TOOLCHAIN ?= $(IPOD_ROOT)/tinyalsa-build/arm-linux-musleabi-cross
 TINYALSA  ?= $(IPOD_ROOT)/tinyalsa-build/tinyalsa-2.0.0
+SSH_KEY   ?= $(IPOD_ROOT)/n31_id
+DEVICE    ?= root@192.168.7.2
 
 CC     := $(TOOLCHAIN)/bin/arm-linux-musleabi-gcc
+STRIP  := $(TOOLCHAIN)/bin/arm-linux-musleabi-strip
 BUILD  := build-n31
 CORE   := ../core
 PLAT   := ../platform
+LVGL   ?= ../../../lvgl
+
+LVLIB  ?= ../../entrain/host/build-n31/liblvgl_n31.a
+TALIB  ?= ../../entrain/host/build-n31/libtinyalsa_n31.a
 
 ARCH_FLAGS := -mcpu=cortex-a8 -mthumb -mfpu=vfpv3-d16 -mfloat-abi=softfp
 
@@ -23,15 +36,34 @@ CFLAGS := -O2 -g0 -std=gnu99 $(ARCH_FLAGS) \
           -Wall -Wextra -Wshadow -Wno-unused-parameter \
           -I$(TINYALSA)/include
 
-SRCS := $(CORE)/fmcmd.c $(CORE)/fmreg.c $(CORE)/rds.c $(CORE)/region.c \
-        $(CORE)/wav.c $(CORE)/store.c \
-        $(PLAT)/tuner_linux.c $(PLAT)/capture_linux.c
+LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_n31.h\" \
+             -I$(LVGL) -I$(LVGL)/src -I$(LVGL)/include -I$(LVGL)/.. -I..
 
-OBJS := $(patsubst %.c,$(BUILD)/%.o,$(notdir $(SRCS)))
-HDRS := $(wildcard $(CORE)/*.h $(PLAT)/*.h)
+CORE_SRCS := $(CORE)/fmcmd.c $(CORE)/fmreg.c $(CORE)/rds.c $(CORE)/region.c \
+             $(CORE)/wav.c $(CORE)/store.c
 
-.PHONY: all clean toolchain-check
-all: $(OBJS)
+PLAT_SRCS := $(PLAT)/tuner_linux.c $(PLAT)/capture_linux.c $(PLAT)/model_linux.c
+
+APP      := $(BUILD)/radioplus
+APP_SRCS := main_n31.c ../ui.c $(CORE_SRCS) $(PLAT_SRCS)
+
+OBJS := $(patsubst %.c,$(BUILD)/%.o,$(notdir $(CORE_SRCS) $(PLAT_SRCS)))
+HDRS := $(wildcard $(CORE)/*.h $(PLAT)/*.h ../*.h)
+
+.PHONY: all app objs push run log stop clean toolchain-check
+all: app
+app: $(APP)
+
+# Static, so it needs nothing on the device but a kernel.
+$(APP): $(APP_SRCS) $(HDRS) | $(BUILD)
+	@test -f $(LVLIB) || { echo "no ARM LVGL at $(LVLIB)"; \
+	  echo "build it once from the entrain n31 target"; exit 1; }
+	$(CC) $(CFLAGS) $(LV_CFLAGS) -static -Wl,--gc-sections \
+	      -o $@ $(APP_SRCS) $(LVLIB) $(TALIB) -lm -lpthread
+	@$(STRIP) $@
+	@ls -l $@
+
+objs: $(OBJS)
 	@echo "compiled $(words $(OBJS)) objects for cortex-a8"
 
 toolchain-check:
@@ -47,6 +79,29 @@ $(BUILD)/%.o: $(CORE)/%.c $(HDRS) | $(BUILD)
 
 $(BUILD)/%.o: $(PLAT)/%.c $(HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+# The key lives on a Windows-mounted path, which shows as 0777 under WSL, and
+# ssh refuses a world-readable private key. Stage a 0600 copy once.
+KEY := $(HOME)/.ssh/radioplus-n31-key
+
+$(KEY): $(SSH_KEY)
+	@mkdir -p $(dir $(KEY))
+	@cp $(SSH_KEY) $(KEY)
+	@chmod 600 $(KEY)
+
+SSH = ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i $(KEY)
+
+# dropbear on the device has no sftp-server, so scp cannot be used. Piping
+# through ssh needs nothing on the far side but a shell.
+push: $(APP) $(KEY)
+	@$(SSH) $(DEVICE) 'cat > /tmp/radioplus && chmod +x /tmp/radioplus' < $(APP)
+	@echo "pushed to $(DEVICE):/tmp/radioplus"
+
+stop: $(KEY)
+	-@$(SSH) $(DEVICE) 'for p in $$(ps | grep "[r]adioplus" | while read pid rest; do echo $$pid; done); do kill -9 $$p 2>/dev/null; done; sleep 1; true'
+
+run: stop push
+	@$(SSH) $(DEVICE) 'RADIOPLUS_HOME=/tmp/radioplus /tmp/radioplus 2>&1 | head -40'
 
 clean:
 	rm -rf $(BUILD)

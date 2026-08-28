@@ -256,7 +256,8 @@ en_tuner_err_t en_tuner_rds_enable(bool on)
     return attr_write("fm_rds", on ? "1\n" : "0\n");
 }
 
-int en_tuner_rds_poll(en_rds_t *r)
+int en_tuner_rds_poll(en_rds_t *r, uint16_t (*out)[4], uint8_t *out_valid,
+                      uint8_t out_max)
 {
     if (!r) return -1;
 
@@ -277,8 +278,16 @@ int en_tuner_rds_poll(en_rds_t *r)
     uint8_t valid[8];
     uint8_t n = en_rds_unpack_tuples_unverified(fifo, sizeof fifo, groups,
                                                 valid, 8);
-    for (uint8_t i = 0; i < n; i++)
+    for (uint8_t i = 0; i < n; i++) {
         en_rds_group(r, groups[i], valid[i]);
+
+        /* Copied out before decoding changes anything, so a recorder gets what
+           arrived rather than what was made of it. */
+        if (out && out_valid && i < out_max) {
+            for (uint8_t k = 0; k < 4; k++) out[i][k] = groups[i][k];
+            out_valid[i] = valid[i];
+        }
+    }
 
     /*
      * The driver decodes RDS too, and its answer is an independent check on

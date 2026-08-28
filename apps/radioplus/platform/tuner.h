@@ -68,7 +68,21 @@ en_tuner_err_t en_tuner_set_region(const en_region_t *rg);
    en_tuner_rds_poll() returns the number of groups fed, which is worth showing:
    groups arriving but nothing decoding is a different fault from no signal. */
 en_tuner_err_t en_tuner_rds_enable(bool on);
-int            en_tuner_rds_poll(en_rds_t *r);
+
+/*
+ * Drain whatever RDS has arrived into `r`, and optionally hand back the raw
+ * groups as well.
+ *
+ * `groups`, `valid` and `max` may be NULL/0 when the caller only wants the
+ * decoded state. A recorder wants the raw blocks too: they are what lets a
+ * recording be decoded again later by a better decoder, which matters while
+ * the FIFO framing is still unconfirmed.
+ *
+ * Returns the number of groups fed, which is worth showing on its own - groups
+ * arriving but nothing decoding is a different fault from no signal.
+ */
+int en_tuner_rds_poll(en_rds_t *r, uint16_t (*groups)[4], uint8_t *valid,
+                      uint8_t max);
 
 /*
  * Raw register access, for the advanced screens.
