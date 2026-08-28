@@ -1,0 +1,66 @@
+# The N31 launcher.
+#
+#   cd host && make -f Makefile.n31          build
+#   cd host && make -f Makefile.n31 push     send it to the device
+#   cd host && make -f Makefile.n31 run      push and run it
+#
+# LVGL is shared with the Entrain ARM build rather than rebuilt: same lv_conf,
+# and cross-compiling it again costs minutes and buys nothing.
+
+IPOD_ROOT ?= /mnt/c/src/ipod/artifacts/linux-n31
+TOOLCHAIN ?= $(IPOD_ROOT)/tinyalsa-build/arm-linux-musleabi-cross
+SSH_KEY   ?= $(IPOD_ROOT)/n31_id
+DEVICE    ?= root@192.168.7.2
+
+CC     := $(TOOLCHAIN)/bin/arm-linux-musleabi-gcc
+STRIP  := $(TOOLCHAIN)/bin/arm-linux-musleabi-strip
+BUILD  := build-n31
+LVGL   ?= ../../../lvgl
+LVLIB  ?= ../../entrain/host/build-n31/liblvgl_n31.a
+
+ARCH_FLAGS := -mcpu=cortex-a8 -mthumb -mfpu=vfpv3-d16 -mfloat-abi=softfp
+
+CFLAGS := -O2 -g0 -std=gnu99 $(ARCH_FLAGS) \
+          -ffunction-sections -fdata-sections \
+          -Wall -Wextra -Wshadow -Wno-unused-parameter
+
+LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_n31.h\" \
+             -I$(LVGL) -I$(LVGL)/src -I$(LVGL)/include -I$(LVGL)/.. -I..
+
+APP  := $(BUILD)/n31launcher
+SRCS := ../launcher.c ../ui.c ../apps.c ../fbcon.c
+HDRS := $(wildcard ../*.h)
+
+.PHONY: all push run stop clean
+all: $(APP)
+
+$(APP): $(SRCS) $(HDRS) | $(BUILD)
+	@test -f $(LVLIB) || { echo "no ARM LVGL at $(LVLIB)"; exit 1; }
+	$(CC) $(CFLAGS) $(LV_CFLAGS) -static -Wl,--gc-sections \
+	      -o $@ $(SRCS) $(LVLIB) -lm -lpthread
+	@$(STRIP) $@
+	@ls -l $@
+
+$(BUILD):
+	@mkdir -p $(BUILD)
+
+KEY := $(HOME)/.ssh/radioplus-n31-key
+$(KEY): $(SSH_KEY)
+	@mkdir -p $(dir $(KEY))
+	@cp $(SSH_KEY) $(KEY)
+	@chmod 600 $(KEY)
+
+SSH = ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i $(KEY)
+
+push: $(APP) $(KEY)
+	@$(SSH) $(DEVICE) 'cat > /tmp/n31launcher && chmod +x /tmp/n31launcher' < $(APP)
+	@echo "pushed $(DEVICE):/tmp/n31launcher"
+
+stop: $(KEY)
+	-@$(SSH) $(DEVICE) 'for p in $$(ps | grep "[n]31launcher" | while read pid rest; do echo $$pid; done); do kill -9 $$p 2>/dev/null; done; sleep 1; true'
+
+run: stop push
+	@$(SSH) $(DEVICE) '/tmp/n31launcher 2>&1 | head -20'
+
+clean:
+	rm -rf $(BUILD)

@@ -1,0 +1,27 @@
+# Headless preview of the launcher. See ../../radioplus/host/Makefile.preview -
+# same approach, same shared LVGL archive.
+
+CC     ?= cc
+BUILD  := build
+LVGL   ?= ../../../lvgl
+LVLIB  ?= ../../entrain/host/build/liblvgl_host.a
+
+LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_host.h\" \
+             -I$(LVGL) -I$(LVGL)/src -I$(LVGL)/include -I$(LVGL)/.. -I..
+
+CFLAGS := -O1 -g -std=gnu99 -Wall -Wextra -Wno-unused-parameter
+SRCS := preview.c ../ui.c ../apps.c
+
+.PHONY: shots clean
+shots: $(BUILD)/preview
+	@mkdir -p shots
+	@./$(BUILD)/preview shots
+	@python3 tobmp.py shots && rm -f shots/*.bmp
+	@ls shots/
+
+$(BUILD)/preview: $(SRCS) $(wildcard ../*.h)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(LV_CFLAGS) -o $@ $(SRCS) $(LVLIB) -lm -lpthread
+
+clean:
+	rm -rf $(BUILD) shots
