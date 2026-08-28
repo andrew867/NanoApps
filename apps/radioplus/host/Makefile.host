@@ -22,7 +22,7 @@ CFLAGS  += -fsanitize=address,undefined -fno-omit-frame-pointer
 LDFLAGS += -fsanitize=address,undefined
 endif
 
-SRCS := tests.c $(CORE)/fmcmd.c $(CORE)/fmreg.c
+SRCS := tests.c $(CORE)/fmcmd.c $(CORE)/fmreg.c $(CORE)/rds.c
 HDRS := $(wildcard $(CORE)/*.h)
 
 .PHONY: all test clean

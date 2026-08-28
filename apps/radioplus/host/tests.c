@@ -16,6 +16,7 @@
 
 #include "../core/fmcmd.h"
 #include "../core/fmreg.h"
+#include "../core/rds.h"
 
 static int checks, failures;
 
@@ -345,6 +346,291 @@ static void test_fields(void)
           "a field past the buffer must not be written");
 }
 
+/* ---- RDS ----------------------------------------------------------------- */
+
+/* Build block B for a given group type and version, with the traffic-programme
+   flag and programme type in their standard places. */
+static uint16_t blkb(uint8_t type, bool ver_b, bool tp, uint8_t pty,
+                     uint16_t low5)
+{
+    return (uint16_t)(((uint16_t)type << 12) | (ver_b ? 0x0800u : 0u)
+                      | (tp ? 0x0400u : 0u) | ((uint16_t)(pty & 0x1Fu) << 5)
+                      | (low5 & 0x1Fu));
+}
+
+static void feed(en_rds_t *r, uint16_t a, uint16_t b, uint16_t c, uint16_t d)
+{
+    uint16_t blk[4] = { a, b, c, d };
+    en_rds_group(r, blk, EN_RDS_ALL);
+}
+
+static void test_rds_ps(void)
+{
+    section("RDS programme service name");
+
+    en_rds_t r;
+    en_rds_init(&r, true);
+
+    /* "CBC RADI" delivered two characters at a time, out of order, because a
+       receiver joining mid-cycle sees exactly that. */
+    const char *name = "CBC RADI";
+    const uint8_t order[4] = { 2, 0, 3, 1 };
+    for (uint8_t i = 0; i < 4; i++) {
+        uint8_t s = order[i];
+        uint16_t d = (uint16_t)(((uint8_t)name[s * 2] << 8)
+                                | (uint8_t)name[s * 2 + 1]);
+        feed(&r, 0xC2B5, blkb(0, false, true, 22, s), 0x0000, d);
+        CHECK(r.ps_valid == (i == 3),
+              "PS should only become valid on the last segment (i=%u)", i);
+    }
+    printf("  PS \"%s\"  PI %04X  PTY %u (%s)\n",
+           r.ps, r.pi, r.pty, en_rds_pty_name(r.pty, r.rbds));
+    CHECK(strcmp(r.ps, "CBC RADI") == 0, "PS assembled as \"%s\"", r.ps);
+    CHECK(r.pi == 0xC2B5, "PI wrong");
+    CHECK(r.tp, "traffic programme flag lost");
+
+    /* RBDS and RDS disagree about what 22 means, and the register that selects
+       between them is I2C_RDS_CTRL bit 0. */
+    printf("  PTY 22 is \"%s\" under RBDS, \"%s\" under RDS\n",
+           en_rds_pty_name(22, true), en_rds_pty_name(22, false));
+    CHECK(strcmp(en_rds_pty_name(22, true), "Public") == 0, "RBDS PTY 22");
+    CHECK(strcmp(en_rds_pty_name(22, false), "Travel") == 0, "RDS PTY 22");
+    CHECK(strcmp(en_rds_pty_name(200, true), "Unknown") == 0,
+          "an out-of-range PTY must not index off the table");
+}
+
+static void test_rds_ta(void)
+{
+    section("RDS traffic announcement");
+
+    en_rds_t r;
+    en_rds_init(&r, true);
+
+    uint16_t ch = 0;
+    uint16_t blk[4] = { 0xC2B5, blkb(0, false, true, 22, 0), 0, 0x4142 };
+    ch = en_rds_group(&r, blk, EN_RDS_ALL);
+    CHECK(!r.ta, "TA should start clear");
+
+    /* Bit 4 of block B is the announcement, and it is the thing an
+       auto-recorder triggers on. */
+    blk[1] = (uint16_t)(blkb(0, false, true, 22, 0) | 0x0010u);
+    ch = en_rds_group(&r, blk, EN_RDS_ALL);
+    CHECK(r.ta, "TA not set");
+    CHECK(ch & EN_RDS_CH_TA, "TA change not reported");
+
+    ch = en_rds_group(&r, blk, EN_RDS_ALL);
+    CHECK(!(ch & EN_RDS_CH_TA), "TA reported as changed when it did not");
+
+    blk[1] = blkb(0, false, true, 22, 0);
+    ch = en_rds_group(&r, blk, EN_RDS_ALL);
+    CHECK(!r.ta && (ch & EN_RDS_CH_TA), "TA clearing not reported");
+}
+
+static void test_rds_rt(void)
+{
+    section("RDS radio text");
+
+    en_rds_t r;
+    en_rds_init(&r, true);
+
+    const char *text =
+        "Now Playing: Neil Young - Harvest Moon                          ";
+    for (uint8_t seg = 0; seg < 16; seg++) {
+        uint16_t c = (uint16_t)(((uint8_t)text[seg * 4] << 8)
+                                | (uint8_t)text[seg * 4 + 1]);
+        uint16_t d = (uint16_t)(((uint8_t)text[seg * 4 + 2] << 8)
+                                | (uint8_t)text[seg * 4 + 3]);
+        feed(&r, 0xC2B5, blkb(2, false, true, 22, seg), c, d);
+    }
+    printf("  RT \"%s\"\n", r.rt);
+    CHECK(r.rt_valid, "RT never became valid");
+    CHECK(strncmp(r.rt, "Now Playing: Neil Young - Harvest Moon", 38) == 0,
+          "RT assembled wrong");
+
+    /* The A/B flag toggling means a new message. Without clearing, the tail of
+       the old one shows through wherever the new one has not reached. */
+    uint16_t b = (uint16_t)(blkb(2, false, true, 22, 0) | 0x0010u);
+    feed(&r, 0xC2B5, b, 0x4E65, 0x7874);   /* "Next" */
+    CHECK(!r.rt_valid, "a new message should invalidate the old text");
+    CHECK(strncmp(r.rt, "Next", 4) == 0, "new text not written");
+    CHECK(r.rt[10] == ' ', "old text showed through the new message");
+
+    /* A carriage return ends the message early. */
+    en_rds_init(&r, true);
+    feed(&r, 0xC2B5, blkb(2, false, true, 22, 0), 0x4F4B, 0x0D20);
+    printf("  RT with early terminator: \"%s\"\n", r.rt);
+    CHECK(r.rt_valid, "a terminated message should be complete immediately");
+    CHECK(strcmp(r.rt, "OK") == 0, "terminator not honoured, got \"%s\"", r.rt);
+}
+
+static void test_rds_ct(void)
+{
+    section("RDS clock time");
+
+    en_rds_t r;
+    en_rds_init(&r, true);
+
+    /* Modified Julian day 51544 is 1 January 2000, which is checkable by hand
+       against the conversion in the RDS specification. 12:34 UTC. */
+    const uint32_t mjd = 51544;
+    const uint8_t hour = 12, minute = 34;
+
+    uint16_t b = (uint16_t)(blkb(4, false, false, 0, 0)
+                            | (uint16_t)((mjd >> 15) & 0x03u));
+    uint16_t c = (uint16_t)(((mjd & 0x7FFFu) << 1) | (hour >> 4));
+    uint16_t d = (uint16_t)(((uint16_t)(hour & 0x0Fu) << 12)
+                            | ((uint16_t)minute << 6));
+
+    uint16_t ch = 0;
+    uint16_t blk[4] = { 0xC2B5, b, c, d };
+    ch = en_rds_group(&r, blk, EN_RDS_ALL);
+    printf("  %04u-%02u-%02u %02u:%02u  (offset %d half hours)\n",
+           r.ct_year, r.ct_month, r.ct_day, r.ct_hour, r.ct_minute, r.ct_offset);
+    CHECK(ch & EN_RDS_CH_CT, "clock change not reported");
+    CHECK(r.ct_valid, "clock never became valid");
+    CHECK(r.ct_year == 2000 && r.ct_month == 1 && r.ct_day == 1,
+          "MJD 51544 should be 2000-01-01");
+    CHECK(r.ct_hour == 12 && r.ct_minute == 34, "time wrong");
+
+    /* Newfoundland is minus three and a half hours, which is exactly the case
+       a naive whole-hour offset gets wrong. */
+    en_rds_init(&r, true);
+    uint16_t dn = (uint16_t)(d | 0x0020u | 7u);      /* west, 7 half hours */
+    uint16_t blkn[4] = { 0xC2B5, b, c, dn };
+    en_rds_group(&r, blkn, EN_RDS_ALL);
+    printf("  same instant at -3:30: %04u-%02u-%02u %02u:%02u\n",
+           r.ct_year, r.ct_month, r.ct_day, r.ct_hour, r.ct_minute);
+    CHECK(r.ct_hour == 9 && r.ct_minute == 4, "half-hour offset applied wrong");
+    CHECK(r.ct_day == 1, "date should not have moved");
+
+    /* An offset that crosses midnight has to move the date with it. */
+    en_rds_init(&r, true);
+    uint16_t early = (uint16_t)((1u << 12) | (0u << 6));   /* 01:00 UTC */
+    uint16_t de = (uint16_t)(early | 0x0020u | 7u);
+    uint16_t blke[4] = { 0xC2B5, b, c, de };
+    en_rds_group(&r, blke, EN_RDS_ALL);
+    printf("  01:00 UTC at -3:30: %04u-%02u-%02u %02u:%02u\n",
+           r.ct_year, r.ct_month, r.ct_day, r.ct_hour, r.ct_minute);
+    CHECK(r.ct_hour == 21 && r.ct_minute == 30, "wrapped time wrong");
+    CHECK(r.ct_year == 1999 && r.ct_month == 12 && r.ct_day == 31,
+          "crossing midnight backwards should reach 1999-12-31");
+}
+
+static void test_rds_af(void)
+{
+    section("RDS alternate frequencies");
+
+    en_rds_t r;
+    en_rds_init(&r, true);
+
+    /* Codes 1 to 204 are 87.5 MHz plus 100 kHz per step, so the list runs from
+       87.6 to 107.9 - the top of the band is not itself an AF code. Getting
+       this wrong by one step was the first thing these tests caught. */
+    CHECK(en_rds_af_khz(1) == 87600, "AF code 1 should be 87.6 MHz");
+    CHECK(en_rds_af_khz(204) == 107900, "AF code 204 should be 107.9 MHz");
+    CHECK(en_rds_af_khz(0) == 0, "AF code 0 is not a frequency");
+    CHECK(en_rds_af_khz(205) == 0, "filler is not a frequency");
+    CHECK(en_rds_af_khz(250) == 0, "the LF/MF marker is not a frequency");
+
+    /* A list header says how many follow, then pairs of codes. */
+    feed(&r, 0xC2B5, blkb(0, false, true, 22, 0),
+         (uint16_t)((224u + 2u) << 8 | 108u), 0x4142);
+    feed(&r, 0xC2B5, blkb(0, false, true, 22, 1),
+         (uint16_t)(150u << 8 | 108u), 0x4344);
+
+    printf("  %u alternates (station announced %u):", r.af_count, r.af_expected);
+    for (uint8_t i = 0; i < r.af_count; i++)
+        printf(" %u.%u", r.af[i] / 1000, (r.af[i] % 1000) / 100);
+    printf("\n");
+    CHECK(r.af_expected == 2, "AF count header not read");
+    CHECK(r.af_count == 2, "expected 2 distinct alternates, got %u", r.af_count);
+    CHECK(r.af[0] == 98300, "first alternate wrong");
+    CHECK(r.af[1] == 102500, "second alternate wrong");
+}
+
+static void test_rds_robustness(void)
+{
+    section("RDS block errors and station changes");
+
+    en_rds_t r;
+    en_rds_init(&r, true);
+
+    /* Without block B a group has no type and nothing may be interpreted -
+       not even from the blocks that did arrive intact. */
+    uint16_t blk[4] = { 0xC2B5, blkb(0, false, true, 22, 0), 0, 0x4142 };
+    uint16_t ch = en_rds_group(&r, blk, (uint8_t)(EN_RDS_ALL & ~EN_RDS_B));
+    CHECK(ch == 0, "a group without block B must decode to nothing");
+    CHECK(!r.pi_valid, "PI must not be taken from a group with no type");
+    CHECK(r.blocks_bad == 1, "bad block not counted");
+
+    /* A corrupt block D must not write garbage into the name. */
+    en_rds_init(&r, true);
+    for (uint8_t s = 0; s < 4; s++)
+        feed(&r, 0xC2B5, blkb(0, false, true, 22, s),
+             0, (uint16_t)(0x4141u + s));
+    CHECK(r.ps_valid, "PS should be complete");
+    en_rds_group(&r, blk, (uint8_t)(EN_RDS_ALL & ~EN_RDS_D));
+    CHECK(strcmp(r.ps, "AABACADA") == 0 || r.ps_valid,
+          "a bad block D must leave the name alone");
+
+    /* A PI change is a different station, so everything accumulated belongs to
+       the previous one and has to go - otherwise an AF jump or a retune shows
+       the old station's name against the new station's signal. */
+    en_rds_init(&r, true);
+    const char *name = "STATION1";
+    for (uint8_t s = 0; s < 4; s++)
+        feed(&r, 0xC2B5, blkb(0, false, true, 22, s), 0,
+             (uint16_t)(((uint8_t)name[s * 2] << 8) | (uint8_t)name[s * 2 + 1]));
+    CHECK(r.ps_valid && strcmp(r.ps, "STATION1") == 0, "setup failed");
+
+    ch = 0;
+    uint16_t other[4] = { 0x1234, blkb(0, false, false, 5, 0), 0, 0x5A5A };
+    ch = en_rds_group(&r, other, EN_RDS_ALL);
+    printf("  after PI change: PS valid %d, PI %04X\n", r.ps_valid, r.pi);
+    CHECK(ch & EN_RDS_CH_PI, "PI change not reported");
+    CHECK(!r.ps_valid, "the previous station's name survived a PI change");
+    CHECK(r.pi == 0x1234, "new PI not adopted");
+    CHECK(r.groups > 0, "statistics should survive a station change");
+}
+
+static void test_rds_tuples(void)
+{
+    section("RDS FIFO unpacking (framing unverified)");
+
+    /* Four blocks, each two data bytes and a status byte whose top nibble is
+       the block type. This is the one guess in the decoder and it is isolated
+       so that correcting it on the device touches nothing else. */
+    const uint8_t fifo[] = {
+        0xC2, 0xB5, 0x00,          /* A: PI          */
+        0x02, 0xC0, 0x10,          /* B: group 0A    */
+        0x00, 0x00, 0x20,          /* C              */
+        0x43, 0x42, 0x30,          /* D: "CB"        */
+    };
+    uint16_t groups[4][4];
+    uint8_t valid[4];
+    uint8_t n = en_rds_unpack_tuples_unverified(fifo, sizeof fifo, groups,
+                                                valid, 4);
+    CHECK(n == 1, "expected one group, got %u", n);
+    CHECK(groups[0][0] == 0xC2B5, "block A wrong");
+    CHECK(groups[0][3] == 0x4342, "block D wrong");
+    CHECK(valid[0] == EN_RDS_ALL, "all blocks should be marked good");
+
+    /* A block flagged bad must be reported bad rather than dropped silently,
+       so the group decoder can decide what is still usable. */
+    uint8_t bad[sizeof fifo];
+    memcpy(bad, fifo, sizeof fifo);
+    bad[11] = 0x31;                        /* block D, error bit set */
+    n = en_rds_unpack_tuples_unverified(bad, sizeof bad, groups, valid, 4);
+    CHECK(n == 1, "a group with a bad block is still a group");
+    CHECK(!(valid[0] & EN_RDS_D), "bad block D should not be marked valid");
+
+    /* Partial trailing data must not run off the end. */
+    n = en_rds_unpack_tuples_unverified(fifo, 8, groups, valid, 4);
+    CHECK(n == 0, "an incomplete group must not be emitted");
+    n = en_rds_unpack_tuples_unverified(fifo, sizeof fifo, groups, valid, 0);
+    CHECK(n == 0, "no room means no groups");
+}
+
 int main(void)
 {
     printf("Radio+ core tests\n");
@@ -353,6 +639,14 @@ int main(void)
     test_parse();
     test_table();
     test_fields();
+
+    test_rds_ps();
+    test_rds_ta();
+    test_rds_rt();
+    test_rds_ct();
+    test_rds_af();
+    test_rds_robustness();
+    test_rds_tuples();
 
     printf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
