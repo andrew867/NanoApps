@@ -210,7 +210,7 @@ static uint8_t g_qn;
 
 static uint32_t g_head_start_ms;    /* when g_q[0] was first seen sounding */
 static uint32_t g_last_tick_ms;
-static uint64_t g_frames_out;
+static uint64_t g_frames_done;      /* frames of blocks that have FINISHED */
 
 static en_audio_pull_fn s_pull;
 static void            *s_pull_ctx;
@@ -219,6 +219,8 @@ static bool             s_source_done;
 static bool g_paused;
 static bool g_stopping;
 static uint32_t g_out_rate;         /* the mixer's rate, read off a live voice */
+static bool     g_duration_bad;     /* the OS disagreed; stop stating one */
+static uint8_t  g_overrun;          /* consecutive blocks that took too long */
 static bool g_quiet_armed;          /* the silence block is looping */
 static bool g_fade_in;              /* next block handed over ramps up */
 static int  g_volume = 45;
@@ -243,7 +245,7 @@ static uint32_t os_volume(void)
  * out and pads the difference with silence. */
 static uint32_t duration_ms(uint32_t frames)
 {
-    if (!g_out_rate || !frames) return 0;
+    if (g_duration_bad || !g_out_rate || !frames) return 0;
 
     uint32_t num = frames * 1000u;          /* 28224000 — no overflow */
     if (num % g_out_rate) return 0;         /* would not round-trip */
@@ -411,7 +413,9 @@ static void enqueue(int idx)
     g_slot[idx].state = SLOT_QUEUED;
     g_slot[idx].seen_playing = false;
     g_q[g_qn++] = (uint8_t)idx;
-    g_frames_out += g_slot[idx].frames;
+    /* Deliberately not counted towards elapsed here. Handing a block to the OS
+       is not the same as playing it, and counting it here made the clock jump a
+       block at a time and run ahead of the sound. */
 }
 
 /* Start a voice on a block. Only needed to get going, or to recover after the
@@ -591,7 +595,7 @@ bool en_audio_start_stream(uint32_t sample_rate, en_audio_pull_fn pull,
     s_pull = pull;
     s_pull_ctx = ctx;
     s_source_done = false;
-    g_frames_out = 0;
+    g_frames_done = 0;
     g_paused = false;
     g_stopping = false;
     g_fade_in = true;
@@ -709,8 +713,31 @@ void en_audio_tick(void)
         if (desc_playing(h)) { h->seen_playing = true; break; }
         if (!h->seen_playing) break;      /* queued, not reached yet */
 
+        /* How long the block took against how long its audio actually is.
+         *
+         * Stating a duration is the one thing here that depends on reading the
+         * OS correctly, and getting it wrong is expensive: too large and the
+         * voice pads with silence once the PCM runs out, which is a block of
+         * sound followed by a block of nothing. Rather than trust the reading,
+         * measure it. A block that takes half again as long as its own audio
+         * has been padded, and two in a row is not a stalled frame callback.
+         *
+         * Falling back to no duration at all costs a faint click per join and
+         * is what played correctly before any of this - much the better of the
+         * two failures to land on. */
+        if (!g_duration_bad && duration_ms(h->frames)) {
+            uint32_t expect = (h->frames * 1000u) / DEVICE_RATE;
+            uint32_t took = now - g_head_start_ms;
+            if (h->seen_playing && took > expect + expect / 2u) {
+                if (++g_overrun >= 2) g_duration_bad = true;
+            } else {
+                g_overrun = 0;
+            }
+        }
+
         h->state = SLOT_FREE;
         h->fill = 0;
+        g_frames_done += h->frames;       /* this one really has played */
         for (uint8_t i = 1; i < g_qn; i++) g_q[i - 1] = g_q[i];
         g_qn--;
         g_head_start_ms = now;
@@ -764,7 +791,17 @@ en_audio_state_t en_audio_state(void) { return g_state; }
 
 double en_audio_elapsed(void)
 {
-    return (double)g_frames_out / (double)DEVICE_RATE;
+    /* Blocks that have finished, plus however far into the sounding one the
+       wall clock says we are - capped at that block's length so a stall cannot
+       push the clock past audio that has not been played. */
+    uint64_t f = g_frames_done;
+
+    if (g_qn) {
+        uint32_t cap = g_slot[g_q[0]].frames;
+        uint32_t in = MS_FRAMES(hb_time_uptime_ms() - g_head_start_ms);
+        f += (in > cap) ? cap : in;
+    }
+    return (double)f / (double)DEVICE_RATE;
 }
 
 const char *en_audio_backend_name(void) { return "RetailOS sfx, chained PCM"; }

@@ -1269,6 +1269,18 @@ static void build_settings(void)
         "Tones are generated on the device. No health claims are made.",
         F_CAPTION, C_TEXT_MUTE, CONTENT_W);
     lv_obj_set_pos(about, MARGIN, y);
+    y += 30;
+
+    /* Which build is actually running.
+     *
+     * Installing a new version and hearing no change is ambiguous: it could be
+     * a fix that did not work, or the old executable still being loaded. The
+     * blob that gets staged hashes identical to the one that was built, so the
+     * doubt is all downstream of that - and it is not something a listener can
+     * resolve by ear. Reading it off the screen settles it in a second. */
+    lv_obj_t *stamp = make_label(s, "build " __DATE__ " " __TIME__,
+                                 F_CAPTION, C_TEXT_MUTE);
+    lv_obj_set_pos(stamp, MARGIN, y);
 
     lv_obj_t *hint = make_label(s, "swipe down for sleep timer",
                                 F_CAPTION, C_TEXT_MUTE);
