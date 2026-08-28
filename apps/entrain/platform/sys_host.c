@@ -85,6 +85,13 @@ bool en_sys_battery_charging(void)
     return false;
 }
 
+bool en_sys_has_system_volume(void)
+{
+    /* A bare Linux port has no system volume UI of its own, so the app's
+       slider is the only one there is. */
+    return false;
+}
+
 void en_sys_wake_lock(bool on)
 {
     /* Nothing to hold on Linux: there is no OS idle timer competing for the

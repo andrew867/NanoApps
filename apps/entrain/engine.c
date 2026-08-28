@@ -19,16 +19,6 @@
 /* Program fades. Long enough to be a fade rather than a switch. */
 #define EN_PROGRAM_FADE_S 2.0
 
-/* Crossfade tail on a looped buffer, in milliseconds.
- *
- * A join can only be timed to the UI tick, and a tone with a 16 ms hole in it
- * clicks. So a loop buffer carries this much extra past its wrap point,
- * repeating what the loop opens with and fading out, while the head fades in.
- * The gains are linear and sum to one — correct here because the two are the
- * same signal, not independent ones — so overlapping them cannot comb-filter
- * and a few milliseconds either way costs only a slight amplitude ripple. */
-#define EN_LOOP_XFADE_MS 60
-
 /* How long the live-tune gesture must be still before the re-render starts.
    Re-rendering on every pixel of a drag would thrash; waiting for the gesture
    to settle costs nothing because the old loop is still playing. */
@@ -192,20 +182,16 @@ static bool job_start(const en_segment_t *seg, bool loop, bool first,
     job_cancel();
     if (seg->frames == 0) return false;
 
-    /* A looped buffer is longer than its loop: the extra is the crossfade tail
-       that overlaps the next pass. */
-    uint32_t xfade = 0;
-    if (loop) {
-        xfade = (uint32_t)(((uint64_t)seg->sample_rate * EN_LOOP_XFADE_MS) / 1000u);
-        if (xfade > seg->frames / 4u) xfade = seg->frames / 4u;
-    }
-
-    E.job.buf = en_sys_alloc((seg->frames + xfade) * 4u);
+    /* The master buffer is the clean signal. Crossfading is the backend's job:
+       the device plays this out in short windows and shapes each join itself,
+       and the host streams it sample-exactly and needs no shaping at all.
+       Fading here as well would shape the loop head twice. */
+    E.job.buf = en_sys_alloc(seg->frames * 4u);
     if (!E.job.buf) return false;
 
     E.job.seg = *seg;
-    E.job.frames = seg->frames + xfade;
-    E.job.advance = loop ? seg->frames : 0;
+    E.job.frames = seg->frames;
+    E.job.advance = 0;
     E.job.done = 0;
     E.job.rate = seg->sample_rate;
     E.job.loop = loop;
@@ -221,24 +207,6 @@ static bool job_start(const en_segment_t *seg, bool loop, bool first,
            to be quick, not smooth. */
         en_render_init(&E.rnd, seg->sample_rate, seg->noise, 1);
         en_render_loop(&E.rnd, seg, E.job.buf);
-
-        /* Append the crossfade tail. The loop is periodic, so what follows its
-           last sample is its own first sample — copy the head past the end,
-           fading it down while fading the head up. Read each frame before
-           writing either copy, since the source is the head itself. */
-        uint32_t n = seg->frames;
-        uint32_t x = E.job.frames - n;
-        for (uint32_t i = 0; i < x; i++) {
-            int32_t l = E.job.buf[2 * i + 0];
-            int32_t r = E.job.buf[2 * i + 1];
-            /* out = 1 - i/x, in = i/x; they sum to exactly one */
-            int32_t gi = (int32_t)((i * 4096u) / x);        /* 0 .. 4096 */
-            int32_t go = 4096 - gi;
-            E.job.buf[2 * (n + i) + 0] = (int16_t)((l * go) >> 12);
-            E.job.buf[2 * (n + i) + 1] = (int16_t)((r * go) >> 12);
-            E.job.buf[2 * i + 0]       = (int16_t)((l * gi) >> 12);
-            E.job.buf[2 * i + 1]       = (int16_t)((r * gi) >> 12);
-        }
         E.job.done = E.job.frames;
     }
     return true;
@@ -668,6 +636,11 @@ void en_engine_live_adjust(double d_beat, double d_carrier)
 
 void en_engine_live_reset(void)
 {
+    /* Only a preset has a baseline to return to. Reached from a program, the
+       base fields are zero and resetting to them would drop the beat to the
+       0.5 Hz clamp — which looked exactly like the reset "not working". */
+    if (E.base_beat <= 0.0 || E.base_carrier <= 0.0) return;
+
     E.live_beat = E.base_beat;
     E.live_carrier = E.base_carrier;
     en_loop_plan_t p;

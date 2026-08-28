@@ -311,6 +311,9 @@ static void wake_screen(void)
     if (s_blanked) {
         s_blanked = false;
         en_sys_backlight(100);
+        /* Take the idle-clock lock back now that the screen is meant to be
+           lit, so the OS does not dim it under a running program. */
+        en_sys_wake_lock(true);
     }
 }
 
@@ -327,6 +330,10 @@ static void blank_tick(void)
     uint32_t idle = (en_sys_millis() - s_last_touch_ms) / 1000u;
     if (!s_blanked && idle >= (uint32_t)P.blank_delay_s) {
         s_blanked = true;
+        /* Drop the wake lock FIRST. While it is held the OS idle clock keeps
+           being reset, and the backlight we just turned off comes straight
+           back on — which is exactly what the screen was seen doing. */
+        en_sys_wake_lock(false);
         en_sys_backlight(0);
     }
 }
@@ -882,12 +889,17 @@ static void on_tune_press(lv_event_t *e)
     lv_indev_get_point(in, &s_drag_last);
     s_dragging = true;
 
+    /* Double tap resets. 350 ms was too tight to hit reliably, and a tap that
+       moves even slightly still counts, so compare against the last press
+       regardless of what happened in between. */
     uint32_t now = en_sys_millis();
-    if (now - s_last_tap_ms < 350) {
-        en_engine_live_reset();     /* double tap resets to the preset */
+    if (s_last_tap_ms && now - s_last_tap_ms < 500) {
+        en_engine_live_reset();
         s_dragging = false;
+        s_last_tap_ms = 0;          /* a triple tap is not two resets */
+    } else {
+        s_last_tap_ms = now;
     }
-    s_last_tap_ms = now;
 }
 
 static void on_tune_move(lv_event_t *e)
@@ -1185,6 +1197,12 @@ static void build_settings(void)
 
     int y = 58;
 
+    /* Where the platform owns volume — RetailOS has hardware buttons and its
+       own HUD — a second slider in here is just something to get out of sync
+       with the real one, so it is not built at all. */
+    const bool own_volume = !en_sys_has_system_volume();
+
+    if (own_volume) {
     lv_obj_t *vrow = setting_row(s, y, "Volume", "Starts moderate on purpose");
     s_vol_lbl = make_label(vrow, "", F_CAPTION, C_TEXT_DIM);
     lv_obj_set_style_text_align(s_vol_lbl, LV_TEXT_ALIGN_RIGHT, 0);
@@ -1206,6 +1224,13 @@ static void build_settings(void)
     lv_obj_set_style_pad_all(s_vol_slider, 9, LV_PART_KNOB);
     lv_obj_set_ext_click_area(s_vol_slider, 18);
     y += 34;
+    } else {
+        lv_obj_t *vnote = make_para(s,
+            "Volume is the iPod's own: use the buttons on the side.",
+            F_CAPTION, C_TEXT_MUTE, CONTENT_W);
+        lv_obj_set_pos(vnote, MARGIN, y);
+        y += 40;
+    }
 
     lv_obj_t *brow = setting_row(s, y, "Blank screen after", NULL);
     lv_obj_add_flag(brow, LV_OBJ_FLAG_CLICKABLE);
@@ -1256,6 +1281,8 @@ static void refresh_settings(void)
     str_cat(buf, "%", sizeof buf);
     if (s_vol_lbl) lv_label_set_text(s_vol_lbl, buf);
     if (s_vol_slider) lv_slider_set_value(s_vol_slider, P.volume, LV_ANIM_OFF);
+    /* s_vol_slider is absent where the platform owns volume; every use of it
+       here is guarded for exactly that reason. */
 
     if (s_blank_lbl) {
         if (P.blank_delay_s == 0) {

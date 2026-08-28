@@ -40,7 +40,17 @@ bool en_sys_battery_charging(void)
 
 void en_sys_wake_lock(bool on)
 {
+    /* This is what kept relighting the screen. The lock resets the OS idle
+       clock roughly every ten seconds, so with it held the backlight came
+       straight back on after the app blanked it. The UI now drops the lock
+       when it blanks and takes it again when it wakes. */
     hb_wake_lock(on);
+}
+
+bool en_sys_has_system_volume(void)
+{
+    /* RetailOS owns volume: hardware buttons and its own HUD. */
+    return true;
 }
 
 void en_sys_backlight(int percent)

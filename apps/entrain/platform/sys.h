@@ -20,6 +20,12 @@ bool en_sys_battery_charging(void);
    which would be wrong in the middle of a 45-minute program. */
 void en_sys_wake_lock(bool on);
 
+/* True when the platform has its own volume control that the user already
+   knows about — RetailOS has hardware volume buttons and an on-screen HUD, so
+   a second slider inside the app is just a second thing to get out of sync.
+   A bare Linux port has no such thing and needs ours. */
+bool en_sys_has_system_volume(void);
+
 /* Backlight only, 0..100. Zero means the backlight is off but the compositor
    keeps running — which matters more than it looks: on the device, stopping
    the render loop can take the audio subsystem down with it (AUDIO_NOTES.md),

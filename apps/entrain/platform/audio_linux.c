@@ -48,6 +48,9 @@ static int             s_thread_running;
 static int             s_quit;
 
 static struct pcm *s_pcm;
+static struct mixer     *s_mixer;
+static struct mixer_ctl *s_vol_ctl;
+static int               s_mixer_tried;
 static int         s_null_sink;      /* forced, or fell back after a failure */
 static int         s_card = EN_DEFAULT_CARD;
 static int         s_device = EN_DEFAULT_DEVICE;
@@ -78,6 +81,77 @@ void en_audio_linux_set_device(int card, int device)
 void en_audio_linux_force_null(int on)
 {
     s_null_sink = on ? 1 : 0;
+}
+
+/* ---- hardware volume ------------------------------------------------------
+ *
+ * Scaling the samples in software works, but it throws away bits and it leaves
+ * the codec's own gain wherever it happened to be. The card has a real volume
+ * control — the same one tinymix drives — so use it, and keep the software
+ * gain only for the fade ramps, where it belongs.
+ *
+ * The control is found by name rather than hardcoded: this codec is a cs42l81
+ * but the driver is still being worked on, and a name that is right today may
+ * not be tomorrow. Anything that is an integer control with "volume" in its
+ * name will do, preferring the ones that sound like a master output. */
+static int name_has(const char *hay, const char *needle)
+{
+    for (const char *h = hay; *h; h++) {
+        const char *a = h, *b = needle;
+        while (*a && *b) {
+            char ca = *a, cb = *b;
+            if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+            if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+            if (ca != cb) break;
+            a++; b++;
+        }
+        if (!*b) return 1;
+    }
+    return 0;
+}
+
+static void mixer_find_volume(void)
+{
+    if (s_mixer_tried) return;
+    s_mixer_tried = 1;
+
+    s_mixer = mixer_open((unsigned)s_card);
+    if (!s_mixer) return;
+
+    unsigned n = mixer_get_num_ctls(s_mixer);
+    int best_score = 0;
+
+    for (unsigned i = 0; i < n; i++) {
+        struct mixer_ctl *c = mixer_get_ctl(s_mixer, i);
+        if (!c) continue;
+        if (mixer_ctl_get_type(c) != MIXER_CTL_TYPE_INT) continue;
+
+        const char *nm = mixer_ctl_get_name(c);
+        if (!nm || !name_has(nm, "volume")) continue;
+
+        /* Prefer a master/output control over, say, a mic gain that also has
+           "volume" in its name. */
+        int score = 1;
+        if (name_has(nm, "master"))   score += 4;
+        if (name_has(nm, "playback")) score += 3;
+        if (name_has(nm, "output"))   score += 2;
+        if (name_has(nm, "hp") || name_has(nm, "headphone")) score += 2;
+        if (name_has(nm, "capture") || name_has(nm, "mic")) score -= 8;
+
+        if (score > best_score) {
+            best_score = score;
+            s_vol_ctl = c;
+        }
+    }
+}
+
+static void mixer_apply_volume(int percent)
+{
+    mixer_find_volume();
+    if (!s_vol_ctl) return;
+    unsigned values = mixer_ctl_get_num_values(s_vol_ctl);
+    for (unsigned i = 0; i < values; i++)
+        mixer_ctl_set_percent(s_vol_ctl, i, percent);
 }
 
 static uint64_t now_ns(void)
@@ -370,8 +444,13 @@ void en_audio_set_volume(int percent)
 {
     if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
+
+    /* Drive the card's own control if there is one; otherwise the software
+       gain in pull() carries it. */
+    mixer_apply_volume(percent);
+
     pthread_mutex_lock(&s_lock);
-    s_volume = percent;
+    s_volume = s_vol_ctl ? 100 : percent;   /* no double attenuation */
     pthread_mutex_unlock(&s_lock);
 }
 
@@ -392,6 +471,15 @@ double en_audio_elapsed(void)
 
 const char *en_audio_backend_name(void)
 {
-    return s_null_sink ? "tinyalsa (null sink - no PCM device)"
-                       : "tinyalsa streaming";
+    if (s_null_sink) return "tinyalsa (null sink - no PCM device)";
+    return s_vol_ctl ? "tinyalsa streaming, hardware volume"
+                     : "tinyalsa streaming, software volume";
+}
+
+/* Which mixer control the volume ended up on, for the About screen and for
+   working out why a device is silent. NULL if none was found. */
+const char *en_audio_linux_volume_control(void)
+{
+    mixer_find_volume();
+    return s_vol_ctl ? mixer_ctl_get_name(s_vol_ctl) : (const char *)0;
 }
