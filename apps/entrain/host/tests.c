@@ -489,151 +489,53 @@ static void test_crossfade_combs(void)
     free(pcm);
 }
 
-/* The replacement: cut each block where both channels are crossing zero, and
-   butt-join. A late start is then a gap of silence between two near-zero
-   samples, and an early start sums two near-zero samples. Neither is a step,
-   and neither sums two full-scale copies of anything. */
-static void test_zero_cut(void)
+/* The block length has to survive a round trip through milliseconds.
+ *
+ * The OS is told how long each block is in milliseconds (descriptor+0x34) and
+ * converts it back with ms * rate / 1000 in integer arithmetic, to get the
+ * voice's remaining-sample count. If that does not land on exactly the number
+ * of frames we rendered, the chain transition miscounts by the difference and
+ * clicks once per block - which is what it did.
+ *
+ * 22050/1000 is 441/20, so the round trip is lossless only for multiples of
+ * 441 frames. These are the shipped numbers from audio_device.c. */
+static void test_block_duration(void)
 {
-    section("zero-crossing cut");
+    section("block length converts to milliseconds and back exactly");
 
-    const uint32_t sr = 22050;
-    const uint32_t block = (sr * 1200u) / 1000u;   /* BLOCK_MS  */
-    const uint32_t cap   = block + (sr * 800u) / 1000u;  /* + SLACK_MS */
+    const uint32_t rate = 22050;
+    const uint32_t block_ms = 1200;          /* BLOCK_MS */
+    const uint32_t quiet_ms = 240;           /* QUIET_MS */
 
-    int16_t *pcm = malloc((size_t)cap * 2 * sizeof *pcm);
-    join_signal(pcm, cap, sr);
+    const uint32_t cases[] = { block_ms, quiet_ms };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        uint32_t frames = (rate * cases[i]) / 1000u;
 
-    int peak = peak_abs(pcm, cap);
-    uint32_t cut = en_zero_cut(pcm, block, cap);
+        CHECK(frames % 441u == 0,
+              "%u ms is %u frames, not a multiple of 441",
+              cases[i], frames);
 
-    CHECK(cut > block && cut < cap, "cut %u outside the search range", cut);
+        /* What the app puts in descriptor+0x34... */
+        uint32_t ms = (frames / 441u) * 20u;
+        /* ...and what the OS makes of it. */
+        uint32_t back = (ms * rate) / 1000u;
 
-    /* The two samples straddling the boundary, both channels. These are the
-       whole point: they are what a gap steps to and from. */
-    int worst = 0;
-    for (uint32_t k = cut - 1; k <= cut; k++)
-        for (int ch = 0; ch < 2; ch++) {
-            int v = pcm[2 * k + ch];
-            if (v < 0) v = -v;
-            if (v > worst) worst = v;
-        }
-    printf("  peak %d, cut at frame %u (%.3f s), boundary samples <= %d\n",
-           peak, cut, (double)cut / sr, worst);
-    int pct = peak ? (worst * 100) / peak : 0;
-    printf("  boundary excursion %d%% of peak\n", pct);
-
-    /* The floor is the sample grid, not the search. One sample at 200 Hz into
-       22050 Hz is 3.3 degrees of phase, so the nearest sample to a crossing sits
-       up to half that off zero - about 3% of peak - and both channels have to
-       manage it at once. Anything near that is as good as it gets. */
-    CHECK(pct <= 4, "cut is not on a zero crossing: %d%% of peak", pct);
-
-    /* Against the alternative: a fixed length, which is what butt-joining
-       without the search would do. */
-    int naive = 0;
-    for (uint32_t k = block - 1; k <= block; k++)
-        for (int ch = 0; ch < 2; ch++) {
-            int v = pcm[2 * k + ch];
-            if (v < 0) v = -v;
-            if (v > naive) naive = v;
-        }
-    printf("  a fixed-length cut would have stepped %d%% of peak\n",
-           peak ? (naive * 100) / peak : 0);
-
-    /* Why the backend biases late rather than trying to hit the boundary
-       exactly. Arriving EARLY overlaps this block's last d frames with the next
-       block's first d, and both are full-scale that far from the boundary - so
-       they comb, and they clip. No cut point can help, because the damage is
-       not at the boundary. */
-    for (uint32_t early_ms = 2; early_ms <= 8; early_ms += 3) {
-        uint32_t d = (sr * early_ms) / 1000u;
-        int over = 0;
-        for (uint32_t i = 0; i < d && cut + i < cap; i++)
-            for (int ch = 0; ch < 2; ch++) {
-                int v = pcm[2 * (cut - d + i) + ch] + pcm[2 * (cut + i) + ch];
-                if (v < 0) v = -v;
-                if (v > over) over = v;
-            }
-        printf("  %u ms EARLY would peak at %d%% of peak\n",
-               early_ms, peak ? (over * 100) / peak : 0);
+        printf("  %4u ms -> %6u frames -> %4u ms -> %6u samples\n",
+               cases[i], frames, ms, back);
+        CHECK(ms == cases[i], "%u ms round-tripped to %u", cases[i], ms);
+        CHECK(back == frames,
+              "%u ms converts to %u samples, not the %u rendered",
+              ms, back, frames);
     }
 
-    /* Late is the case the backend actually produces, and all it costs is a gap
-       of silence between two samples the cut has already put on a crossing. The
-       step at each end is what was measured above, whatever the gap length -
-       which is why the gap only has to be short, not zero.
-
-       JOIN_BIAS_MS plus the spin residual is two to three milliseconds. At the
-       carrier that is well under a cycle. */
-    printf("  2-3 ms LATE: %d%% step at each end, %.1f cycles of carrier lost\n",
-           pct, 0.0025 * 200.0);
-    CHECK(pct <= 4, "a late join still steps %d%% of peak", pct);
-
-    free(pcm);
-}
-
-/* The cut has to work for every mode and every beat on offer, not just the one
-   convenient case above. The slack was sized for the slowest beat, so check the
-   extremes. */
-static void test_zero_cut_range(void)
-{
-    section("zero-crossing cut across the range");
-
-    const uint32_t sr = 22050;
-    const uint32_t block = (sr * 1200u) / 1000u;
-    const uint32_t cap   = block + (sr * 800u) / 1000u;
-    int16_t *pcm = malloc((size_t)cap * 2 * sizeof *pcm);
-
-    static const struct { en_mode_t mode; double carrier, beat; } cases[] = {
-        { EN_MODE_BINAURAL,   100.0,  0.5 },   /* slowest beat on offer */
-        { EN_MODE_BINAURAL,   200.0,  7.83 },  /* Schumann */
-        { EN_MODE_BINAURAL,   440.0, 40.0 },   /* fastest */
-        { EN_MODE_ISOCHRONIC, 200.0, 10.0 },
-        { EN_MODE_MONAURAL,   180.0,  6.0 },
-    };
-
-    for (size_t c = 0; c < sizeof cases / sizeof cases[0]; c++) {
-        en_render_t r;
-        en_render_init(&r, sr, EN_NOISE_NONE, 1);
-        en_segment_t seg;
-        memset(&seg, 0, sizeof seg);
-        seg.sample_rate = sr;
-        seg.mode = cases[c].mode;
-        seg.noise = EN_NOISE_NONE;
-        seg.frames = cap;
-        seg.start.carrier_hz = cases[c].carrier;
-        seg.start.beat_hz = cases[c].beat;
-        seg.start.tone_level = 0.8;
-        seg.end = seg.start;
-        en_render_segment(&r, &seg, pcm);
-
-        int peak = peak_abs(pcm, cap);
-        uint32_t cut = en_zero_cut(pcm, block, cap);
-
-        int worst = 0;
-        for (uint32_t k = cut - 1; k <= cut; k++)
-            for (int ch = 0; ch < 2; ch++) {
-                int v = pcm[2 * k + ch];
-                if (v < 0) v = -v;
-                if (v > worst) worst = v;
-            }
-        int pct = peak ? (worst * 100) / peak : 0;
-        printf("  %-11s carrier %5.1f beat %5.2f -> cut %.3f s, %d%% of peak\n",
-               en_mode_name(cases[c].mode), cases[c].carrier, cases[c].beat,
-               (double)cut / sr, pct);
-        /* Scaled to the sample grid: half a sample of phase at this carrier is
-           the best any search could do, and both channels have to hit it
-           together. 440 Hz into 22050 Hz is 7 degrees a sample, so the floor
-           there is around 6%. */
-        int floor_pct = (int)(100.0 * 3.14159265358979 * cases[c].carrier / sr);
-        if (floor_pct < 2) floor_pct = 2;
-        CHECK(pct <= floor_pct + 3,
-              "%s carrier %.0f cuts %d%% off zero (floor about %d%%)",
-              en_mode_name(cases[c].mode), cases[c].carrier, pct, floor_pct);
-    }
-
-    free(pcm);
+    /* And the failure that was actually shipping: an arbitrary length, such as
+       the zero-crossing search used to pick, does not round trip. */
+    uint32_t odd = 27563;                    /* a real cut from the old code */
+    uint32_t odd_ms = (odd * 1000u) / rate;
+    uint32_t odd_back = (odd_ms * rate) / 1000u;
+    printf("  an unaligned %u frames -> %u ms -> %u samples (%d out)\n",
+           odd, odd_ms, odd_back, (int)odd_back - (int)odd);
+    CHECK(odd_back != odd, "expected the unaligned case to lose samples");
 }
 
 /* ---- 6. phase continuity across a glide --------------------------------- */
@@ -908,8 +810,7 @@ int main(void)
     test_loop_seams();
     test_noise_bed();
     test_crossfade_combs();
-    test_zero_cut();
-    test_zero_cut_range();
+    test_block_duration();
     test_glide();
     test_levels();
     test_wav_header();

@@ -46,12 +46,21 @@
  * half a carrier period of misalignment, 2.5 ms, cancels the carrier outright.
  * No crossfade length fixes that, because the crossfade IS the defect.
  *
- * Blocks are still cut on a zero crossing (en_zero_cut) even though a chained
- * join is sample-exact and does not need it. It costs a few milliseconds of
- * render, and it is what makes the fallback safe: if the chain is ever broken —
- * the OS puts another app in front and stops running us for longer than the
- * audio we had queued — the restart is a fresh play(), and that join is only as
- * good as wherever the previous block happened to stop.
+ * One field has to be right for any of this to work, and it is not obvious.
+ * descriptor+0x34 is the block's length in MILLISECONDS, and setSource turns it
+ * into the voice's remaining-sample counter at voice+0x48. The constructor
+ * leaves it zero and voice::start never touches it, so leaving it alone means
+ * the counter is zero — and then the exhaustion path computes the shortfall to
+ * carry into the next buffer as `samples_wanted - 0`, the whole mixer pass
+ * rather than the true remainder. The mixer re-enters at 0x86312e0 with that as
+ * its new target, so every transition emitted a pass worth of samples too many.
+ * A few samples out, once per block, heard as a faint click about once a
+ * second.
+ *
+ * So the duration is set, and it has to convert back exactly: the OS computes
+ * ms * rate / 1000 in integers, and 22050/1000 is 441/20, so a block only
+ * survives the round trip if it is a whole number of milliseconds — a multiple
+ * of 441 frames. Block lengths are therefore fixed multiples of 441.
  *
  * Pause and stop do not wait for a block boundary. The voice reads our buffer
  * live, which is what makes the completion flag meaningful, and it cuts both
@@ -89,6 +98,7 @@
 #define SFX_OFF_CHANNELS 0x18
 #define SFX_OFF_BITS     0x1C
 #define SFX_OFF_VOLUME   0x24
+#define SFX_OFF_DURATION 0x34   /* MILLISECONDS -> voice+0x48 sample count */
 #define SFX_OFF_TRIM_LO  0x38
 #define SFX_OFF_TRIM_HI  0x3C
 #define SFX_OFF_VOICE    0x48   /* setSource writes the voice here */
@@ -103,15 +113,16 @@
    of 44.1k for carriers that never go above a few hundred hertz. */
 #define DEVICE_RATE 22050u
 
-/* Block length. With the chain doing the joining this is no longer an audio
+/* A whole number of milliseconds, and a multiple of 20 so that the frame count
+   is a multiple of 441 and the OS's ms * rate / 1000 converts back to exactly
+   the length we rendered. See the header: getting this wrong is a click at
+   every boundary.
+
+   With the chain doing the joining, the value itself is no longer an audio
    quality knob at all — it is the app's worst-case response time to a retune or
    a preset change, and how much rendering has to fit between one block being
-   linked and the voice reaching it. Short enough to feel immediate. */
+   linked and the voice reaching it. */
 #define BLOCK_MS 1200
-
-/* Search room for the zero crossing. Only matters once the chain has been
-   broken and a restart has to butt-join; see the header. */
-#define SLACK_MS 800
 
 /* Blocks in the ring. Two would be enough never to leave the chain empty — one
    sounding, one queued behind it — and the third is slack for a frame that runs
@@ -134,14 +145,13 @@
 #define FADE_MS 80
 
 /* The block chained to itself while paused, purely to keep the voice chain and
-   the DAC alive so resuming is a ramp and not a cold start. */
-#define QUIET_MS 250
+   the DAC alive so resuming is a ramp and not a cold start. A multiple of 20 ms
+   for the same reason as BLOCK_MS. */
+#define QUIET_MS 240
 
 #define MS_FRAMES(ms) ((DEVICE_RATE * (uint32_t)(ms)) / 1000u)
 
 #define BLOCK_FRAMES  MS_FRAMES(BLOCK_MS)
-#define SLACK_FRAMES  MS_FRAMES(SLACK_MS)
-#define CAP_FRAMES    (BLOCK_FRAMES + SLACK_FRAMES)
 #define SAFETY_FRAMES MS_FRAMES(SAFETY_MS)
 #define FADE_FRAMES   MS_FRAMES(FADE_MS)
 #define QUIET_FRAMES  MS_FRAMES(QUIET_MS)
@@ -152,15 +162,14 @@
    so start clean rather than carrying on from stale state. */
 #define STARVED_MS (BLOCK_MS * SLOTS * 3)
 
+/* Exact for any multiple of 441 frames, which every block is by construction:
+   22050/1000 = 441/20, so frames/441*20 is the length in whole milliseconds. */
+#define FRAMES_MS(f) (((f) / 441u) * 20u)
+
 typedef void *(*sfx_ctor_t)(void *self);
 typedef void *(*sfx_player_inst_t)(void);
 typedef void  (*sfx_player_play_t)(void *player, void *desc,
                                    void *cb, void *cbdata);
-
-/* Stages of building a block. See build_step(). */
-#define BUILD_BODY 0        /* rendering the body, committed as it goes */
-#define BUILD_PEEK 1        /* rendering the slack to choose the cut */
-#define BUILD_TAIL 2        /* committing the tail the cut chose */
 
 /* Slot states. */
 #define SLOT_FREE   0       /* nothing in it; may be rendered into */
@@ -171,9 +180,8 @@ typedef void  (*sfx_player_play_t)(void *player, void *desc,
 typedef struct {
     uint8_t  desc[0x80];
     int16_t *pcm;
-    uint32_t frames;        /* committed length, chosen by en_zero_cut */
-    uint32_t fill;          /* how much of the body is rendered so far */
-    uint8_t  stage;
+    uint32_t frames;        /* always a multiple of 441 — see FRAMES_MS */
+    uint32_t fill;          /* how much is rendered so far */
     uint8_t  state;
     bool     seen_playing;  /* the OS has had it: its flag was seen set */
 } slot_t;
@@ -226,6 +234,11 @@ static void desc_build(slot_t *s)
     *(volatile uint32_t *)(d + SFX_OFF_BITS)     = 16;
     *(volatile uint32_t *)(d + SFX_OFF_TRIM_LO)  = 0;
     *(volatile uint32_t *)(d + SFX_OFF_TRIM_HI)  = 0;
+    /* The one the constructor leaves at zero. setSource turns it into the
+       voice's remaining-sample count, and the chain transition subtracts the
+       mixer pass from it to work out how much of that pass the NEXT buffer
+       owes. Zero here means every transition over-produces by a pass. */
+    *(volatile uint32_t *)(d + SFX_OFF_DURATION) = FRAMES_MS(s->frames);
     *(volatile uint32_t *)(d + SFX_OFF_VOLUME)   = os_volume();
     d[SFX_OFF_PLAYMODE] = 1;
     d[SFX_OFF_FLAGS] = 0;
@@ -266,7 +279,7 @@ static bool reserve(int16_t **pcm, uint32_t bytes)
 static bool buffers_ready(void)
 {
     for (int i = 0; i < SLOTS; i++)
-        if (!reserve(&g_slot[i].pcm, CAP_FRAMES * 4u)) return false;
+        if (!reserve(&g_slot[i].pcm, BLOCK_FRAMES * 4u)) return false;
 
     if (!reserve(&g_quiet.pcm, QUIET_FRAMES * 4u)) return false;
     for (uint32_t i = 0; i < QUIET_FRAMES * 2u; i++) g_quiet.pcm[i] = 0;
@@ -278,11 +291,9 @@ static bool buffers_ready(void)
 
 /* One slice of building a block. Returns true once it is ready to hand over.
  *
- * Only the slack is ever rendered twice, and only because the cut has to see it
- * before deciding how much of it to keep: peeking renders without moving the
- * source on, so committing afterwards re-renders the identical samples that
- * were measured. The body needs no such thing — it is kept whatever the cut
- * says — so it is committed as it goes. */
+ * Straight through now: the block is a fixed number of frames and the chain
+ * joins sample-exactly, so there is nothing to choose about where it ends and
+ * nothing has to be rendered twice. */
 static bool build_step(int idx)
 {
     slot_t *b = &g_slot[idx];
@@ -291,54 +302,28 @@ static bool build_step(int idx)
 
     b->state = SLOT_BUILD;
 
-    if (b->stage == BUILD_BODY) {
-        uint32_t want = BLOCK_FRAMES - b->fill;
-        if (want > CHUNK_FRAMES) want = CHUNK_FRAMES;
+    uint32_t want = BLOCK_FRAMES - b->fill;
+    if (want > CHUNK_FRAMES) want = CHUNK_FRAMES;
 
-        uint32_t got = s_pull(b->pcm + (uint32_t)b->fill * 2u, want, want,
-                              s_pull_ctx);
-        if (got == 0) {
-            /* The program ended part-way through. Whatever is already rendered
-               is real audio and gets played; there is simply nothing left to
-               cut against, so it stands as it is. */
-            s_source_done = true;
-            if (b->fill == 0) { b->state = SLOT_FREE; return false; }
-            b->frames = b->fill;
-            b->state = SLOT_READY;
-            return true;
-        }
-        b->fill += got;
-        if (b->fill >= BLOCK_FRAMES) b->stage = BUILD_PEEK;
-        return false;
-    }
-
-    if (b->stage == BUILD_PEEK) {
-        uint32_t got = s_pull(b->pcm + (uint32_t)BLOCK_FRAMES * 2u,
-                              SLACK_FRAMES, 0, s_pull_ctx);
-        if (got == 0) {
-            s_source_done = true;
-            b->frames = BLOCK_FRAMES;
-            b->stage = BUILD_BODY;
-            b->state = SLOT_READY;
-            return true;
-        }
-        uint32_t n = en_zero_cut(b->pcm, BLOCK_FRAMES, BLOCK_FRAMES + got);
-        if (n < BLOCK_FRAMES || n > BLOCK_FRAMES + got) n = BLOCK_FRAMES + got;
-        b->frames = n;
-        b->stage = BUILD_TAIL;
-        return false;
-    }
-
-    /* BUILD_TAIL: commit exactly as much of the slack as the cut kept. */
-    uint32_t tail = b->frames - BLOCK_FRAMES;
-    if (tail && s_pull(b->pcm + (uint32_t)BLOCK_FRAMES * 2u, tail, tail,
-                       s_pull_ctx) == 0) {
+    uint32_t got = s_pull(b->pcm + (uint32_t)b->fill * 2u, want, want,
+                          s_pull_ctx);
+    if (got == 0) {
+        /* The program ended part-way through. Whatever is already rendered is
+           real audio and gets played, rounded down to a whole number of
+           milliseconds so the duration still converts exactly. */
         s_source_done = true;
-        b->state = SLOT_FREE;
-        return false;
+        b->fill -= b->fill % 441u;
+        if (b->fill == 0) { b->state = SLOT_FREE; return false; }
+        b->frames = b->fill;
+        b->state = SLOT_READY;
+        return true;
     }
+
+    b->fill += got;
+    if (b->fill < BLOCK_FRAMES) return false;
+
+    b->frames = BLOCK_FRAMES;
     b->fill = 0;
-    b->stage = BUILD_BODY;
     b->state = SLOT_READY;
     return true;
 }
@@ -349,7 +334,6 @@ static bool build_step(int idx)
 static bool build_now(int idx)
 {
     g_slot[idx].fill = 0;
-    g_slot[idx].stage = BUILD_BODY;
     g_slot[idx].state = SLOT_FREE;
     for (int guard = 0; guard < 64; guard++)
         if (build_step(idx)) return true;
@@ -493,7 +477,6 @@ static void drop_queue(void)
     for (uint8_t i = 0; i < g_qn; i++) {
         slot_t *b = &g_slot[g_q[i]];
         b->state = SLOT_FREE;
-        b->stage = BUILD_BODY;
         b->fill = 0;
     }
     g_qn = 0;
@@ -547,7 +530,6 @@ bool en_audio_start_stream(uint32_t sample_rate, en_audio_pull_fn pull,
 
     for (int i = 0; i < SLOTS; i++) {
         g_slot[i].state = SLOT_FREE;
-        g_slot[i].stage = BUILD_BODY;
         g_slot[i].fill = 0;
     }
 
@@ -660,7 +642,6 @@ void en_audio_tick(void)
         if (!h->seen_playing) break;      /* queued, not reached yet */
 
         h->state = SLOT_FREE;
-        h->stage = BUILD_BODY;
         h->fill = 0;
         for (uint8_t i = 1; i < g_qn; i++) g_q[i - 1] = g_q[i];
         g_qn--;
@@ -696,8 +677,8 @@ void en_audio_tick(void)
             chain_slot(ready);
         } else {
             /* The chain ran dry — a very long stall, or the very first block.
-               A fresh voice has to be started, and that join is the one the
-               zero-crossing cut exists for. */
+               A fresh voice has to be started, and that join is covered by the
+               fade-in rather than by anything clever. */
             release_quiet();
             play_slot(ready);
         }

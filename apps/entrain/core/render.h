@@ -78,39 +78,6 @@ void en_render_segment(en_render_t *r, const en_segment_t *seg, int16_t *out);
    where the loop started, so calling it twice gives identical bytes. */
 void en_render_loop(en_render_t *r, const en_segment_t *seg, int16_t *out);
 
-/* Choose where to cut a rendered block so the join to the next one is silent.
- *
- * Successive blocks are already phase-continuous - the renderer carries its
- * accumulators - but they are handed to the sound hardware as separate buffers,
- * and nothing guarantees the second starts on the exact sample the first ended.
- * A late start leaves a gap, an early one overlaps.
- *
- * Both are harmless if the boundary sits on a zero crossing in BOTH channels: a
- * gap is then silence between two near-zero samples, and an overlap sums two
- * near-zero samples. Away from a crossing, either is a step of up to full scale
- * - a click.
- *
- * So this searches [lo, hi) for the boundary whose LARGEST straddling sample is
- * smallest - that being the biggest step a gap there would make - and returns
- * the frame COUNT to use. The floor is set by the sample rate: at 440 Hz into
- * 22050 Hz one sample is seven degrees of phase, so the nearest sample to a
- * crossing is a few percent off zero and no search beats that.
- * With a binaural pair the two channels only cross together once per beat
- * period, which is why the caller gives it a slack of a good fraction of a
- * second to search in.
- *
- * Note what this is not: it is not a crossfade. Crossfading consecutive buffers
- * sums a signal with a time-shifted copy of itself, and that is a comb filter
- * whose notches sweep as the timing drifts - audible as a wobble, and worse
- * than the click it was meant to hide. The tests measure it: half a carrier
- * period of misalignment, 2.5 ms, cancels the carrier completely.
- *
- * Nor does it help an EARLY join. Arriving early overlaps a block's last
- * milliseconds with the next block's first, and both are full-scale that far
- * from the boundary - measured at 200% of peak. The caller has to bias late so
- * a gap is the only case this has to handle. */
-uint32_t en_zero_cut(const int16_t *pcm, uint32_t lo, uint32_t hi);
-
 const char *en_mode_name(en_mode_t mode);
 
 /* Cubic soft clip: unity slope through zero, saturating smoothly at +/-1.
