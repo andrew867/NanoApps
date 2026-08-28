@@ -208,3 +208,128 @@ Being straight about the gaps, because the feature list leans on them:
 Scaffolded (`./start new radioplus`, LVGL, title "Radio+"). Nothing implemented
 yet — this document is the Phase 0 deliverable and the next step is the
 `TRFTuner` vtable hunt.
+
+---
+
+# Phase 0b — the TRFTuner vtable hunt
+
+The gap flagged in §5 is now closed enough to design against. The tuner vtables
+are located, their slots are classified by shape, and part of the object layout
+falls out for free.
+
+## The technique
+
+The tuner classes carry RTTI, and the Itanium C++ ABI lays RTTI out in a fixed
+shape, so a vtable can be reached from nothing but its class name:
+
+```
+type_info   [ vptr ][ __name -> "N3ISL8TRFTunerE" ][ ...base info... ]
+vtable      [ offset_to_top ][ type_info* ][ vfn0 ][ vfn1 ] ...
+```
+
+Find the name string; find the word pointing at it (that is `type_info+4`); find
+the word pointing at the type_info (that is `vtable+4`); the virtual functions
+start immediately after. Every step is checkable — a real vtable is a run of
+plausible code pointers, and anything else means the chain went somewhere else.
+No guessing at any point, which matters, because guessing at RetailOS internals
+has already cost this project two bad builds on the Entrain side.
+
+`re/vtable.py` does the walk, `re/vtdiff.py` the comparison, `re/vtmap.sh` the
+per-slot classification, `re/findref.py` finds accessors of a struct offset, and
+`re/dis.sh` disassembles at a virtual address. All re-runnable.
+
+## What was found
+
+| Class | type_info | vtable |
+|---|---|---|
+| `ISL::TRFTuner` | `0x0878bbc0` | **`0x087f0050`** |
+| `ISL::TRFTuner_IAP` | `0x0878b590` | **`0x087ecfd8`** |
+| `ISL::TRFTuner_RTXC` | `0x0878b62c` | **`0x087ed41c`** |
+| `TRFTunerPresetList` | `0x08788600` | **`0x087a8a30`** |
+| `CIapLingoRFTuner` | `0x087880c8` | **`0x087a2d80`** |
+| `ISL::IPodRFTuner` | `0x0878b4f8` | *none found* |
+
+`TRFTuner` is **abstract**: slots 4, 5, 11 and 12 are null. So it declares an
+interface and implements most of it, and the concrete tuners fill in the rest.
+
+`TRFTuner_RTXC` is the one that matters — RTXC is the RTOS-side path to the
+built-in chip, where `_IAP` is the accessory-protocol tuner for external
+hardware. Both are worth having: the shared slots are identical in all three, so
+anything reached through `TRFTuner`'s own implementation works either way.
+
+`IPodRFTuner` has a type_info but nothing points at it from a vtable. Either it
+is abstract with no emitted table, or it is only ever named, not instantiated.
+Unresolved, and not obviously in the way.
+
+## Slot map, 38 slots
+
+Diffing the three tables separates inherited plumbing from per-transport work:
+
+- **Identical in all three** (TRFTuner implements it once):
+  2, 3, 6, 7, 8, 9, 10, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 24, 25, 26, 28,
+  33, 34, 35, 37
+- **Overridden per implementation** (the transport primitives):
+  0, 1, 18, 27, 29, 30, 31, 32, 36
+- **Pure virtual**: 4, 5, 11, 12
+
+Slots 0 and 1 are the destructor pair — `TRFTuner_RTXC` slot 0 writes a vptr and
+a second pointer at `+0x44`, and slot 1 calls slot 0 then jumps to the
+deallocator, which is exactly the complete/deleting destructor shape.
+
+Several RTXC overrides are constant predicates, which is what a capability query
+compiles to:
+
+| Slot | `TRFTuner_RTXC` |
+|---|---|
+| 18 | `movs r0,#1; bx lr` — returns true |
+| 29 | `movs r0,#0; bx lr` — returns false |
+| 30 | `movs r0,#1; bx lr` — returns true |
+| 31 | `movs r0,#0; bx lr` — returns false |
+| 32 | `b.w 0x8472ea4` — tail-call into shared code |
+| 27 | real work: 40 bytes of stack, calls `0x8416c5c` |
+
+## Object layout, so far
+
+Read straight off the accessors rather than inferred:
+
+| Offset | Width | Evidence |
+|---|---|---|
+| `+0x4C` | byte | read in slot 20's neighbourhood |
+| `+0x4E` | byte | slot 33 is `ldrb.w r0,[r0,#0x4E]; bx lr` |
+| `+0x50`, `+0x54` | words | slot 37 copies both into a caller-supplied struct |
+| `+0x390` | byte | written by a setter guarded on `r1 == 1` |
+| `+0x394` | pointer | slot 26 loads it and branches on null |
+| `+0x398` | pointer | slots 28, 34, 35 load it and fall back to a literal when null — a delegate |
+| `+0x39C` | byte | **the state**: eight call sites compare it against 0, 1 and 2 |
+| `+0x39E` | byte | slot 20 is a plain getter |
+| `+0x3A0` | word | slot 21 is `ldr.w r0,[r0,#0x3A0]; bx lr` |
+
+`+0x39C == 2` is the guard slots 22, 23, 24 and 25 all check before doing
+anything, so 2 is the powered/ready state.
+
+## Confidence, honestly
+
+**Solid:** the vtable addresses, which slots are shared versus overridden, the
+pure virtuals, the destructor pair, and every offset in the layout table — those
+are read directly out of instructions.
+
+**Not established:** what any slot is *called*. Shape is not meaning: slot 21
+being a word getter at `+0x3A0` makes it a plausible frequency, but nothing yet
+proves it, and this project has already been bitten twice by a plausible reading
+of RetailOS that turned out wrong. No slot gets a name in code until a caller or
+a device observation confirms it.
+
+Worth recording as a trap: scanning for a struct offset finds *every* class that
+uses it. The byte accessors of `+0x3A0` around `0x0841xxxx` are a different
+cluster from the `TRFTuner` methods at `0x0847xxxx` and are very likely a
+different class entirely. Offsets alone do not identify an object.
+
+## Next
+
+1. Name the slots from their callers — `TSilverRadioTunerBarView` and
+   `TRadioTagListCntlr` drive this object and their call sites will say which
+   slot means what.
+2. Find how `TRFTuner_RTXC` reaches the chip: slot 27 and `0x8416c5c` are the
+   thread to pull, and that is where `0xFC15` should surface.
+3. Locate the Live Pause cache buffer, using `Radio Live Pause Cache`
+   (`0x284f7c`) and the `HandleBuffer*` handlers (`0x267a40`–`0x267ab8`).
