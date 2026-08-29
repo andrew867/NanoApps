@@ -29,6 +29,13 @@
 
 void n31_ui_init(void);
 
+/*
+ * A line of kernel commentary under the tiles, for the minute before a volume
+ * is mounted. Pass NULL or "" to take it away again, which is what happens as
+ * soon as there is something mounted to talk about instead.
+ */
+void n31_ui_home_note(const char *text);
+
 /* The three fixed tiles. `hot` lights one while its app starts. */
 void n31_ui_home(void);
 void n31_ui_home_hot(int tile, bool on);

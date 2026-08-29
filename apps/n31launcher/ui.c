@@ -168,6 +168,7 @@ typedef struct {
 static lv_obj_t *s_home;
 static lv_obj_t *s_home_status;
 static tile_t    s_tile[3];
+static lv_obj_t *s_home_note;
 
 /* The status bar. Each of these is hidden when there is nothing true to say
    with it, and the row reflows - an absent battery leaves no gap. */
@@ -273,11 +274,35 @@ static void build_home(void)
     build_tile(&s_tile[N31_TILE_MUSIC],  s_home, TILE_TOP + 2 * TILE_H,
                "TinyPod", "Music", "TP", "VOL -", C_MUSIC);
 
+    /*
+     * The gap under the tiles. Small, dim, and elided rather than wrapped:
+     * this is a hint that something is happening, not something to read
+     * closely, and a second line would push it into the footer.
+     */
+    s_home_note = label(s_home, "", F_CAPTION, C_TEXT_MUTE);
+    lv_obj_set_size(s_home_note, CONTENT_W, 18);
+    lv_label_set_long_mode(s_home_note, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(s_home_note, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(s_home_note, MARGIN, TILE_TOP + 3 * TILE_H + 8);
+    lv_obj_add_flag(s_home_note, LV_OBJ_FLAG_HIDDEN);
+
     /* Different amounts, so tilting reads as depth rather than as the whole
        screen sliding. */
     s_tile[N31_TILE_RADIO].depth  = 10;
     s_tile[N31_TILE_EXTRAS].depth = 7;
     s_tile[N31_TILE_MUSIC].depth  = 13;
+}
+
+void n31_ui_home_note(const char *text)
+{
+    if (!s_home_note) return;
+
+    if (text && text[0]) {
+        lv_label_set_text(s_home_note, text);
+        lv_obj_remove_flag(s_home_note, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_home_note, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 void n31_ui_home(void)
