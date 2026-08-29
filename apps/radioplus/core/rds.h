@@ -1,0 +1,163 @@
+/*
+ * rds.h — decode RDS/RBDS groups into station state.
+ *
+ * Everything here is IEC 62106 (and the NRSC RBDS variant), which is a
+ * published standard and completely independent of the tuner chip. That
+ * separation is deliberate: how the BCM part frames its FIFO is undocumented in
+ * the command specification and its Linux driver is not in this tree, so the
+ * one function that guesses at framing is isolated at the bottom of this file
+ * and named so nobody mistakes it for established fact. Group decoding above it
+ * is verifiable against the standard and testable with no hardware.
+ *
+ * A group is four 16-bit blocks. Block A carries the programme identification,
+ * block B the group type, traffic flag and programme type, and blocks C and D
+ * carry whatever that group type says they do. Blocks arrive with error flags,
+ * so every block is fed with a validity bit and a bad one is dropped rather
+ * than allowed to corrupt accumulated text.
+ *
+ * RBDS matters here rather than being a footnote: North American broadcasters
+ * use a completely different programme-type table, and I2C_RDS_CTRL bit 0
+ * selects which the chip is decoding. Displaying "Serious Classical" for a
+ * station transmitting "Classical" would be a small lie; displaying "Phone In"
+ * for "Public" is a large one.
+ *
+ * Pure C99, no allocation, no I/O.
+ */
+
+#ifndef RADIOPLUS_RDS_H
+#define RADIOPLUS_RDS_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+/* Block validity, one bit per block, as passed to en_rds_group(). */
+#define EN_RDS_A 0x1u
+#define EN_RDS_B 0x2u
+#define EN_RDS_C 0x4u
+#define EN_RDS_D 0x8u
+#define EN_RDS_ALL (EN_RDS_A | EN_RDS_B | EN_RDS_C | EN_RDS_D)
+
+/* What a group changed, so the UI repaints only what moved. */
+#define EN_RDS_CH_PI    0x0001u
+#define EN_RDS_CH_PS    0x0002u
+#define EN_RDS_CH_RT    0x0004u
+#define EN_RDS_CH_PTY   0x0008u
+#define EN_RDS_CH_TA    0x0010u
+#define EN_RDS_CH_TP    0x0020u
+#define EN_RDS_CH_MS    0x0040u
+#define EN_RDS_CH_CT    0x0080u
+#define EN_RDS_CH_AF    0x0100u
+#define EN_RDS_CH_PTYN  0x0200u
+#define EN_RDS_CH_ECC   0x0400u
+#define EN_RDS_CH_PIN   0x0800u
+#define EN_RDS_CH_DI    0x1000u
+
+#define EN_RDS_PS_LEN   8
+#define EN_RDS_RT_LEN   64
+#define EN_RDS_PTYN_LEN 8
+#define EN_RDS_AF_MAX   25
+
+typedef struct {
+    /* Programme identification. Also the station's identity across an
+       alternate-frequency jump, which is why it is tracked separately from
+       everything else it implies. */
+    uint16_t pi;
+    bool     pi_valid;
+
+    uint8_t  pty;          /* programme type; name depends on the RBDS flag */
+    bool     tp;           /* this station carries traffic announcements */
+    bool     ta;           /* one is on the air right now */
+    bool     ms;           /* true for music, false for speech */
+    uint8_t  di;           /* decoder identification, four bits */
+
+    /* Programme service name: eight characters delivered two at a time. Only
+       shown once every segment has arrived, because a half-filled name looks
+       like a glitch rather than a station. */
+    char     ps[EN_RDS_PS_LEN + 1];
+    uint8_t  ps_seen;      /* bitmask of the four segments */
+    bool     ps_valid;
+
+    /* Radio text: 64 characters in group 2A (four at a time) or 32 in 2B (two
+       at a time). The A/B flag toggling means the station started a new
+       message, at which point the buffer has to be cleared or the old text
+       shows through the gaps in the new one. */
+    char     rt[EN_RDS_RT_LEN + 1];
+    uint16_t rt_seen;
+    bool     rt_valid;
+    bool     rt_ab;
+    bool     rt_ab_known;
+
+    /* Programme type name, group 10A: an eight-character free-text refinement
+       of the numeric programme type. */
+    char     ptyn[EN_RDS_PTYN_LEN + 1];
+    uint8_t  ptyn_seen;
+    bool     ptyn_valid;
+
+    /* Alternate frequencies, in kHz. */
+    uint32_t af[EN_RDS_AF_MAX];
+    uint8_t  af_count;
+    uint8_t  af_expected;  /* from the AF list header, 0 if not yet seen */
+
+    /* Clock time and date, group 4A, already converted from modified Julian
+       day and already offset to local time. */
+    bool     ct_valid;
+    uint16_t ct_year;
+    uint8_t  ct_month, ct_day, ct_hour, ct_minute;
+    int8_t   ct_offset;    /* local offset in half hours, as transmitted */
+
+    uint8_t  ecc;          /* extended country code, group 1A */
+    bool     ecc_valid;
+    uint16_t pin;          /* programme item number, group 1A */
+    bool     pin_valid;
+
+    /* Reception statistics. Useful on their own - a station with groups
+       arriving but nothing decoding is a different problem from no signal. */
+    uint32_t groups;
+    uint32_t blocks_bad;
+    uint32_t group_count[32];   /* indexed by type<<1 | version */
+
+    bool     rbds;         /* interpret programme types as RBDS */
+} en_rds_t;
+
+/* Reset to nothing received. Call on tune, and on any PI change. */
+void en_rds_init(en_rds_t *r, bool rbds);
+
+/*
+ * Feed one group. `blk` is blocks A to D; `valid` says which of them arrived
+ * intact. Returns a bitmask of what changed.
+ *
+ * Blocks flagged invalid are not merely ignored - a group missing block B has
+ * no type and cannot be interpreted at all, and one missing block C or D drops
+ * only the payload those blocks carried. Getting this wrong shows up as text
+ * that fills with garbage on a weak signal.
+ */
+uint16_t en_rds_group(en_rds_t *r, const uint16_t blk[4], uint8_t valid);
+
+/* Programme type name, honouring the RBDS flag. Never NULL. */
+const char *en_rds_pty_name(uint8_t pty, bool rbds);
+
+/* Decode an alternate-frequency code. Returns 0 for filler and codes that are
+   not a frequency. */
+uint32_t en_rds_af_khz(uint8_t code);
+
+/*
+ * The one guess in this file.
+ *
+ * I2C_RDS_DATA returns "RDS tuples" and I2C_RDS_WLINE counts them, but neither
+ * the command specification nor anything else in this tree states a tuple
+ * layout. Three bytes - two of data and one of block type and error status - is
+ * what the BCM2048 family is understood to use, and it is the only layout that
+ * fits a waterline counted in tuples against a 250-byte read.
+ *
+ * It is isolated here so that confirming or correcting it on the device changes
+ * exactly one function and nothing above it. Everything else in this file is
+ * the published standard and stands regardless.
+ *
+ * Returns the number of complete groups written to `out`, which must have room
+ * for len/12 groups and the matching validity bytes.
+ */
+uint8_t en_rds_unpack_tuples_unverified(const uint8_t *fifo, uint16_t len,
+                                        uint16_t (*out)[4], uint8_t *valid,
+                                        uint8_t max_groups);
+
+#endif /* RADIOPLUS_RDS_H */

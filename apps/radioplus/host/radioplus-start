@@ -1,0 +1,64 @@
+#!/bin/sh
+# Start Radio+ on the N31.
+#
+# The app brings hci0 up itself, so this script does not need hciconfig - which
+# is just as well, because the device rootfs has none. What it does is make the
+# failures legible: if the Bluetooth controller never bound there is nothing to
+# tune, and finding that out from a blank screen is much worse than being told.
+
+set -e
+
+# Not /tmp/radioplus - that is where the binary itself is pushed, and the two
+# collided: mkdir refused because the path was already a file.
+HOME_DIR="${RADIOPLUS_HOME:-/tmp/radioplus.d}"
+APP="${RADIOPLUS_BIN:-/tmp/radioplus}"
+
+echo "=== Radio+ ==="
+
+[ -x "$APP" ] || { echo "FAIL: no executable at $APP"; exit 1; }
+
+# The controller is bound by the kernel through serdev, so this reports rather
+# than acts. Its absence is the single most common reason nothing works.
+if [ -x /bin/n31-bt-up ]; then
+	n31-bt-up || true
+elif [ -d /sys/class/bluetooth/hci0 ]; then
+	echo "hci0 present"
+else
+	echo "WARN: no hci0 - the Bluetooth driver did not bind."
+	echo "      FM rides on hci0, so the tuner will not respond."
+	echo "      Check: dmesg | grep -i bluetooth"
+fi
+
+# The tuner is reached through the driver, not by us, so its sysfs interface
+# has to exist. Checked one candidate at a time: `ls a b` reports failure when
+# the first pattern matches nothing even if the second matches, which had this
+# printing "did not bind" about a driver that had bound perfectly well.
+FM_DIR=""
+for d in /sys/devices/*/*/fm_power /sys/devices/*/*/*/fm_power          /sys/devices/*/*/*/*/fm_power; do
+	[ -e "$d" ] || continue
+	# Parameter expansion rather than dirname: this busybox has no dirname,
+	# and reaching for a coreutil on a device rootfs is how a launcher dies.
+	FM_DIR="${d%/fm_power}"
+	break
+done
+
+if [ -n "$FM_DIR" ]; then
+	echo "tuner: $FM_DIR"
+else
+	echo "WARN: no fm_power in sysfs - bcm2078-bt did not bind."
+	echo "      Check: ls /proc/device-tree/soc/bcm2078-companion/"
+fi
+
+# Capture is what clocks IIS2, so without it the radio is silent even when it
+# is tuned correctly. Worth knowing before blaming the aerial.
+if [ ! -e /dev/snd/pcmC0D1c ]; then
+	echo "WARN: no capture device hw:0,1 - there will be no audio."
+fi
+
+mkdir -p "$HOME_DIR/recordings"
+
+echo "home:  $HOME_DIR"
+echo "note:  the headphone cable is the aerial - plug it in"
+echo
+
+exec env RADIOPLUS_HOME="$HOME_DIR" "$APP" "$@"

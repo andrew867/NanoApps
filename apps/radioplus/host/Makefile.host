@@ -1,0 +1,42 @@
+# Desktop build of the Radio+ core.
+#
+# core/ has no dependencies at all - no SDK, no LVGL, no libc beyond string.h -
+# so the encoder, the register table and the field packing can be exercised on
+# a workstation with no tuner, no iPod and no Bluetooth stack anywhere near it.
+# That is the point of keeping the transport out of it.
+#
+#   cd host && make -f Makefile.host test
+
+CC      ?= cc
+BUILD   := build
+CORE    := ../core
+
+CFLAGS  := -O1 -g -std=c99 -Wall -Wextra -Wshadow -Wconversion \
+           -Wno-sign-conversion -Wpointer-arith -Wcast-qual
+
+# The table is hand-transcribed from a specification, so the checks that matter
+# most are the ones that run under a sanitiser: a bad bit offset shows up as an
+# out-of-bounds read long before it shows up as a wrong register write.
+ifneq ($(NOSAN),1)
+CFLAGS  += -fsanitize=address,undefined -fno-omit-frame-pointer
+LDFLAGS += -fsanitize=address,undefined
+endif
+
+SRCS := tests.c $(CORE)/fmcmd.c $(CORE)/fmreg.c $(CORE)/rds.c $(CORE)/region.c $(CORE)/wav.c $(CORE)/store.c
+HDRS := $(wildcard $(CORE)/*.h)
+
+.PHONY: all test clean
+
+all: $(BUILD)/tests
+
+$(BUILD):
+	@mkdir -p $(BUILD)
+
+$(BUILD)/tests: $(SRCS) $(HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRCS)
+
+test: $(BUILD)/tests
+	@./$(BUILD)/tests
+
+clean:
+	rm -rf $(BUILD)
