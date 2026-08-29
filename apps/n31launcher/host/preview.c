@@ -112,6 +112,16 @@ int main(int argc, char **argv)
     n31_ui_home();
     shot("home-no-extras");
 
+    /* The minute before a volume is mounted: the tiles say None yet, and the
+       kernel says what it is doing about it. A real FTL line, at the length
+       they actually come in, to prove it elides rather than wrapping into the
+       footer. */
+    n31_ui_home_note("s5l8740-ftl: CS recover OK mapped_ranges=1933 btoc=6");
+    n31_ui_home();
+    shot("home-bringup");
+
+    n31_ui_home_note(NULL);
+
     n31_ui_extras(n31_extra_first, false);
     shot("modal-no-disk");
 

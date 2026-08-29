@@ -57,6 +57,7 @@
 #include "fbcon.h"
 #include "status.h"
 #include "scanner.h"
+#include "klog.h"
 
 #define FRAME_MS 33
 
@@ -575,6 +576,10 @@ int main(int argc, char **argv)
     if (!n31_scanner_start())
         printf("n31launcher: no scanner thread - scanning inline\n");
 
+    /* Only worth opening while there is nothing mounted to talk about. */
+    if (!disk_mounted() && !n31_klog_open())
+        printf("n31launcher: no /dev/kmsg - no bring-up commentary\n");
+
     n31_status_read(&s_status);
     n31_status_tilt(&s_status);
     printf("n31launcher: battery %s, bluetooth %s, accelerometer %s\n",
@@ -611,6 +616,28 @@ int main(int argc, char **argv)
 
     while (!s_quit) {
         pump_keys();
+
+        /*
+         * The kernel's running commentary on storage, while there is none.
+         * It is the only sign of life during the bring-up, and it goes as
+         * soon as something is mounted - after that it would be a log for
+         * its own sake.
+         */
+        if (s_screen == SCREEN_HOME && !s_child) {
+            static bool note_on;
+            char line[96];
+
+            if (disk_mounted()) {
+                if (note_on) {
+                    n31_ui_home_note(NULL);
+                    n31_klog_close();
+                    note_on = false;
+                }
+            } else if (n31_klog_poll(line, sizeof line)) {
+                n31_ui_home_note(line);
+                note_on = true;
+            }
+        }
 
         /*
          * Has the console taken the screen back? Checked even while an app is
@@ -683,6 +710,7 @@ int main(int argc, char **argv)
        a screen nothing can get back. Blocking is fine here: nothing is drawing
        after this point. */
     n31_scanner_stop();
+    n31_klog_close();
     if (s_child) stop_child_blocking(s_child);
     if (s_dying) stop_child_blocking(s_dying);
 
