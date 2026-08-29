@@ -1,0 +1,97 @@
+# The N31 launcher.
+#
+#   cd host && make -f Makefile.n31          build
+#   cd host && make -f Makefile.n31 push     send it to the device
+#   cd host && make -f Makefile.n31 run      push and run it
+#
+# LVGL is compiled from the vendored source into this app's own build
+# directory, so a fresh clone of just this app builds. Point LVLIB at a prebuilt
+# library to skip that:
+#
+#   make -f Makefile.n31 LVLIB=/path/to/liblvgl_n31.a
+
+IPOD_ROOT ?= /mnt/c/src/ipod/artifacts/linux-n31
+TOOLCHAIN ?= $(IPOD_ROOT)/tinyalsa-build/arm-linux-musleabi-cross
+SSH_KEY   ?= $(IPOD_ROOT)/n31_id
+DEVICE    ?= root@192.168.7.2
+
+CC     := $(TOOLCHAIN)/bin/arm-linux-musleabi-gcc
+STRIP  := $(TOOLCHAIN)/bin/arm-linux-musleabi-strip
+AR     := $(TOOLCHAIN)/bin/arm-linux-musleabi-ar
+BUILD  := build-n31
+LVGL   ?= ../../../lvgl
+LV_CONF := lv_conf_n31.h
+
+LVLIB_OWN := $(BUILD)/liblvgl_n31.a
+LVLIB     ?= $(LVLIB_OWN)
+
+ARCH_FLAGS := -mcpu=cortex-a8 -mthumb -mfpu=vfpv3-d16 -mfloat-abi=softfp
+
+CFLAGS := -O2 -g0 -std=gnu99 $(ARCH_FLAGS) \
+          -ffunction-sections -fdata-sections \
+          -Wall -Wextra -Wshadow -Wno-unused-parameter
+
+LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_n31.h\" \
+             -I$(LVGL) -I$(LVGL)/src -I$(LVGL)/include -I$(LVGL)/.. -I..
+
+APP  := $(BUILD)/n31launcher
+SRCS := ../launcher.c ../ui.c ../apps.c ../fbcon.c ../status.c ../scanner.c
+HDRS := $(wildcard ../*.h)
+
+.PHONY: all push run stop clean
+all: $(APP)
+
+
+# LVGL, built here rather than borrowed from another app's build directory.
+# That directory is gitignored, so depending on it meant this could not be built
+# from a fresh clone - and it dangles the moment you check out a branch that
+# does not carry that app.
+#
+# All of src/ is compiled, which is what a liblvgl.a normally is: the parts this
+# app does not use are dropped at link time by --gc-sections, and picking a
+# subset by hand is how you discover a missing symbol six months later. It is a
+# few hundred files, so the first build takes a while - pass -j.
+LV_SRCS := $(shell find $(LVGL)/src -name '*.c')
+LV_OBJS := $(patsubst $(LVGL)/%.c,$(BUILD)/lvgl/%.o,$(LV_SRCS))
+
+$(BUILD)/lvgl/%.o: $(LVGL)/%.c
+	@mkdir -p $(dir $@)
+	@$(CC) $(CFLAGS) $(LV_CFLAGS) -c -o $@ $<
+
+# Coarse, but right: the config decides what LVGL compiles to, so changing it
+# has to rebuild all of it.
+$(LV_OBJS): $(LV_CONF)
+
+$(LVLIB_OWN): $(LV_OBJS)
+	@echo "AR $@"
+	@$(AR) rcs $@ $^
+
+$(APP): $(SRCS) $(HDRS) $(LVLIB) | $(BUILD)
+	$(CC) $(CFLAGS) $(LV_CFLAGS) -static -Wl,--gc-sections \
+	      -o $@ $(SRCS) $(LVLIB) -lm -lpthread
+	@$(STRIP) $@
+	@ls -l $@
+
+$(BUILD):
+	@mkdir -p $(BUILD)
+
+KEY := $(HOME)/.ssh/radioplus-n31-key
+$(KEY): $(SSH_KEY)
+	@mkdir -p $(dir $(KEY))
+	@cp $(SSH_KEY) $(KEY)
+	@chmod 600 $(KEY)
+
+SSH = ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i $(KEY)
+
+push: $(APP) $(KEY)
+	@$(SSH) $(DEVICE) 'cat > /tmp/n31launcher && chmod +x /tmp/n31launcher' < $(APP)
+	@echo "pushed $(DEVICE):/tmp/n31launcher"
+
+stop: $(KEY)
+	-@$(SSH) $(DEVICE) 'for p in $$(ps | grep "[n]31launcher" | while read pid rest; do echo $$pid; done); do kill -9 $$p 2>/dev/null; done; sleep 1; true'
+
+run: stop push
+	@$(SSH) $(DEVICE) '/tmp/n31launcher 2>&1 | head -20'
+
+clean:
+	rm -rf $(BUILD)

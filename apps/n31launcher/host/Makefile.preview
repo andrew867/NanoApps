@@ -1,0 +1,92 @@
+# Headless preview of the launcher: renders every screen to PNG with no device
+# and no framebuffer. Worth using - every layout bug in this app was found in a
+# picture and was invisible in the source.
+#
+# LVGL is compiled from the vendored source into this app's own build directory,
+# so a fresh clone builds. Point LVLIB at a prebuilt library to skip that.
+
+CC     ?= cc
+AR     ?= ar
+BUILD  := build
+LVGL   ?= ../../../lvgl
+LV_CONF := lv_conf_host.h
+
+LVLIB_OWN := $(BUILD)/liblvgl_host.a
+LVLIB     ?= $(LVLIB_OWN)
+
+LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_host.h\" \
+             -I$(LVGL) -I$(LVGL)/src -I$(LVGL)/include -I$(LVGL)/.. -I..
+
+CFLAGS := -O1 -g -std=gnu99 -Wall -Wextra -Wno-unused-parameter
+SRCS := preview.c ../ui.c ../apps.c ../status.c
+
+# The app scan, against a real directory tree. Needs no LVGL and no
+# device, and it is what caught the flat-copy fallback listing every folder
+# that had no binary in it: access(dir, X_OK) is true for any directory.
+.PHONY: scantest
+scantest:
+	@mkdir -p $(BUILD)
+	@$(CC) -O1 -I.. -o $(BUILD)/scantest tests/scantest.c ../apps.c
+	@rm -rf /tmp/n31os
+	@mkdir -p /tmp/n31os/apps/demo /tmp/n31os/apps/bare /tmp/n31os/apps/empty
+	@printf '#!/bin/sh\ntrue\n' > /tmp/n31os/apps/demo/demo
+	@printf '#!/bin/sh\ntrue\n' > /tmp/n31os/apps/bare/bare
+	@chmod +x /tmp/n31os/apps/demo/demo /tmp/n31os/apps/bare/bare
+	@printf '%s\n' '{ "name": "Demo App", "exec": "demo", "tagline": "a test", "glyph": "DA", "color": "#f43f5e", "screen": "console" }' > /tmp/n31os/apps/demo/app.json
+	@touch /tmp/n31os/apps/empty/readme
+	@$(BUILD)/scantest; rc=$$?; rm -rf /tmp/n31os; exit $$rc
+
+# The scanner thread, plain and then under ThreadSanitizer. A race here
+# would show up as a list that is occasionally wrong on a device, which is
+# not something you debug by looking - so it gets checked by a tool.
+.PHONY: threadtest
+threadtest:
+	@mkdir -p $(BUILD)
+	@$(CC) -O1 -I.. -o $(BUILD)/threadtest tests/threadtest.c ../apps.c ../scanner.c -lpthread
+	@$(BUILD)/threadtest
+	@echo
+	@echo 'under ThreadSanitizer:'
+	@$(CC) -O1 -g -fsanitize=thread -I.. -o $(BUILD)/threadtest-tsan tests/threadtest.c ../apps.c ../scanner.c -lpthread
+	@$(BUILD)/threadtest-tsan
+
+.PHONY: tests
+tests: scantest threadtest
+
+.PHONY: shots clean
+shots: $(BUILD)/preview
+	@mkdir -p shots
+	@./$(BUILD)/preview shots
+	@python3 tobmp.py shots && rm -f shots/*.bmp
+	@ls shots/
+
+
+# LVGL, built here rather than borrowed from another app's build directory.
+# That directory is gitignored, so depending on it meant this could not be built
+# from a fresh clone - and it dangles the moment you check out a branch that
+# does not carry that app.
+#
+# All of src/ is compiled, which is what a liblvgl.a normally is: the parts this
+# app does not use are dropped at link time by --gc-sections, and picking a
+# subset by hand is how you discover a missing symbol six months later. It is a
+# few hundred files, so the first build takes a while - pass -j.
+LV_SRCS := $(shell find $(LVGL)/src -name '*.c')
+LV_OBJS := $(patsubst $(LVGL)/%.c,$(BUILD)/lvgl/%.o,$(LV_SRCS))
+
+$(BUILD)/lvgl/%.o: $(LVGL)/%.c
+	@mkdir -p $(dir $@)
+	@$(CC) $(CFLAGS) $(LV_CFLAGS) -c -o $@ $<
+
+# Coarse, but right: the config decides what LVGL compiles to, so changing it
+# has to rebuild all of it.
+$(LV_OBJS): $(LV_CONF)
+
+$(LVLIB_OWN): $(LV_OBJS)
+	@echo "AR $@"
+	@$(AR) rcs $@ $^
+
+$(BUILD)/preview: $(SRCS) $(wildcard ../*.h) $(LVLIB)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(LV_CFLAGS) -o $@ $(SRCS) $(LVLIB) -lm -lpthread
+
+clean:
+	rm -rf $(BUILD) shots
