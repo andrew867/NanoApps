@@ -41,6 +41,21 @@ void n31_fbcon_reclaim(void);
    start on top of whatever was last printed there. */
 void n31_fbcon_clear(void);
 
+/*
+ * Take the console back if something rebound it behind us.
+ *
+ * There is no event for this, so it is a poll: cheap enough to run alongside
+ * everything else, and the alternative is that one module load or mode set
+ * hands the screen back to the console for the rest of the session, with every
+ * kernel message drawing over whatever is running.
+ *
+ * Only ever re-takes a console this process detached in the first place, and
+ * does nothing while it is lent to a console app. Returns true if it had to
+ * take it back, which means the console has been drawing and the screen needs
+ * repainting.
+ */
+bool n31_fbcon_reassert(void);
+
 /* Reattach whatever detach took, if anything. Safe to call unconditionally. */
 void n31_fbcon_restore(void);
 

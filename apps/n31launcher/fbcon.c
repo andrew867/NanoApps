@@ -80,6 +80,22 @@ bool n31_fbcon_detach(void)
     return done;
 }
 
+bool n31_fbcon_reassert(void)
+{
+    char state[8];
+
+    /* Never held it, or deliberately handed it to a console app. */
+    if (!s_taken || s_lent || !s_bind[0])
+        return false;
+
+    if (!read_line(s_bind, state, sizeof state))
+        return false;
+    if (state[0] != '1')
+        return false;                   /* still ours */
+
+    return write_char(s_bind, '0');
+}
+
 void n31_fbcon_lend(void)
 {
     if (!s_taken || s_lent) return;

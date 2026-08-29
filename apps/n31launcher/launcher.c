@@ -82,6 +82,11 @@
    them change faster than that in any way worth drawing. */
 #define STATUS_MS 1000
 
+/* How often to check the console has not taken the screen back. One small
+   sysfs read; the cost of missing it is every kernel message drawing over the
+   UI for the rest of the session. */
+#define FBCON_MS 2000
+
 /*
  * How long to wait before trying the volume again after a failure, and how far
  * to back off. The helper escalates internally - load, recover, BPB fallback,
@@ -869,9 +874,26 @@ int main(int argc, char **argv)
     uint32_t last_scan = millis();
     uint32_t last_status = millis();
     uint32_t last_tilt = millis();
+    uint32_t last_fbcon = millis();
 
     while (!s_quit) {
         pump_keys();
+
+        /*
+         * Has the console taken the screen back? Checked even while an app is
+         * running - especially then, since that is when a module load is most
+         * likely and when the mess is most obvious.
+         */
+        if (millis() - last_fbcon >= FBCON_MS) {
+            last_fbcon = millis();
+            if (n31_fbcon_reassert()) {
+                printf("n31launcher: console had rebound - taken back\n");
+                fflush(stdout);
+                /* It has been drawing over us, so nothing on screen can be
+                   trusted. Only redraw if the screen is ours to redraw. */
+                if (!s_child) n31_ui_redraw();
+            }
+        }
 
         /* A child that was asked to stop, going in its own time. */
         if (reap_dying()) {
