@@ -56,6 +56,7 @@
 #include "apps.h"
 #include "fbcon.h"
 #include "status.h"
+#include "scanner.h"
 
 #define FRAME_MS 33
 
@@ -116,6 +117,15 @@ static volatile sig_atomic_t s_quit;
 static screen_t s_screen;
 static int      s_selected;
 static uint32_t s_screen_at;      /* when the current screen was entered */
+
+/*
+ * A child that has been asked to stop but has not gone yet. Kept here rather
+ * than waited for in place: the wait is up to four seconds and the loop that
+ * would be doing the waiting is the loop that draws.
+ */
+static pid_t    s_dying;
+static uint32_t s_dying_since;
+static bool     s_dying_was_mount;
 
 static pid_t s_child;             /* a running app */
 static bool  s_child_console;     /* it draws through the console, not fb0 */
@@ -271,8 +281,46 @@ static bool launch(const n31_app_t *a)
     return true;
 }
 
-/* Ask a child to stop, and mean it only if asked twice. */
-static void stop_child(pid_t pid)
+/*
+ * Ask a child to stop. Returns immediately - reaping it, and killing it if it
+ * will not go, is reap_dying()'s job on subsequent passes of the main loop.
+ *
+ * This used to wait here for up to four seconds, which meant HOME froze the
+ * launcher for that long with nothing on screen explaining the pause.
+ */
+static void ask_child_to_stop(pid_t pid, bool is_mount)
+{
+    kill(-pid, SIGTERM);
+    s_dying = pid;
+    s_dying_since = millis();
+    s_dying_was_mount = is_mount;
+}
+
+/* Advance a pending stop. Called every pass; does nothing when none is
+   pending. Returns true when the child has finally gone. */
+static bool reap_dying(void)
+{
+    if (!s_dying) return false;
+
+    pid_t r = waitpid(s_dying, NULL, WNOHANG);
+    if (r == s_dying || (r < 0 && errno == ECHILD)) {
+        s_dying = 0;
+        return true;
+    }
+
+    /* It has had its grace and is not listening. */
+    if (millis() - s_dying_since >= TERM_GRACE_MS) {
+        kill(-s_dying, SIGKILL);
+        waitpid(s_dying, NULL, WNOHANG);
+        s_dying = 0;
+        return true;
+    }
+    return false;
+}
+
+/* Only for the way out, where blocking is fine because nothing is drawing
+   afterwards. */
+static void stop_child_blocking(pid_t pid)
 {
     kill(-pid, SIGTERM);
 
@@ -282,8 +330,6 @@ static void stop_child(pid_t pid)
         if (r == pid || (r < 0 && errno == ECHILD)) return;
         usleep(50000);
     }
-
-    /* It has had four seconds and is not listening. */
     kill(-pid, SIGKILL);
     waitpid(pid, NULL, 0);
 }
@@ -306,14 +352,19 @@ static void close_app(void)
 {
     if (!s_child) return;
 
-    /* Not drawn: the app still owns the screen until it is actually gone. It
-       is here so the log says what the pause was. */
     printf("n31launcher: closing pid %d\n", (int)s_child);
     fflush(stdout);
 
-    stop_child(s_child);
+    ask_child_to_stop(s_child, false);
     s_child = 0;
-    after_app();
+
+    /*
+     * Say so now. The app may take a few seconds to save and go, and until
+     * this the screen just held its last frame - so HOME looked like it had
+     * done nothing at all.
+     */
+    n31_ui_starting("Closing", 0x8B92A0);
+    lv_refr_now(NULL);
 }
 
 /* Has the app exited on its own? fbdoom quitting from its own menu should bring
@@ -359,7 +410,7 @@ static void mount_cancel(void)
     if (!s_mount) return;
 
     if (s_mount_fd >= 0) { close(s_mount_fd); s_mount_fd = -1; }
-    stop_child(s_mount);
+    ask_child_to_stop(s_mount, true);
     s_mount = 0;
     s_mount_len = 0;
 }
@@ -430,8 +481,7 @@ static void mount_done(void)
 
     /* The folders were not readable a moment ago, so the fingerprint from
        before the mount says nothing about what is on them now. */
-    n31_apps_invalidate();
-    n31_apps_scan();
+    n31_scanner_invalidate();
 
     if (automatic) {
         /* Whatever the user is looking at, keep them there - but redraw it,
@@ -566,6 +616,12 @@ static void mount_pump(void)
  * row. An app appearing above the selection would otherwise slide something
  * else under the cursor, and the next PLAY would open the wrong thing.
  */
+/*
+ * Take whatever the scanner thread has finished, keeping the selection on the
+ * same app rather than the same row. An app appearing above the selection
+ * would otherwise slide something else under the cursor, and the next PLAY
+ * would open the wrong thing.
+ */
 static void rescan(void)
 {
     char was[32];
@@ -573,7 +629,7 @@ static void rescan(void)
     if (s_selected >= (int)n31_extra_first && s_selected < (int)n31_app_count)
         memcpy(was, n31_apps[s_selected].prog, sizeof was);
 
-    if (!n31_apps_scan()) return;
+    if (!n31_scanner_collect()) return;
 
     s_selected = (int)n31_extra_first;
     if (was[0]) {
@@ -778,9 +834,17 @@ int main(int argc, char **argv)
     if (!s_key_fds)
         printf("n31launcher: no key input - nothing can be started\n");
 
+    /*
+     * The first scan is inline, because there is nothing to draw yet and the
+     * home screen should come up with the right list rather than filling in a
+     * moment later. Every scan after this one is on the worker.
+     */
     n31_apps_scan();
     for (uint8_t i = 0; i < n31_app_count; i++)
         printf("n31launcher: %-12s %s\n", n31_apps[i].prog, n31_apps[i].path);
+
+    if (!n31_scanner_start())
+        printf("n31launcher: no scanner thread - scanning inline\n");
 
     n31_status_read(&s_status);
     n31_status_tilt(&s_status);
@@ -809,6 +873,16 @@ int main(int argc, char **argv)
     while (!s_quit) {
         pump_keys();
 
+        /* A child that was asked to stop, going in its own time. */
+        if (reap_dying()) {
+            if (s_dying_was_mount) {
+                n31_ui_mount_progress(false, 0, NULL);
+                go(SCREEN_EXTRAS);
+            } else {
+                after_app();
+            }
+        }
+
         app_gone();
         if (s_mount) {
             mount_pump();
@@ -831,8 +905,14 @@ int main(int argc, char **argv)
            itself. */
         if (!s_mount && millis() - last_scan >= RESCAN_MS) {
             last_scan = millis();
-            rescan();
+            if (!n31_scanner_busy())
+                n31_scanner_request();
         }
+
+        /* Collect on every pass, not on the poll interval: the worker finishes
+           when it finishes, and a result sitting unclaimed is a list that is
+           already stale on screen. */
+        rescan();
 
         /* A scheduled retry after a failed automatic mount. */
         if (!s_mount && s_mount_retry_at &&
@@ -862,9 +942,12 @@ int main(int argc, char **argv)
     }
 
     /* Going away without taking them with us would leave something drawing to
-       a screen nothing can get back. */
-    if (s_child) stop_child(s_child);
-    mount_cancel();
+       a screen nothing can get back. Blocking is fine here: nothing is drawing
+       after this point. */
+    n31_scanner_stop();
+    if (s_child) stop_child_blocking(s_child);
+    if (s_mount) stop_child_blocking(s_mount);
+    if (s_dying) stop_child_blocking(s_dying);
 
     /* Hand the screen back. Exiting the launcher should leave a console you
        can read, not the last frame it happened to draw. */

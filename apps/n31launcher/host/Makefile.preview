@@ -36,6 +36,22 @@ scantest:
 	@touch /tmp/n31os/apps/empty/readme
 	@$(BUILD)/scantest; rc=$$?; rm -rf /tmp/n31os; exit $$rc
 
+# The scanner thread, plain and then under ThreadSanitizer. A race here
+# would show up as a list that is occasionally wrong on a device, which is
+# not something you debug by looking - so it gets checked by a tool.
+.PHONY: threadtest
+threadtest:
+	@mkdir -p $(BUILD)
+	@$(CC) -O1 -I.. -o $(BUILD)/threadtest tests/threadtest.c ../apps.c ../scanner.c -lpthread
+	@$(BUILD)/threadtest
+	@echo
+	@echo 'under ThreadSanitizer:'
+	@$(CC) -O1 -g -fsanitize=thread -I.. -o $(BUILD)/threadtest-tsan tests/threadtest.c ../apps.c ../scanner.c -lpthread
+	@$(BUILD)/threadtest-tsan
+
+.PHONY: tests
+tests: scantest threadtest
+
 .PHONY: shots clean
 shots: $(BUILD)/preview
 	@mkdir -p shots

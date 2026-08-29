@@ -63,6 +63,35 @@ typedef struct {
     bool     console;
 } n31_app_t;
 
+/*
+ * A complete list, self-contained. The scan fills one of these rather than the
+ * globals so it can run on a worker thread: reading app manifests off the
+ * internal volume can block for a long time, and the loop that draws must not
+ * be the one waiting for NAND.
+ */
+typedef struct {
+    n31_app_t apps[N31_MAX_APPS];
+    uint8_t   count;
+    uint8_t   extra_first;
+} n31_app_list_t;
+
+/* What the scan remembers between runs so it can skip work. Caller-owned, so
+   two scanners would not fight over it. */
+typedef struct {
+    uint32_t hash;
+    bool     valid;
+} n31_scan_state_t;
+
+/*
+ * Scan into `out`. Touches no globals and no LVGL, so it is safe to call from
+ * a thread. Returns true if the result differs from what `state` last saw; on
+ * false, `out` is left untouched and nothing needs redrawing.
+ */
+bool n31_apps_scan_into(n31_app_list_t *out, n31_scan_state_t *state);
+
+/* Copy a finished list into the globals the UI reads. Main thread only. */
+void n31_apps_publish(const n31_app_list_t *list);
+
 extern n31_app_t n31_apps[N31_MAX_APPS];
 extern uint8_t   n31_app_count;
 

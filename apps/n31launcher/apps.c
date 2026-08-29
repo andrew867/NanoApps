@@ -215,10 +215,10 @@ static void apply_manifest(const char *apps_dir, const char *folder,
 
 /* ---- the list ------------------------------------------------------------- */
 
-static bool have_prog(const char *prog)
+static bool have_prog(const n31_app_list_t *l, const char *prog)
 {
-    for (uint8_t i = 0; i < n31_app_count; i++)
-        if (!strcmp(n31_apps[i].prog, prog)) return true;
+    for (uint8_t i = 0; i < l->count; i++)
+        if (!strcmp(l->apps[i].prog, prog)) return true;
     return false;
 }
 
@@ -305,11 +305,12 @@ static void for_each_apps_dir(void (*fn)(const char *apps_dir, void *ctx),
     closedir(mnt);
 }
 
-static void add_from_dir(const char *apps_dir, const char *folder)
+static void add_from_dir(const char *apps_dir, const char *folder,
+                         n31_app_list_t *l)
 {
-    if (n31_app_count >= N31_MAX_APPS) return;
+    if (l->count >= N31_MAX_APPS) return;
     if (folder[0] == '.') return;
-    if (have_prog(folder)) return;             /* a builtin already covers it */
+    if (have_prog(l, folder)) return;          /* a builtin already covers it */
 
     n31_app_t a;
     memset(&a, 0, sizeof a);
@@ -328,7 +329,7 @@ static void add_from_dir(const char *apps_dir, const char *folder)
     if (!a.glyph[0]) initials(a.name, a.glyph, sizeof a.glyph);
     if (!resolve_in(apps_dir, folder, exec, a.path, sizeof a.path)) return;
 
-    n31_apps[n31_app_count++] = a;
+    l->apps[l->count++] = a;
 }
 
 /*
@@ -347,29 +348,28 @@ static int name_cmp(const char *a, const char *b)
     return (unsigned char)*a - (unsigned char)*b;
 }
 
-static void sort_from(uint8_t fixed)
+static void sort_from(n31_app_list_t *l, uint8_t fixed)
 {
-    for (uint8_t i = fixed + 1; i < n31_app_count; i++) {
-        n31_app_t v = n31_apps[i];
+    for (uint8_t i = fixed + 1; i < l->count; i++) {
+        n31_app_t v = l->apps[i];
         uint8_t j = i;
-        while (j > fixed && name_cmp(n31_apps[j - 1].name, v.name) > 0) {
-            n31_apps[j] = n31_apps[j - 1];
+        while (j > fixed && name_cmp(l->apps[j - 1].name, v.name) > 0) {
+            l->apps[j] = l->apps[j - 1];
             j--;
         }
-        n31_apps[j] = v;
+        l->apps[j] = v;
     }
 }
 
 static void scan_one_dir(const char *apps_dir, void *ctx)
 {
-    (void)ctx;
-
+    n31_app_list_t *l = ctx;
     DIR *d = opendir(apps_dir);
     if (!d) return;
 
     struct dirent *e;
-    while ((e = readdir(d)) && n31_app_count < N31_MAX_APPS)
-        add_from_dir(apps_dir, e->d_name);
+    while ((e = readdir(d)) && l->count < N31_MAX_APPS)
+        add_from_dir(apps_dir, e->d_name, l);
     closedir(d);
 }
 
@@ -433,33 +433,35 @@ static void fingerprint_dir(const char *apps_dir, void *ctx)
     closedir(d);
 }
 
-static uint32_t s_fingerprint;
-static bool s_have_fingerprint;
+static n31_scan_state_t s_scan_state;
 
 void n31_apps_invalidate(void)
 {
-    s_have_fingerprint = false;
+    s_scan_state.valid = false;
 }
 
-bool n31_apps_scan(void)
+/*
+ * The whole scan, into a list the caller owns.
+ *
+ * No globals, no LVGL, no static scratch: everything it touches is either on
+ * its own stack or reached through `out` and `state`. That is what makes it
+ * safe to run on the scanner thread while the main loop keeps drawing.
+ */
+bool n31_apps_scan_into(n31_app_list_t *out, n31_scan_state_t *state)
 {
     uint32_t fp = 2166136261u;                      /* FNV-1a */
     for_each_apps_dir(fingerprint_dir, &fp);
 
     /* Nothing anywhere has changed since last time, so neither can the list.
-       This is the case almost every poll, and it now costs a readdir and a few
+       This is the case almost every poll, and it costs a readdir and a few
        stats instead of a manifest read per app. */
-    if (s_have_fingerprint && fp == s_fingerprint)
+    if (state->valid && fp == state->hash)
         return false;
 
-    s_fingerprint = fp;
-    s_have_fingerprint = true;
+    state->hash = fp;
+    state->valid = true;
 
-    n31_app_t before[N31_MAX_APPS];
-    uint8_t before_count = n31_app_count;
-    memcpy(before, n31_apps, sizeof before);
-
-    n31_app_count = 0;
+    memset(out, 0, sizeof *out);
 
     for (unsigned i = 0; i < sizeof k_builtin / sizeof k_builtin[0]; i++) {
         n31_app_t a;
@@ -479,14 +481,41 @@ bool n31_apps_scan(void)
             continue;   /* not installed: a row that opens nothing is worse
                            than a missing row - it looks like our bug */
 
-        n31_apps[n31_app_count++] = a;
+        out->apps[out->count++] = a;
     }
 
-    uint8_t fixed = n31_app_count;
-    n31_extra_first = fixed;
-    for_each_apps_dir(scan_one_dir, NULL);
-    sort_from(fixed);
+    out->extra_first = out->count;
+    for_each_apps_dir(scan_one_dir, out);
+    sort_from(out, out->extra_first);
 
-    if (before_count != n31_app_count) return true;
-    return memcmp(before, n31_apps, sizeof(n31_app_t) * n31_app_count) != 0;
+    return true;
+}
+
+void n31_apps_publish(const n31_app_list_t *list)
+{
+    memcpy(n31_apps, list->apps, sizeof n31_apps);
+    n31_app_count   = list->count;
+    n31_extra_first = list->extra_first;
+}
+
+/*
+ * The synchronous form, for the tests and for anything that has no thread to
+ * spare. The launcher does not use it: it would do NAND-backed reads on the
+ * loop that draws.
+ */
+bool n31_apps_scan(void)
+{
+    n31_app_list_t list;
+
+    if (!n31_apps_scan_into(&list, &s_scan_state))
+        return false;
+
+    /* The fingerprint changed, but the list it produces may not have - an app
+       touched without being altered, say. Compare before claiming a change. */
+    bool same = (list.count == n31_app_count) &&
+                memcmp(list.apps, n31_apps,
+                       sizeof(n31_app_t) * list.count) == 0;
+
+    n31_apps_publish(&list);
+    return !same;
 }
