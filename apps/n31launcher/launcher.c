@@ -140,13 +140,13 @@ static uint32_t s_launched_at;
 static n31_status_t s_status;
 
 /*
- * The volume comes up on its own. `s_mount_auto` distinguishes that from a
- * mount the user asked for: an automatic one reports quietly on the Extra apps
- * tile, and only a requested one is allowed to take the screen.
+ * The volume is mounted by n31-autostart before this process starts, so every
+ * run of the helper is now one the user asked for. `s_mount_auto` stays
+ * because the quiet reporting path it selects is still the right behaviour if
+ * a background bring-up is ever wanted again -- nothing sets it today.
  */
 static bool     s_mount_auto;
 static int      s_mount_tries;
-static uint32_t s_mount_retry_at;   /* 0 = nothing scheduled */
 
 static pid_t s_mount;             /* the mount helper */
 static int   s_mount_fd = -1;
@@ -425,7 +425,6 @@ static bool mount_start(bool automatic)
     if (s_mount) return false;
 
     s_mount_auto = automatic;
-    s_mount_retry_at = 0;
 
     int fd[2];
     if (pipe(fd) < 0) return false;
@@ -481,7 +480,6 @@ static void mount_done(void)
     mount_cleanup();
     s_mount_finished = true;
     s_mount_tries = 0;
-    s_mount_retry_at = 0;
     n31_ui_mount_progress(false, 0, NULL);
 
     /* The folders were not readable a moment ago, so the fingerprint from
@@ -512,21 +510,17 @@ static void mount_failed(const char *why)
     s_mount_finished = true;
     s_mount_tries++;
 
-    /* Try again, less often each time. The helper escalates on its own, so
-       the next attempt does something the last one did not. */
-    if (s_mount_tries < MOUNT_RETRIES) {
-        uint32_t wait = MOUNT_RETRY_MS * (uint32_t)s_mount_tries;
-        if (wait > MOUNT_RETRY_MAX_MS) wait = MOUNT_RETRY_MAX_MS;
-        s_mount_retry_at = millis() + wait;
-    } else {
-        s_mount_retry_at = 0;
-    }
+    /*
+     * No automatic retry. The helper no longer escalates -- it will not
+     * reload the NAND stack -- so a second unattended attempt would repeat
+     * the first exactly, and each one costs a full scan. Pressing PLAY runs
+     * it again, which is the same thing with someone watching.
+     */
 
     if (automatic) {
         /* Said on the tile, not by hijacking the screen. Pressing PLAY on the
            empty list still gets the full story. */
-        n31_ui_mount_progress(false, 0,
-                              s_mount_retry_at ? "retrying" : "unavailable");
+        n31_ui_mount_progress(false, 0, "unavailable");
         if (s_screen == SCREEN_HOME) n31_ui_home();
         else if (s_screen == SCREEN_EXTRAS)
             n31_ui_extras(s_selected, disk_mounted());
@@ -863,13 +857,22 @@ int main(int argc, char **argv)
     go(SCREEN_HOME);
 
     /*
-     * Start bringing the volume up immediately. It takes about a minute and
-     * nothing else needs it, so there is no reason to make the user ask - and
-     * by the time they have looked at the home screen and pressed anything it
-     * is usually already there.
+     * The volume is brought up by n31-autostart, before this ever runs:
+     * load-mods storage does the insmod and the recover, then autostart
+     * mounts /mnt/disk and only then starts the launcher.
+     *
+     * This used to start the helper here as well, on the reasoning that
+     * nothing else needed the volume. Something else did. Two independent
+     * bring-ups raced, and because the helper's first stage asks for a
+     * recover whenever the map does not look valid *to it*, the whole
+     * thirty-second classify pass ran twice on every boot -- the second
+     * result identical to the first and thrown away.
+     *
+     * So the helper is now only ever run because someone asked for it, from
+     * the Extras tile. If autostart could not mount the volume, that is a
+     * fault to show and retry deliberately, not to paper over by starting a
+     * second bring-up behind the user's back.
      */
-    if (!disk_mounted())
-        mount_start(true);
 
     uint32_t last_scan = millis();
     uint32_t last_status = millis();
@@ -936,13 +939,11 @@ int main(int argc, char **argv)
            already stale on screen. */
         rescan();
 
-        /* A scheduled retry after a failed automatic mount. */
-        if (!s_mount && s_mount_retry_at &&
-            (int32_t)(millis() - s_mount_retry_at) >= 0) {
-            s_mount_retry_at = 0;
-            if (!disk_mounted())
-                mount_start(true);
-        }
+        /*
+         * No scheduled retry. It only ever rearmed the automatic mount that
+         * no longer happens, and an unattended retry of a bring-up is how a
+         * single failure turns into a loop of thirty-second scans.
+         */
 
         /* Only the home screen shows either of these, so only sample for it. */
         if (s_screen == SCREEN_HOME) {
