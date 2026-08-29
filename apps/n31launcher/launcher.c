@@ -81,6 +81,19 @@
    them change faster than that in any way worth drawing. */
 #define STATUS_MS 1000
 
+/*
+ * How long to wait before trying the volume again after a failure, and how far
+ * to back off. The helper escalates internally - load, recover, BPB fallback,
+ * reload the stack - so each retry is a different attempt rather than the same
+ * one repeated, and it is worth doing more than once.
+ *
+ * It backs off because the failure that is not going to fix itself (no NAND at
+ * all) should not sit in a retry loop for the life of the session.
+ */
+#define MOUNT_RETRY_MS     15000
+#define MOUNT_RETRY_MAX_MS 120000
+#define MOUNT_RETRIES      6
+
 /* Tilt, which has to keep up with the hand holding the device. One short read
    and three small moves, so this is cheap enough to do properly. */
 #define TILT_MS 80
@@ -110,6 +123,15 @@ static screen_t s_child_from;     /* the screen to come back to */
 static uint32_t s_launched_at;
 
 static n31_status_t s_status;
+
+/*
+ * The volume comes up on its own. `s_mount_auto` distinguishes that from a
+ * mount the user asked for: an automatic one reports quietly on the Extra apps
+ * tile, and only a requested one is allowed to take the screen.
+ */
+static bool     s_mount_auto;
+static int      s_mount_tries;
+static uint32_t s_mount_retry_at;   /* 0 = nothing scheduled */
 
 static pid_t s_mount;             /* the mount helper */
 static int   s_mount_fd = -1;
@@ -312,6 +334,14 @@ static bool app_gone(void)
 
 static void mount_draw(void)
 {
+    if (s_mount_auto) {
+        /* Only the tile, and only when it is on screen. */
+        n31_ui_mount_progress(true, s_mount_pct, s_mount_phase);
+        if (s_screen == SCREEN_HOME) n31_ui_home();
+        s_mount_drawn = millis();
+        return;
+    }
+
     n31_ui_mounting(s_mount_pct, s_mount_phase,
                     (int)((millis() - s_mount_at) / 1000u));
     s_mount_drawn = millis();
@@ -334,9 +364,12 @@ static void mount_cancel(void)
     s_mount_len = 0;
 }
 
-static bool mount_start(void)
+static bool mount_start(bool automatic)
 {
     if (s_mount) return false;
+
+    s_mount_auto = automatic;
+    s_mount_retry_at = 0;
 
     int fd[2];
     if (pipe(fd) < 0) return false;
@@ -372,25 +405,78 @@ static bool mount_start(void)
     s_mount_finished = false;
     snprintf(s_mount_phase, sizeof s_mount_phase, "starting");
 
-    mount_draw();
-    go(SCREEN_MOUNTING);
+    /* An automatic mount stays out of the way: it reports on the Extra apps
+       tile and leaves you on whatever screen you were using. Only a mount the
+       user asked for gets the whole screen. */
+    if (automatic) {
+        n31_ui_mount_progress(true, s_mount_pct, s_mount_phase);
+        if (s_screen == SCREEN_HOME) n31_ui_home();
+    } else {
+        mount_draw();
+        go(SCREEN_MOUNTING);
+    }
     return true;
 }
 
 static void mount_done(void)
 {
+    bool automatic = s_mount_auto;
+
     mount_cleanup();
     s_mount_finished = true;
+    s_mount_tries = 0;
+    s_mount_retry_at = 0;
+    n31_ui_mount_progress(false, 0, NULL);
 
+    /* The folders were not readable a moment ago, so the fingerprint from
+       before the mount says nothing about what is on them now. */
+    n31_apps_invalidate();
     n31_apps_scan();
+
+    if (automatic) {
+        /* Whatever the user is looking at, keep them there - but redraw it,
+           because the app list underneath it has just changed. */
+        if (s_screen == SCREEN_HOME) n31_ui_home();
+        else if (s_screen == SCREEN_EXTRAS) {
+            if (s_selected < (int)n31_extra_first)
+                s_selected = (int)n31_extra_first;
+            n31_ui_extras(s_selected, disk_mounted());
+        }
+        return;
+    }
+
     s_selected = (int)n31_extra_first;
     go(SCREEN_EXTRAS);
 }
 
 static void mount_failed(const char *why)
 {
+    bool automatic = s_mount_auto;
+
     mount_cleanup();
     s_mount_finished = true;
+    s_mount_tries++;
+
+    /* Try again, less often each time. The helper escalates on its own, so
+       the next attempt does something the last one did not. */
+    if (s_mount_tries < MOUNT_RETRIES) {
+        uint32_t wait = MOUNT_RETRY_MS * (uint32_t)s_mount_tries;
+        if (wait > MOUNT_RETRY_MAX_MS) wait = MOUNT_RETRY_MAX_MS;
+        s_mount_retry_at = millis() + wait;
+    } else {
+        s_mount_retry_at = 0;
+    }
+
+    if (automatic) {
+        /* Said on the tile, not by hijacking the screen. Pressing PLAY on the
+           empty list still gets the full story. */
+        n31_ui_mount_progress(false, 0,
+                              s_mount_retry_at ? "retrying" : "unavailable");
+        if (s_screen == SCREEN_HOME) n31_ui_home();
+        else if (s_screen == SCREEN_EXTRAS)
+            n31_ui_extras(s_selected, disk_mounted());
+        return;
+    }
 
     n31_ui_mount_failed(why && *why ? why : "no reason given");
     go(SCREEN_MOUNT_FAILED);
@@ -604,9 +690,17 @@ static void on_key(uint16_t code, int32_t value)
         if (!pressed || settling()) return;
 
         if (code == N31_KEY_PLAYPAUSE) {
-            if (n31_extra_count) open_app(&n31_apps[s_selected]);
-            else if (!mount_start())
+            if (n31_extra_count) {
+                open_app(&n31_apps[s_selected]);
+            } else if (s_mount) {
+                /* Already running in the background - show it properly
+                   rather than refusing or starting a second one. */
+                s_mount_auto = false;
+                mount_draw();
+                go(SCREEN_MOUNTING);
+            } else if (!mount_start(false)) {
                 n31_ui_status("cannot start helper");
+            }
         } else if (code == N31_KEY_HOMEPAGE) {
             go(SCREEN_HOME);
         }
@@ -616,13 +710,14 @@ static void on_key(uint16_t code, int32_t value)
         /* A progress bar you cannot escape from is a hang with extra steps. */
         if (pressed && code == N31_KEY_HOMEPAGE) {
             mount_cancel();
+            n31_ui_mount_progress(false, 0, NULL);
             go(SCREEN_EXTRAS);
         }
         return;
 
     case SCREEN_MOUNT_FAILED:
         if (!pressed || settling()) return;
-        if (code == N31_KEY_PLAYPAUSE)     mount_start();
+        if (code == N31_KEY_PLAYPAUSE)     mount_start(false);
         else if (code == N31_KEY_HOMEPAGE) go(SCREEN_EXTRAS);
         return;
     }
@@ -698,6 +793,15 @@ int main(int argc, char **argv)
     n31_ui_status_bar(&s_status);
     go(SCREEN_HOME);
 
+    /*
+     * Start bringing the volume up immediately. It takes about a minute and
+     * nothing else needs it, so there is no reason to make the user ask - and
+     * by the time they have looked at the home screen and pressed anything it
+     * is usually already there.
+     */
+    if (!disk_mounted())
+        mount_start(true);
+
     uint32_t last_scan = millis();
     uint32_t last_status = millis();
     uint32_t last_tilt = millis();
@@ -728,6 +832,14 @@ int main(int argc, char **argv)
         if (!s_mount && millis() - last_scan >= RESCAN_MS) {
             last_scan = millis();
             rescan();
+        }
+
+        /* A scheduled retry after a failed automatic mount. */
+        if (!s_mount && s_mount_retry_at &&
+            (int32_t)(millis() - s_mount_retry_at) >= 0) {
+            s_mount_retry_at = 0;
+            if (!disk_mounted())
+                mount_start(true);
         }
 
         /* Only the home screen shows either of these, so only sample for it. */

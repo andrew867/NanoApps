@@ -159,6 +159,7 @@ static lv_obj_t *footer(lv_obj_t *screen, const char *text)
 typedef struct {
     lv_obj_t *root;
     lv_obj_t *tagline;
+    lv_obj_t *bar;         /* progress across the bottom, extras tile only */
     lv_obj_t *icon;        /* moved a couple of pixels by the accelerometer */
     int       icon_x, icon_y;
     int       depth;       /* per tile, so they do not move as one flat sheet */
@@ -178,6 +179,11 @@ static lv_obj_t *s_ic_play;
 static lv_obj_t *s_ic_fm;
 static lv_obj_t *s_ic_batt;
 static lv_obj_t *s_ic_pct;
+
+/* A background mount, reported on the extras tile. */
+static bool s_mounting;
+static int  s_mount_pct;
+static char s_mount_text[40];
 
 /*
  * One home tile.
@@ -217,6 +223,11 @@ static void build_tile(tile_t *t, lv_obj_t *screen, int y, const char *name,
     t->tagline = fitted(t->root, tagline, F_CAPTION, C_TEXT_DIM, rx, 58, rw, 18);
 
     panel(t->root, MARGIN, TILE_H - 1, CONTENT_W, 1, C_HAIRLINE);
+
+    /* Sits on the hairline, so it reads as the tile filling up rather than as
+       another thing on the screen. Hidden unless something is happening. */
+    t->bar = panel(t->root, MARGIN, TILE_H - 2, 1, 2, accent);
+    lv_obj_add_flag(t->bar, LV_OBJ_FLAG_HIDDEN);
 }
 
 /*
@@ -280,19 +291,54 @@ static void build_home(void)
     s_tile[N31_TILE_MUSIC].depth  = 13;
 }
 
+void n31_ui_mount_progress(bool running, int pct, const char *text)
+{
+    s_mounting = running;
+    s_mount_pct = pct;
+    snprintf(s_mount_text, sizeof s_mount_text, "%s", text ? text : "");
+}
+
 void n31_ui_home(void)
 {
-    /* The extras tile says how many there are, because the answer is usually
-       none and finding that out by pressing is a wasted trip. */
-    char t[32];
-    if (n31_app_count > N31_BUILTIN_COUNT) {
-        int n = (int)n31_app_count - N31_BUILTIN_COUNT;
-        snprintf(t, sizeof t, "%d on the volume", n);
-    } else {
-        snprintf(t, sizeof t, "None yet");
-    }
-    lv_label_set_text(s_tile[N31_TILE_EXTRAS].tagline, t);
+    tile_t *x = &s_tile[N31_TILE_EXTRAS];
+    char t[40];
 
+    /*
+     * The tile answers "is there anything in there". While the volume is
+     * coming up the honest answer is "not yet, and here is how far", which is
+     * the same question - so the count gives way to the phase rather than
+     * sitting there saying None while something is clearly happening.
+     */
+    if (s_mounting) {
+        if (s_mount_text[0]) snprintf(t, sizeof t, "%s", s_mount_text);
+        else                 snprintf(t, sizeof t, "Mounting...");
+
+        if (s_mount_pct >= 0) {
+            int w = CONTENT_W * s_mount_pct / 100;
+            lv_obj_set_size(x->bar, w < 1 ? 1 : w, 2);
+            show(x->bar, true);
+        } else {
+            /* No known total for this phase. A full-width dim line says
+               "working" without claiming a position. */
+            lv_obj_set_size(x->bar, CONTENT_W, 2);
+            show(x->bar, true);
+        }
+    } else {
+        show(x->bar, false);
+
+        if (n31_app_count > N31_BUILTIN_COUNT) {
+            int n = (int)n31_app_count - N31_BUILTIN_COUNT;
+            snprintf(t, sizeof t, "%d on the volume", n);
+        } else if (s_mount_text[0]) {
+            /* It stopped without mounting: say so here rather than making the
+               user go and look. */
+            snprintf(t, sizeof t, "No volume - %s", s_mount_text);
+        } else {
+            snprintf(t, sizeof t, "None yet");
+        }
+    }
+
+    lv_label_set_text(x->tagline, t);
     lv_screen_load(s_home);
 }
 

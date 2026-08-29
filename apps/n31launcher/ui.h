@@ -27,6 +27,13 @@
 
 void n31_ui_init(void);
 
+/*
+ * A mount happening in the background, shown on the Extra apps tile rather
+ * than by taking the screen. `pct` of -1 means indeterminate; `text` is the
+ * current phase, or a short reason once it has stopped.
+ */
+void n31_ui_mount_progress(bool running, int pct, const char *text);
+
 /* The three fixed tiles. `hot` lights one while its app starts. */
 void n31_ui_home(void);
 void n31_ui_home_hot(int tile, bool on);

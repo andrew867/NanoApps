@@ -82,8 +82,20 @@ extern uint8_t   n31_extra_first;
  * mounted when the launcher starts, so the list is rebuilt periodically and an
  * app that appears later simply appears.
  *
+ * Cheap to call often. It fingerprints the app folders first - a readdir and a
+ * stat apiece - and only re-reads the manifests when that changes, because on
+ * the internal volume every manifest read is a NAND-backed sector and this runs
+ * every couple of seconds for as long as the device is on.
+ *
  * Returns true if the list changed.
  */
 bool n31_apps_scan(void);
+
+/*
+ * Force the next scan to do the full work, ignoring the fingerprint. For the
+ * moment a volume finishes mounting: the folders were not readable a second
+ * ago, so their fingerprint is not evidence of anything.
+ */
+void n31_apps_invalidate(void);
 
 #endif /* N31_LAUNCHER_APPS_H */

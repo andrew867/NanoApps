@@ -5,8 +5,10 @@
 #include "apps.h"
 
 #include <dirent.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 n31_app_t n31_apps[N31_MAX_APPS];
@@ -65,9 +67,22 @@ static void copy_str(char *dst, size_t cap, const char *src)
     dst[i] = 0;
 }
 
+/*
+ * A runnable file - and the regular-file test is the point of it. X_OK on a
+ * directory means "searchable", which every directory is, so access() alone
+ * says yes to the app folder itself. The flat-copy fallback below looks at
+ * <apps>/<name>, which IS that folder, so without this every folder that
+ * happened to contain no binary was listed as an app that then did nothing.
+ */
 static bool executable(const char *path)
 {
-    return path && *path && access(path, X_OK) == 0;
+    struct stat st;
+
+    if (!path || !*path) return false;
+    if (stat(path, &st) != 0) return false;
+    if (!S_ISREG(st.st_mode)) return false;
+
+    return access(path, X_OK) == 0;
 }
 
 /*
@@ -242,13 +257,35 @@ static bool resolve_builtin(const char *prog, char *out, size_t cap)
     return false;
 }
 
-/* Every mounted place n31os/apps might be, handed one at a time to `fn`.
+/*
+ * Places that are not a mount.
+ *
+ * /tmp/n31os/apps is the development path: scp an app folder there on a running
+ * device and it appears in the list within a couple of seconds, with no mount,
+ * no remount and no restart. It is checked first so a copy staged there shadows
+ * the volume's version of the same app, which is what you want when testing a
+ * build against the installed one.
+ */
+static const char *k_fixed_roots[] = {
+    "/tmp/n31os/apps",
+    "/run/n31os/apps",
+};
+
+/* Every place n31os/apps might be, handed one at a time to `fn`.
    The volume's mount point is not settled, so this looks under everything in
    /mnt rather than naming one - and /mnt/disk, which is what n31-autostart
    uses today, is simply one of the answers that turns up. */
 static void for_each_apps_dir(void (*fn)(const char *apps_dir, void *ctx),
                               void *ctx)
 {
+    for (unsigned i = 0; i < sizeof k_fixed_roots / sizeof k_fixed_roots[0];
+         i++) {
+        DIR *f = opendir(k_fixed_roots[i]);
+        if (!f) continue;
+        closedir(f);
+        fn(k_fixed_roots[i], ctx);
+    }
+
     DIR *mnt = opendir("/mnt");
     if (!mnt) return;
 
@@ -351,8 +388,73 @@ static void find_builtin(const char *apps_dir, void *ctx)
                           h->a->path, sizeof h->a->path);
 }
 
+/* ---- the cheap check ------------------------------------------------------ */
+
+/*
+ * A hash of what is on offer, without reading any of it: the folder names, and
+ * the mtime and size of each folder and of its manifest. That catches an app
+ * appearing, disappearing, or having its app.json rewritten, which is every
+ * change that alters this list.
+ *
+ * It deliberately does not catch a binary replaced under the same name. That
+ * does not change the list, and the launcher execs the binary fresh on every
+ * launch, so the new one is picked up regardless.
+ */
+static void fingerprint_dir(const char *apps_dir, void *ctx)
+{
+    uint32_t *h = ctx;
+    DIR *d = opendir(apps_dir);
+    if (!d) return;
+
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+
+        for (const char *c = e->d_name; *c; c++) {
+            *h ^= (unsigned char)*c;
+            *h *= 16777619u;
+        }
+
+        char p[224];
+        struct stat st;
+
+        snprintf(p, sizeof p, "%s/%s", apps_dir, e->d_name);
+        if (stat(p, &st) == 0) {
+            *h ^= (uint32_t)st.st_mtime; *h *= 16777619u;
+            *h ^= (uint32_t)st.st_size;  *h *= 16777619u;
+        }
+
+        snprintf(p, sizeof p, "%s/%s/app.json", apps_dir, e->d_name);
+        if (stat(p, &st) == 0) {
+            *h ^= (uint32_t)st.st_mtime; *h *= 16777619u;
+            *h ^= (uint32_t)st.st_size;  *h *= 16777619u;
+        }
+    }
+    closedir(d);
+}
+
+static uint32_t s_fingerprint;
+static bool s_have_fingerprint;
+
+void n31_apps_invalidate(void)
+{
+    s_have_fingerprint = false;
+}
+
 bool n31_apps_scan(void)
 {
+    uint32_t fp = 2166136261u;                      /* FNV-1a */
+    for_each_apps_dir(fingerprint_dir, &fp);
+
+    /* Nothing anywhere has changed since last time, so neither can the list.
+       This is the case almost every poll, and it now costs a readdir and a few
+       stats instead of a manifest read per app. */
+    if (s_have_fingerprint && fp == s_fingerprint)
+        return false;
+
+    s_fingerprint = fp;
+    s_have_fingerprint = true;
+
     n31_app_t before[N31_MAX_APPS];
     uint8_t before_count = n31_app_count;
     memcpy(before, n31_apps, sizeof before);

@@ -20,6 +20,22 @@ LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_host.h\
 CFLAGS := -O1 -g -std=gnu99 -Wall -Wextra -Wno-unused-parameter
 SRCS := preview.c ../ui.c ../apps.c ../status.c
 
+# The app scan, against a real directory tree. Needs no LVGL and no
+# device, and it is what caught the flat-copy fallback listing every folder
+# that had no binary in it: access(dir, X_OK) is true for any directory.
+.PHONY: scantest
+scantest:
+	@mkdir -p $(BUILD)
+	@$(CC) -O1 -I.. -o $(BUILD)/scantest tests/scantest.c ../apps.c
+	@rm -rf /tmp/n31os
+	@mkdir -p /tmp/n31os/apps/demo /tmp/n31os/apps/bare /tmp/n31os/apps/empty
+	@printf '#!/bin/sh\ntrue\n' > /tmp/n31os/apps/demo/demo
+	@printf '#!/bin/sh\ntrue\n' > /tmp/n31os/apps/bare/bare
+	@chmod +x /tmp/n31os/apps/demo/demo /tmp/n31os/apps/bare/bare
+	@printf '%s\n' '{ "name": "Demo App", "exec": "demo", "tagline": "a test", "glyph": "DA", "color": "#f43f5e", "screen": "console" }' > /tmp/n31os/apps/demo/app.json
+	@touch /tmp/n31os/apps/empty/readme
+	@$(BUILD)/scantest; rc=$$?; rm -rf /tmp/n31os; exit $$rc
+
 .PHONY: shots clean
 shots: $(BUILD)/preview
 	@mkdir -p shots
