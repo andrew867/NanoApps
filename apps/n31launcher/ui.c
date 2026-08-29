@@ -47,6 +47,7 @@
 #define F_NAME    (&lv_font_montserrat_20)
 #define F_BODY    (&lv_font_montserrat_16)
 #define F_CAPTION (&lv_font_montserrat_14)
+#define F_TINY    (&lv_font_montserrat_12)
 
 #define MARGIN    12
 #define CONTENT_W (N31_SCREEN_W - 2 * MARGIN)
@@ -275,15 +276,17 @@ static void build_home(void)
                "TinyPod", "Music", "TP", "VOL -", C_MUSIC);
 
     /*
-     * The gap under the tiles. Small, dim, and elided rather than wrapped:
-     * this is a hint that something is happening, not something to read
-     * closely, and a second line would push it into the footer.
+     * The gap under the tiles. Three lines at 12 pt, because a kernel message
+     * about the FTL runs to eighty or ninety characters and one 14 pt line
+     * showed the first third of it - which tells you something is happening
+     * and not what. LONG_DOT still elides anything longer than the three
+     * lines rather than letting it run into the bottom of the screen.
      */
-    s_home_note = label(s_home, "", F_CAPTION, C_TEXT_MUTE);
-    lv_obj_set_size(s_home_note, CONTENT_W, 18);
+    s_home_note = label(s_home, "", F_TINY, C_TEXT_MUTE);
+    lv_obj_set_size(s_home_note, CONTENT_W, 46);
     lv_label_set_long_mode(s_home_note, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_align(s_home_note, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_pos(s_home_note, MARGIN, TILE_TOP + 3 * TILE_H + 8);
+    lv_obj_set_pos(s_home_note, MARGIN, TILE_TOP + 3 * TILE_H + 6);
     lv_obj_add_flag(s_home_note, LV_OBJ_FLAG_HIDDEN);
 
     /* Different amounts, so tilting reads as depth rather than as the whole
@@ -575,7 +578,7 @@ static void build_extras(void)
     /* A card, not a message centred on an empty screen. It has appeared over
        the list and it wants a keypress, and an edge and a raised surface are
        what say so. */
-    s_none = panel(s_extras, MARGIN, 100, CONTENT_W, 204, C_SURFACE);
+    s_none = panel(s_extras, MARGIN, 112, CONTENT_W, 180, C_SURFACE);
     lv_obj_set_style_radius(s_none, 8, 0);
     lv_obj_set_style_border_width(s_none, 1, 0);
     lv_obj_set_style_border_color(s_none, lv_color_hex(C_HAIRLINE), 0);
@@ -588,19 +591,22 @@ static void build_extras(void)
 
     s_none_body = label(s_none, "", F_CAPTION, C_TEXT_DIM);
     lv_obj_set_style_text_align(s_none_body, LV_TEXT_ALIGN_CENTER, 0);
-    /* Three lines at 14 pt. The longest of these messages needs all three, and
-       a label given fewer simply clips - it does not shrink the text. */
-    lv_obj_set_size(s_none_body, CONTENT_W - 24, 56);
+    /*
+     * Five lines' worth. It was three, and the longest of these messages wraps
+     * to four, so it lost its last word - a label given too little height
+     * clips, it does not shrink the text. The hint below is always empty now
+     * that the modal offers nothing, so the space is free.
+     */
+    lv_obj_set_size(s_none_body, CONTENT_W - 24, 96);
     lv_obj_set_pos(s_none_body, 12, 56);
 
     s_none_hint = label(s_none, "", F_CAPTION, C_EXTRAS);
     lv_obj_set_style_text_align(s_none_hint, LV_TEXT_ALIGN_CENTER, 0);
-    /* Left to wrap, and given the three lines that produces. Hand-breaking
-       this text guessed the width wrong twice: the explicit newline stayed put
-       while the words around it wrapped anyway, so the last line fell off the
-       bottom of the card both times. */
-    lv_obj_set_size(s_none_hint, CONTENT_W - 24, 64);
-    lv_obj_set_pos(s_none_hint, 12, 120);
+    /* Nothing is offered any more, so this is empty and sized to nothing.
+       Kept rather than deleted because the modal will want a line again the
+       moment there is something to say. */
+    lv_obj_set_size(s_none_hint, CONTENT_W - 24, 18);
+    lv_obj_set_pos(s_none_hint, 12, 156);
 
     s_extras_foot = footer(s_extras, "");
 }
