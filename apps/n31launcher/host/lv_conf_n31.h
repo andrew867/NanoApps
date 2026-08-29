@@ -31,6 +31,11 @@
 #undef  LV_MEM_ADR
 #define LV_MEM_ADR              0
 
+/* A smaller face for the kernel line under the tiles. Its messages run to
+   eighty or ninety characters and there is one narrow gap to put them in. */
+#undef  LV_FONT_MONTSERRAT_12
+#define LV_FONT_MONTSERRAT_12   1
+
 /* No SDL, no DRM, no GPU. Framebuffer and evdev only. */
 #undef  LV_USE_SDL
 #define LV_USE_SDL              0

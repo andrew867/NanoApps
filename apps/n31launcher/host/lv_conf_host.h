@@ -20,6 +20,12 @@
 #undef  LV_LIMITS_INCLUDE
 #define LV_LIMITS_INCLUDE       <limits.h>
 
+/* Kept in step with lv_conf_n31.h: this file is the device config with
+   only the display and input drivers changed, so the font set has to
+   match or the host preview stops predicting the device. */
+#undef  LV_FONT_MONTSERRAT_12
+#define LV_FONT_MONTSERRAT_12   1
+
 /* Host display backends. SDL is what you develop against; fbdev and DRM are
    what the brief actually targets, and all three are compiled in so the same
    binary runs on a dev laptop and on a tinydrm panel. */

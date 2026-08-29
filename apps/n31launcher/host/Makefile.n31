@@ -10,19 +10,45 @@
 #
 #   make -f Makefile.n31 LVLIB=/path/to/liblvgl_n31.a
 
+# Stated rather than inherited from whichever rule happens to come first:
+# adding the cache-directory rule above `all` silently made THAT the default,
+# and a bare make started reporting an empty directory as up to date.
+.DEFAULT_GOAL := all
+
 IPOD_ROOT ?= /mnt/c/src/ipod/artifacts/linux-n31
 TOOLCHAIN ?= $(IPOD_ROOT)/tinyalsa-build/arm-linux-musleabi-cross
 SSH_KEY   ?= $(IPOD_ROOT)/n31_id
 DEVICE    ?= root@192.168.7.2
 
-CC     := $(TOOLCHAIN)/bin/arm-linux-musleabi-gcc
+# ccache if it is installed, nothing if it is not. LVGL is four hundred
+# odd translation units and most rebuilds recompile all of them
+# identically.
+CCACHE := $(shell command -v ccache 2>/dev/null)
+
+CC     := $(CCACHE) $(TOOLCHAIN)/bin/arm-linux-musleabi-gcc
 STRIP  := $(TOOLCHAIN)/bin/arm-linux-musleabi-strip
 AR     := $(TOOLCHAIN)/bin/arm-linux-musleabi-ar
 BUILD  := build-n31
 LVGL   ?= ../../../lvgl
 LV_CONF := lv_conf_n31.h
 
-LVLIB_OWN := $(BUILD)/liblvgl_n31.a
+# LVGL objects live on the native filesystem, not the Windows drive.
+#
+# A full pass measured twelve minutes wall for four and a half of CPU. The rest
+# was drvfs: four hundred and sixty-six object files written across the mount.
+# The kernel build keeps its output under /home for exactly this reason.
+#
+# The directory is named after the hash of the config that produced the
+# objects, so switching branch - which rewrites lv_conf and moves its mtime
+# without changing a byte - reuses what is already there instead of rebuilding
+# it, and flipping a config option back finds its old objects still present.
+LV_CONF_ID := $(shell md5sum $(LV_CONF) 2>/dev/null | cut -c1-12)
+LV_CACHE   ?= $(HOME)/.cache/n31-lvgl/launcher-n31-$(LV_CONF_ID)
+
+$(LV_CACHE):
+	@mkdir -p $@
+
+LVLIB_OWN  = $(LV_CACHE)/liblvgl_n31.a
 LVLIB     ?= $(LVLIB_OWN)
 
 ARCH_FLAGS := -mcpu=cortex-a8 -mthumb -mfpu=vfpv3-d16 -mfloat-abi=softfp
@@ -52,15 +78,15 @@ all: $(APP)
 # subset by hand is how you discover a missing symbol six months later. It is a
 # few hundred files, so the first build takes a while - pass -j.
 LV_SRCS := $(shell find $(LVGL)/src -name '*.c')
-LV_OBJS := $(patsubst $(LVGL)/%.c,$(BUILD)/lvgl/%.o,$(LV_SRCS))
+LV_OBJS := $(patsubst $(LVGL)/%.c,$(LV_CACHE)/%.o,$(LV_SRCS))
 
-$(BUILD)/lvgl/%.o: $(LVGL)/%.c
+$(LV_CACHE)/%.o: $(LVGL)/%.c
 	@mkdir -p $(dir $@)
 	@$(CC) $(CFLAGS) $(LV_CFLAGS) -c -o $@ $<
 
 # Coarse, but right: the config decides what LVGL compiles to, so changing it
 # has to rebuild all of it.
-$(LV_OBJS): $(LV_CONF)
+$(LV_OBJS): | $(LV_CACHE)
 
 $(LVLIB_OWN): $(LV_OBJS)
 	@echo "AR $@"
