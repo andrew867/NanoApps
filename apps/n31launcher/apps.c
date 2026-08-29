@@ -447,9 +447,31 @@ void n31_apps_invalidate(void)
  * its own stack or reached through `out` and `state`. That is what makes it
  * safe to run on the scanner thread while the main loop keeps drawing.
  */
+/*
+ * The set of mounts, folded into the fingerprint.
+ *
+ * The folder walk below notices a volume appearing, because its folders appear
+ * with it. This notices the mount itself, which is the actual event - a volume
+ * unmounted, or swapped for another one whose folders happen to look identical.
+ * One small read of a procfs file that is already in memory.
+ */
+static void fingerprint_mounts(uint32_t *h)
+{
+    FILE *f = fopen("/proc/mounts", "r");
+    if (!f) return;
+
+    int c;
+    while ((c = fgetc(f)) != EOF) {
+        *h ^= (unsigned char)c;
+        *h *= 16777619u;
+    }
+    fclose(f);
+}
+
 bool n31_apps_scan_into(n31_app_list_t *out, n31_scan_state_t *state)
 {
     uint32_t fp = 2166136261u;                      /* FNV-1a */
+    fingerprint_mounts(&fp);
     for_each_apps_dir(fingerprint_dir, &fp);
 
     /* Nothing anywhere has changed since last time, so neither can the list.

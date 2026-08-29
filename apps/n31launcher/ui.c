@@ -159,7 +159,6 @@ static lv_obj_t *footer(lv_obj_t *screen, const char *text)
 typedef struct {
     lv_obj_t *root;
     lv_obj_t *tagline;
-    lv_obj_t *bar;         /* progress across the bottom, extras tile only */
     lv_obj_t *icon;        /* moved a couple of pixels by the accelerometer */
     int       icon_x, icon_y;
     int       depth;       /* per tile, so they do not move as one flat sheet */
@@ -179,11 +178,6 @@ static lv_obj_t *s_ic_play;
 static lv_obj_t *s_ic_fm;
 static lv_obj_t *s_ic_batt;
 static lv_obj_t *s_ic_pct;
-
-/* A background mount, reported on the extras tile. */
-static bool s_mounting;
-static int  s_mount_pct;
-static char s_mount_text[40];
 
 /*
  * One home tile.
@@ -223,11 +217,6 @@ static void build_tile(tile_t *t, lv_obj_t *screen, int y, const char *name,
     t->tagline = fitted(t->root, tagline, F_CAPTION, C_TEXT_DIM, rx, 58, rw, 18);
 
     panel(t->root, MARGIN, TILE_H - 1, CONTENT_W, 1, C_HAIRLINE);
-
-    /* Sits on the hairline, so it reads as the tile filling up rather than as
-       another thing on the screen. Hidden unless something is happening. */
-    t->bar = panel(t->root, MARGIN, TILE_H - 2, 1, 2, accent);
-    lv_obj_add_flag(t->bar, LV_OBJ_FLAG_HIDDEN);
 }
 
 /*
@@ -291,58 +280,24 @@ static void build_home(void)
     s_tile[N31_TILE_MUSIC].depth  = 13;
 }
 
-void n31_ui_mount_progress(bool running, int pct, const char *text)
-{
-    s_mounting = running;
-    s_mount_pct = pct;
-    snprintf(s_mount_text, sizeof s_mount_text, "%s", text ? text : "");
-}
-
 void n31_ui_home(void)
 {
     tile_t *x = &s_tile[N31_TILE_EXTRAS];
     char t[40];
 
-    /*
-     * The tile answers "is there anything in there". While the volume is
-     * coming up the honest answer is "not yet, and here is how far", which is
-     * the same question - so the count gives way to the phase rather than
-     * sitting there saying None while something is clearly happening.
-     */
-    if (s_mounting) {
-        if (s_mount_text[0]) snprintf(t, sizeof t, "%s", s_mount_text);
-        else                 snprintf(t, sizeof t, "Mounting...");
-
-        if (s_mount_pct >= 0) {
-            int w = CONTENT_W * s_mount_pct / 100;
-            lv_obj_set_size(x->bar, w < 1 ? 1 : w, 2);
-            show(x->bar, true);
-        } else {
-            /* No known total for this phase. A full-width dim line says
-               "working" without claiming a position. */
-            lv_obj_set_size(x->bar, CONTENT_W, 2);
-            show(x->bar, true);
-        }
+    /* The count is the useful part: pressing through to find out there is
+       nothing there is a wasted trip. */
+    if (n31_app_count > N31_BUILTIN_COUNT) {
+        int n = (int)n31_app_count - N31_BUILTIN_COUNT;
+        snprintf(t, sizeof t, "%d on the volume", n);
     } else {
-        show(x->bar, false);
-
-        if (n31_app_count > N31_BUILTIN_COUNT) {
-            int n = (int)n31_app_count - N31_BUILTIN_COUNT;
-            snprintf(t, sizeof t, "%d on the volume", n);
-        } else if (s_mount_text[0]) {
-            /* It stopped without mounting: say so here rather than making the
-               user go and look. */
-            snprintf(t, sizeof t, "No volume - %s", s_mount_text);
-        } else {
-            snprintf(t, sizeof t, "None yet");
-        }
+        snprintf(t, sizeof t, "None yet");
     }
 
     lv_label_set_text(x->tagline, t);
     lv_screen_load(s_home);
 }
 
-/* Which battery glyph, by how full it is. */
 static const char *battery_glyph(int pct)
 {
     if (pct >= 88) return LV_SYMBOL_BATTERY_FULL;
@@ -635,11 +590,16 @@ void n31_ui_extras(int selected, bool disk_mounted)
 
         if (!disk_mounted) {
             lv_label_set_text(s_none_head, "No apps");
+            /*
+             * No offer to do anything about it. Mounting belongs to a system
+             * service now, and this list follows whatever is mounted - so when
+             * a volume appears, internal or USB, its apps turn up here on
+             * their own within a couple of seconds.
+             */
             lv_label_set_text(s_none_body,
-                              "The internal volume has\nnot been brought up.");
-            lv_label_set_text(s_none_hint,
-                              "Press PLAY to attempt mount "
-                              "and rescan for apps");
+                              "Nothing is mounted.\nApps appear here when a\n"
+                              "volume with n31os/apps is.");
+            lv_label_set_text(s_none_hint, "");
             lv_label_set_text(s_extras_foot, "HOME back");
         } else {
             lv_label_set_text(s_none_head, "Nothing found :(");
@@ -648,7 +608,7 @@ void n31_ui_extras(int selected, bool disk_mounted)
             lv_label_set_text(s_none_body,
                               "The volume is mounted but\nn31os/apps is not\n"
                               "readable on it.");
-            lv_label_set_text(s_none_hint, "Press PLAY to try again");
+            lv_label_set_text(s_none_hint, "");
             lv_label_set_text(s_extras_foot, "HOME back");
         }
 
@@ -683,83 +643,6 @@ void n31_ui_extras_opening(bool on)
 {
     s_opening = on;
     for (int i = 0; i < ROWS; i++) fill_row(&s_row[i], s_first + i);
-}
-
-/* ---- mounting ------------------------------------------------------------- */
-
-static lv_obj_t *s_mount;
-static lv_obj_t *s_mount_head;
-static lv_obj_t *s_mount_stage;
-static lv_obj_t *s_mount_fill;
-static lv_obj_t *s_mount_secs;
-static lv_obj_t *s_mount_foot;
-
-#define BAR_Y 190
-#define BAR_H 6
-
-static void build_mount(void)
-{
-    s_mount = lv_obj_create(NULL);
-    flat(s_mount, C_BG);
-    lv_obj_set_size(s_mount, N31_SCREEN_W, N31_SCREEN_H);
-
-    header(s_mount, NULL);
-
-    s_mount_head = centred(s_mount, "Mounting", F_NAME, C_TEXT, 150, 28);
-
-    panel(s_mount, MARGIN, BAR_Y, CONTENT_W, BAR_H, C_SURFACE_2);
-    s_mount_fill = panel(s_mount, MARGIN, BAR_Y, 1, BAR_H, C_EXTRAS);
-
-    s_mount_stage = centred(s_mount, "", F_CAPTION, C_TEXT_DIM, BAR_Y + 18, 18);
-
-    /* The elapsed time is the only thing that moves during the long gap in the
-       middle, and without it a stalled bar and a slow one look the same. */
-    s_mount_secs = centred(s_mount, "", F_CAPTION, C_TEXT_MUTE, BAR_Y + 40, 18);
-
-    s_mount_foot = footer(s_mount, "");
-}
-
-void n31_ui_mounting(int pct, const char *text, int secs)
-{
-    lv_label_set_text(s_mount_head, "Mounting");
-    lv_obj_set_style_text_color(s_mount_head, lv_color_hex(C_TEXT), 0);
-    lv_obj_set_style_bg_color(s_mount_fill, lv_color_hex(C_EXTRAS), 0);
-
-    /* -1 from the driver means this phase has no known total. Drawing that as
-       0% would pin the bar at the left edge through the longest part of the
-       wait, which is exactly when it must not look stuck - so the track is
-       filled faintly instead, saying "working, no idea how far". */
-    if (pct < 0) {
-        lv_obj_set_size(s_mount_fill, CONTENT_W, BAR_H);
-        lv_obj_set_style_bg_color(s_mount_fill, lv_color_hex(C_SURFACE_2), 0);
-    } else {
-        if (pct > 100) pct = 100;
-        int w = CONTENT_W * pct / 100;
-        lv_obj_set_size(s_mount_fill, w < 1 ? 1 : w, BAR_H);
-    }
-
-    if (text) lv_label_set_text(s_mount_stage, text);
-
-    char t[32];
-    snprintf(t, sizeof t, "%d s", secs);
-    lv_label_set_text(s_mount_secs, t);
-
-    /* Cancel has to be advertised. A minute-long bar with no way out reads as
-       a hang, and the user has no reason to guess that HOME still works. */
-    lv_label_set_text(s_mount_foot, "HOME cancel");
-    lv_screen_load(s_mount);
-}
-
-void n31_ui_mount_failed(const char *reason)
-{
-    lv_label_set_text(s_mount_head, "Could not mount");
-    lv_obj_set_style_text_color(s_mount_head, lv_color_hex(C_WARN), 0);
-    lv_obj_set_style_bg_color(s_mount_fill, lv_color_hex(C_WARN), 0);
-
-    lv_label_set_text(s_mount_stage, reason ? reason : "");
-    lv_label_set_text(s_mount_secs, "");
-    lv_label_set_text(s_mount_foot, "PLAY retry     HOME back");
-    lv_screen_load(s_mount);
 }
 
 /* ---- starting ------------------------------------------------------------- */
@@ -801,7 +684,6 @@ void n31_ui_init(void)
 
     build_home();
     build_extras();
-    build_mount();
     build_starting();
 
     n31_ui_home();

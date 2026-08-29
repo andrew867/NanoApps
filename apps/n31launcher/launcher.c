@@ -96,19 +96,11 @@
  * It backs off because the failure that is not going to fix itself (no NAND at
  * all) should not sit in a retry loop for the life of the session.
  */
-#define MOUNT_RETRY_MS     15000
-#define MOUNT_RETRY_MAX_MS 120000
-#define MOUNT_RETRIES      6
 
 /* Tilt, which has to keep up with the hand holding the device. One short read
    and three small moves, so this is cheap enough to do properly. */
 #define TILT_MS 80
 
-#define MOUNT_HELPER "/bin/n31-mount-disk"
-
-/* Long enough that the elapsed seconds tick over, short enough that it is not
-   the thing anyone notices. */
-#define MOUNT_TICK_MS 500
 
 typedef enum {
     SCREEN_HOME,
@@ -130,7 +122,6 @@ static uint32_t s_screen_at;      /* when the current screen was entered */
  */
 static pid_t    s_dying;
 static uint32_t s_dying_since;
-static bool     s_dying_was_mount;
 
 static pid_t s_child;             /* a running app */
 static bool  s_child_console;     /* it draws through the console, not fb0 */
@@ -139,28 +130,7 @@ static uint32_t s_launched_at;
 
 static n31_status_t s_status;
 
-/*
- * The volume is mounted by n31-autostart before this process starts, so every
- * run of the helper is now one the user asked for. `s_mount_auto` stays
- * because the quiet reporting path it selects is still the right behaviour if
- * a background bring-up is ever wanted again -- nothing sets it today.
- */
-static bool     s_mount_auto;
-static int      s_mount_tries;
 
-static pid_t s_mount;             /* the mount helper */
-static int   s_mount_fd = -1;
-static uint32_t s_mount_at;
-static char  s_mount_line[256];
-static size_t s_mount_len;
-static uint32_t s_mount_drawn;
-
-/* The last of each, because they arrive on separate lines and the screen wants
-   both at once. */
-static int  s_mount_pct = -1;
-static char s_mount_phase[64];
-static char s_mount_error[128];
-static bool s_mount_finished;     /* a terminal state was seen */
 
 static uint32_t millis(void)
 {
@@ -293,12 +263,11 @@ static bool launch(const n31_app_t *a)
  * This used to wait here for up to four seconds, which meant HOME froze the
  * launcher for that long with nothing on screen explaining the pause.
  */
-static void ask_child_to_stop(pid_t pid, bool is_mount)
+static void ask_child_to_stop(pid_t pid)
 {
     kill(-pid, SIGTERM);
     s_dying = pid;
     s_dying_since = millis();
-    s_dying_was_mount = is_mount;
 }
 
 /* Advance a pending stop. Called every pass; does nothing when none is
@@ -360,7 +329,7 @@ static void close_app(void)
     printf("n31launcher: closing pid %d\n", (int)s_child);
     fflush(stdout);
 
-    ask_child_to_stop(s_child, false);
+    ask_child_to_stop(s_child);
     s_child = 0;
 
     /*
@@ -384,228 +353,6 @@ static bool app_gone(void)
     s_child = 0;
     after_app();
     return true;
-}
-
-/* ---- the mount helper ----------------------------------------------------- */
-
-static void mount_draw(void)
-{
-    if (s_mount_auto) {
-        /* Only the tile, and only when it is on screen. */
-        n31_ui_mount_progress(true, s_mount_pct, s_mount_phase);
-        if (s_screen == SCREEN_HOME) n31_ui_home();
-        s_mount_drawn = millis();
-        return;
-    }
-
-    n31_ui_mounting(s_mount_pct, s_mount_phase,
-                    (int)((millis() - s_mount_at) / 1000u));
-    s_mount_drawn = millis();
-}
-
-static void mount_cleanup(void)
-{
-    if (s_mount_fd >= 0) { close(s_mount_fd); s_mount_fd = -1; }
-    if (s_mount) { waitpid(s_mount, NULL, WNOHANG); s_mount = 0; }
-    s_mount_len = 0;
-}
-
-static void mount_cancel(void)
-{
-    if (!s_mount) return;
-
-    if (s_mount_fd >= 0) { close(s_mount_fd); s_mount_fd = -1; }
-    ask_child_to_stop(s_mount, true);
-    s_mount = 0;
-    s_mount_len = 0;
-}
-
-static bool mount_start(bool automatic)
-{
-    if (s_mount) return false;
-
-    s_mount_auto = automatic;
-
-    int fd[2];
-    if (pipe(fd) < 0) return false;
-
-    pid_t pid = fork();
-    if (pid < 0) { close(fd[0]); close(fd[1]); return false; }
-
-    if (pid == 0) {
-        setpgid(0, 0);
-        close(fd[0]);
-        dup2(fd[1], 1);
-        dup2(fd[1], 2);            /* a shell error is a reason too */
-        close(fd[1]);
-        execl(MOUNT_HELPER, "n31-mount-disk", (char *)0);
-        /* Speaking the protocol on the way out, so a missing helper shows up
-           as a reason on the screen rather than as nothing happening. */
-        printf("FAIL no %s\n", MOUNT_HELPER);
-        fflush(stdout);
-        _exit(127);
-    }
-
-    setpgid(pid, pid);
-    close(fd[1]);
-    fcntl(fd[0], F_SETFL, O_NONBLOCK);
-
-    s_mount = pid;
-    s_mount_fd = fd[0];
-    s_mount_at = millis();
-    s_mount_len = 0;
-
-    s_mount_pct = -1;
-    s_mount_error[0] = 0;
-    s_mount_finished = false;
-    snprintf(s_mount_phase, sizeof s_mount_phase, "starting");
-
-    /* An automatic mount stays out of the way: it reports on the Extra apps
-       tile and leaves you on whatever screen you were using. Only a mount the
-       user asked for gets the whole screen. */
-    if (automatic) {
-        n31_ui_mount_progress(true, s_mount_pct, s_mount_phase);
-        if (s_screen == SCREEN_HOME) n31_ui_home();
-    } else {
-        mount_draw();
-        go(SCREEN_MOUNTING);
-    }
-    return true;
-}
-
-static void mount_done(void)
-{
-    bool automatic = s_mount_auto;
-
-    mount_cleanup();
-    s_mount_finished = true;
-    s_mount_tries = 0;
-    n31_ui_mount_progress(false, 0, NULL);
-
-    /* The folders were not readable a moment ago, so the fingerprint from
-       before the mount says nothing about what is on them now. */
-    n31_scanner_invalidate();
-
-    if (automatic) {
-        /* Whatever the user is looking at, keep them there - but redraw it,
-           because the app list underneath it has just changed. */
-        if (s_screen == SCREEN_HOME) n31_ui_home();
-        else if (s_screen == SCREEN_EXTRAS) {
-            if (s_selected < (int)n31_extra_first)
-                s_selected = (int)n31_extra_first;
-            n31_ui_extras(s_selected, disk_mounted());
-        }
-        return;
-    }
-
-    s_selected = (int)n31_extra_first;
-    go(SCREEN_EXTRAS);
-}
-
-static void mount_failed(const char *why)
-{
-    bool automatic = s_mount_auto;
-
-    mount_cleanup();
-    s_mount_finished = true;
-    s_mount_tries++;
-
-    /*
-     * No automatic retry. The helper no longer escalates -- it will not
-     * reload the NAND stack -- so a second unattended attempt would repeat
-     * the first exactly, and each one costs a full scan. Pressing PLAY runs
-     * it again, which is the same thing with someone watching.
-     */
-
-    if (automatic) {
-        /* Said on the tile, not by hijacking the screen. Pressing PLAY on the
-           empty list still gets the full story. */
-        n31_ui_mount_progress(false, 0, "unavailable");
-        if (s_screen == SCREEN_HOME) n31_ui_home();
-        else if (s_screen == SCREEN_EXTRAS)
-            n31_ui_extras(s_selected, disk_mounted());
-        return;
-    }
-
-    n31_ui_mount_failed(why && *why ? why : "no reason given");
-    go(SCREEN_MOUNT_FAILED);
-}
-
-/*
- * One key=value line from the helper. Unknown keys are ignored on purpose, so
- * the helper and the driver underneath it can print whatever they like without
- * this having to keep up.
- *
- * percent and phase arrive on separate lines and are both wanted at once, so
- * each is remembered and the screen is drawn from the pair.
- */
-static void mount_line(char *line)
-{
-    if (!strncmp(line, "percent=", 8)) {
-        /* -1 means the current phase has no known total. Kept as -1 rather
-           than clamped, because the UI draws indeterminate differently. */
-        s_mount_pct = (int)strtol(line + 8, NULL, 10);
-        mount_draw();
-        return;
-    }
-
-    if (!strncmp(line, "phase=", 6)) {
-        snprintf(s_mount_phase, sizeof s_mount_phase, "%s", line + 6);
-        mount_draw();
-        return;
-    }
-
-    if (!strncmp(line, "error=", 6)) {
-        /* Kept rather than acted on: error and state arrive as separate lines
-           and either can come first. */
-        snprintf(s_mount_error, sizeof s_mount_error, "%s", line + 6);
-        return;
-    }
-
-    if (!strncmp(line, "state=", 6)) {
-        const char *st = line + 6;
-
-        if (!strcmp(st, "VALID") || !strcmp(st, "valid")) {
-            mount_done();
-        } else if (!strcmp(st, "RUNNING") || !strcmp(st, "running")) {
-            /* Nothing to do; percent and phase carry the detail. */
-        } else {
-            mount_failed(s_mount_error[0] ? s_mount_error : st);
-        }
-    }
-}
-
-static void mount_pump(void)
-{
-    if (s_mount_fd < 0) return;
-
-    char buf[256];
-    ssize_t n;
-    while ((n = read(s_mount_fd, buf, sizeof buf)) > 0) {
-        for (ssize_t i = 0; i < n; i++) {
-            if (buf[i] == '\n' || s_mount_len + 1 >= sizeof s_mount_line) {
-                s_mount_line[s_mount_len] = 0;
-                s_mount_len = 0;
-                if (s_mount_line[0]) mount_line(s_mount_line);
-
-                /* mount_line can have finished the whole thing. */
-                if (s_mount_fd < 0) return;
-                continue;
-            }
-            if (buf[i] != '\r') s_mount_line[s_mount_len++] = (char)buf[i];
-        }
-    }
-
-    /* End of pipe. If a terminal state came through, this is just the helper
-       exiting after it; if not, it died without a result, and silence is not
-       something the user can act on. */
-    if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-        if (!s_mount_finished)
-            mount_failed(s_mount_error[0] ? s_mount_error
-                                          : "the helper stopped without a result");
-        else
-            mount_cleanup();
-    }
 }
 
 /* ---- the list ------------------------------------------------------------- */
@@ -745,36 +492,19 @@ static void on_key(uint16_t code, int32_t value)
         if (!pressed || settling()) return;
 
         if (code == N31_KEY_PLAYPAUSE) {
-            if (n31_extra_count) {
+            /*
+             * Nothing to open, and nothing to offer: bringing the volume up is
+             * a system service's job now, not this program's. The list follows
+             * whatever is mounted, so when the service succeeds the apps appear
+             * here on their own.
+             */
+            if (n31_extra_count)
                 open_app(&n31_apps[s_selected]);
-            } else if (s_mount) {
-                /* Already running in the background - show it properly
-                   rather than refusing or starting a second one. */
-                s_mount_auto = false;
-                mount_draw();
-                go(SCREEN_MOUNTING);
-            } else if (!mount_start(false)) {
-                n31_ui_status("cannot start helper");
-            }
         } else if (code == N31_KEY_HOMEPAGE) {
             go(SCREEN_HOME);
         }
         return;
 
-    case SCREEN_MOUNTING:
-        /* A progress bar you cannot escape from is a hang with extra steps. */
-        if (pressed && code == N31_KEY_HOMEPAGE) {
-            mount_cancel();
-            n31_ui_mount_progress(false, 0, NULL);
-            go(SCREEN_EXTRAS);
-        }
-        return;
-
-    case SCREEN_MOUNT_FAILED:
-        if (!pressed || settling()) return;
-        if (code == N31_KEY_PLAYPAUSE)     mount_start(false);
-        else if (code == N31_KEY_HOMEPAGE) go(SCREEN_EXTRAS);
-        return;
     }
 }
 
@@ -898,24 +628,12 @@ int main(int argc, char **argv)
             }
         }
 
-        /* A child that was asked to stop, going in its own time. */
-        if (reap_dying()) {
-            if (s_dying_was_mount) {
-                n31_ui_mount_progress(false, 0, NULL);
-                go(SCREEN_EXTRAS);
-            } else {
-                after_app();
-            }
-        }
+        /* A child that was asked to stop, going in its own time. The only
+           thing this program starts now is an app. */
+        if (reap_dying())
+            after_app();
 
         app_gone();
-        if (s_mount) {
-            mount_pump();
-            /* The elapsed seconds are the only thing that moves during a long
-               phase, and the helper does not emit a line for every second. */
-            if (s_mount && millis() - s_mount_drawn >= MOUNT_TICK_MS)
-                mount_draw();
-        }
 
         /* While an app owns the framebuffer the launcher draws nothing at all.
            There is no compositor here, and two writers would fight over every
@@ -925,10 +643,7 @@ int main(int argc, char **argv)
             continue;
         }
 
-        /* Not while mounting: the helper is what changes the answer, and a
-           rescan mid-mount would redraw the progress screen out from under
-           itself. */
-        if (!s_mount && millis() - last_scan >= RESCAN_MS) {
+        if (millis() - last_scan >= RESCAN_MS) {
             last_scan = millis();
             if (!n31_scanner_busy())
                 n31_scanner_request();
@@ -969,7 +684,6 @@ int main(int argc, char **argv)
        after this point. */
     n31_scanner_stop();
     if (s_child) stop_child_blocking(s_child);
-    if (s_mount) stop_child_blocking(s_mount);
     if (s_dying) stop_child_blocking(s_dying);
 
     /* Hand the screen back. Exiting the launcher should leave a console you

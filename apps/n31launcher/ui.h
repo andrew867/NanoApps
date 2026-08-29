@@ -1,12 +1,14 @@
 /*
  * ui.h - the launcher screens.
  *
- * Four of them, and which one you are on decides what the buttons mean.
+ * Three of them, and which one you are on decides what the buttons mean.
  *
  *   HOME     three fixed tiles, one per side button. No scrolling.
- *   EXTRAS   what is on the volume, scrolled with the volume keys.
- *   MOUNTING the volume coming up, which takes a while.
+ *   EXTRAS   whatever is mounted, scrolled with the volume keys.
  *   STARTING an app being handed the screen.
+ *
+ * Mounting is not among them. Bringing a volume up belongs to a system
+ * service; this only reports what is mounted, and follows it as it changes.
  *
  * PLAY always means go and HOME always means back, on every screen. That is the
  * whole navigation model, and it is why the extras list opens with PLAY rather
@@ -26,13 +28,6 @@
 #define N31_SCREEN_H 432
 
 void n31_ui_init(void);
-
-/*
- * A mount happening in the background, shown on the Extra apps tile rather
- * than by taking the screen. `pct` of -1 means indeterminate; `text` is the
- * current phase, or a short reason once it has stopped.
- */
-void n31_ui_mount_progress(bool running, int pct, const char *text);
 
 /* The three fixed tiles. `hot` lights one while its app starts. */
 void n31_ui_home(void);
@@ -54,15 +49,6 @@ void n31_ui_home_hot(int tile, bool on);
  */
 void n31_ui_extras(int selected, bool disk_mounted);
 void n31_ui_extras_opening(bool on);
-
-/*
- * The volume coming up. `pct` of -1 means the current step has no known total,
- * which is indeterminate rather than zero - so the bar says so instead of
- * sitting at the left edge looking stuck. `secs` is how long it has been going,
- * which during a long step is the only thing that moves.
- */
-void n31_ui_mounting(int pct, const char *text, int secs);
-void n31_ui_mount_failed(const char *reason);
 
 /*
  * An app being started. Some take ten seconds to put anything on screen, and

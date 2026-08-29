@@ -8,6 +8,7 @@
 #include "apps.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int fails;
@@ -68,6 +69,25 @@ int main(void)
     n31_apps_invalidate();
     n31_apps_scan();
     ok("still finds everything after invalidate", have("demo") && have("bare"));
+
+    /*
+     * A volume going away. The launcher cannot unmount anything from here, but
+     * what it observes is identical: the folders stop existing. Its apps have
+     * to leave the list with them, or it offers to run something that is not
+     * there any more.
+     */
+    if (system("rm -rf /tmp/n31os/apps/demo") != 0)
+        printf("  (could not remove the folder)\n");
+
+    ok("a removed app is dropped", n31_apps_scan() && !have("demo"));
+    ok("and the others stay",      have("bare"));
+
+    /* And the whole root disappearing - the actual unmount case. */
+    if (system("rm -rf /tmp/n31os") != 0)
+        printf("  (could not remove the root)\n");
+
+    n31_apps_scan();
+    ok("everything on the volume goes", !have("bare") && n31_extra_count == 0);
 
     printf(fails ? "\n%d FAILED\n" : "\nall passed\n", fails);
     return fails != 0;

@@ -112,37 +112,11 @@ int main(int argc, char **argv)
     n31_ui_home();
     shot("home-no-extras");
 
-    /* The volume coming up in the background: the tile carries it, and the
-       home screen is not taken away to say so. */
-    n31_ui_mount_progress(true, 42, "rebuilding map");
-    n31_ui_home();
-    shot("home-mounting");
-
-    /* And the same phase with no known total. */
-    n31_ui_mount_progress(true, -1, "scanning NAND");
-    n31_ui_home();
-    shot("home-mounting-indeterminate");
-
-    /* It gave up: still no screen takeover, just an honest tile. */
-    n31_ui_mount_progress(false, 0, "retrying");
-    n31_ui_home();
-    shot("home-mount-failed");
-    n31_ui_mount_progress(false, 0, NULL);
-
     n31_ui_extras(n31_extra_first, false);
     shot("modal-no-disk");
 
     n31_ui_extras(n31_extra_first, true);
     shot("modal-nothing-found");
-
-    n31_ui_mounting(-1, "rebuilding map", 41);
-    shot("mounting-indeterminate");
-
-    n31_ui_mounting(62, "reading filesystem", 73);
-    shot("mounting");
-
-    n31_ui_mount_failed("no disk - the FTL did not bind");
-    shot("mount-failed");
 
     n31_ui_starting("Radio+", 0x22D3EE);
     shot("starting");
