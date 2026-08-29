@@ -1,0 +1,143 @@
+# Makefile.host — build Entrain's DSP and UI on a Linux desktop.
+#
+# core/ is pure C99 with no LVGL and no SDK, so it compiles here unchanged and
+# can be tested, and listened to, without an iPod attached. ui.c is the same
+# file the device builds, at the same 240x432, so the layout you tune here is
+# the layout the device renders.
+#
+#   make -f Makefile.host test     run the unit tests
+#   make -f Makefile.host wav      build the offline renderer
+#   make -f Makefile.host run      build and run the UI in a 240x432 window
+#   make -f Makefile.host shots    render every screen to shots/*.png, no display
+#
+# LVGL comes from the checkout ./start already pins for the device build, so
+# there is nothing extra to fetch. SDL2 and ALSA are both optional: without SDL
+# you still get the fbdev, DRM and headless backends; without ALSA the UI runs
+# silently. Neither absence blocks development.
+
+CC      ?= cc
+AR      ?= ar
+CORE    := ../core
+LVGL    ?= ../../../lvgl
+BUILD   := build
+
+CORE_SRCS := $(CORE)/osc.c $(CORE)/noise.c $(CORE)/render.c \
+             $(CORE)/program.c $(CORE)/wavout.c
+
+WARN    := -Wall -Wextra -Wshadow -Wpointer-arith
+CFLAGS  ?= -O2 -g -std=c99 $(WARN)
+LDLIBS  := -lm
+
+.PHONY: all test glyphs wav host run shots clean
+
+all: test
+
+$(BUILD):
+	@mkdir -p $(BUILD)
+
+# ---- unit tests ------------------------------------------------------------
+# No LVGL, no platform layer: just core/ and the assertions.
+
+$(BUILD)/tests: tests.c $(CORE_SRCS) | $(BUILD)
+	$(CC) $(CFLAGS) -Wstrict-prototypes -o $@ $^ $(LDLIBS)
+
+test: $(BUILD)/tests glyphs
+	@./$(BUILD)/tests
+
+# Every user-facing string must be renderable. LVGL's Montserrat carries ASCII
+# plus a small symbol set; anything else is an empty box on screen, and an em
+# dash slipping into a settings note is exactly how that happens.
+glyphs:
+	@python3 check_glyphs.py ../ui.c ../core/program.c ../engine.c
+
+# ---- offline renderer ------------------------------------------------------
+# Render any preset or program to a .wav so it can be heard on real speakers,
+# or dropped straight onto the iPod.
+
+$(BUILD)/entrain-wav: wavtool.c $(CORE_SRCS) | $(BUILD)
+	$(CC) $(CFLAGS) -Wstrict-prototypes -o $@ $^ $(LDLIBS)
+
+wav: $(BUILD)/entrain-wav
+	@echo "built $(BUILD)/entrain-wav — try: ./$(BUILD)/entrain-wav --list"
+
+# ---- the UI ----------------------------------------------------------------
+
+HAVE_SDL  := $(shell pkg-config --exists sdl2 && echo 1)
+HAVE_ALSA := $(shell pkg-config --exists alsa && echo 1)
+HAVE_DRM  := $(shell pkg-config --exists libdrm gbm && echo 1)
+
+LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_host.h\" \
+             -I$(LVGL) -I$(LVGL)/src -I$(LVGL)/include -I$(LVGL)/..
+
+# POSIX bits (usleep, gettimeofday) that -std=c99 alone hides. core/ still
+# compiles as strict C99 in the test and wav targets.
+HOST_CFLAGS := -D_DEFAULT_SOURCE
+HOST_LIBS   := -lpthread
+
+ifeq ($(HAVE_SDL),1)
+  HOST_CFLAGS += $(shell pkg-config --cflags sdl2)
+  HOST_LIBS   += $(shell pkg-config --libs sdl2)
+else
+  LV_CFLAGS += -DENTRAIN_NO_SDL
+endif
+
+ifeq ($(HAVE_ALSA),1)
+  HOST_CFLAGS += -DEN_HOST_ALSA $(shell pkg-config --cflags alsa)
+  HOST_LIBS   += $(shell pkg-config --libs alsa)
+endif
+
+ifeq ($(HAVE_DRM),1)
+  LV_CFLAGS += -DENTRAIN_HAVE_DRM $(shell pkg-config --cflags libdrm gbm)
+  HOST_LIBS += $(shell pkg-config --libs libdrm gbm)
+else
+  LV_DRM_EXCLUDE := -not -path '*/drivers/display/drm/*'
+endif
+
+# LVGL's own sources. The drivers are included — that is where SDL, fbdev, DRM
+# and evdev live — minus the platforms this build will never target.
+LV_SRCS := $(shell find $(LVGL)/src -name '*.c' \
+             -not -name 'lv_freertos.c' -not -name 'lv_cmsis_rtos2.c' \
+             -not -name 'lv_mqx.c'      -not -name 'lv_rtthread.c' \
+             -not -name 'lv_windows.c'  -not -name 'lv_sdl2.c' \
+             -not -path '*/drivers/nuttx/*'    -not -path '*/drivers/qnx/*' \
+             -not -path '*/drivers/uefi/*'     -not -path '*/drivers/windows/*' \
+             -not -path '*/drivers/wayland/*'  -not -path '*/drivers/x11/*' \
+             -not -path '*/drivers/libinput/*' -not -path '*/drivers/opengles/*' \
+             $(LV_DRM_EXCLUDE) \
+             2>/dev/null)
+
+LV_OBJS := $(patsubst $(LVGL)/%.c,$(BUILD)/lvgl/%.o,$(LV_SRCS))
+
+# The config is a real dependency: changing which backends are enabled has to
+# rebuild the driver objects, or they stay compiled-out and the link fails on
+# a symbol the header promised.
+$(BUILD)/lvgl/%.o: $(LVGL)/%.c lv_conf_host.h
+	@mkdir -p $(dir $@)
+	@$(CC) -O2 -std=gnu99 -w $(LV_CFLAGS) $(HOST_CFLAGS) -c -o $@ $<
+
+$(BUILD)/liblvgl_host.a: $(LV_OBJS)
+	@echo "  AR  $@"
+	@$(AR) crs $@ $^
+
+APP_SRCS := main_host.c ../ui.c ../engine.c \
+            ../platform/audio_host.c ../platform/sys_host.c $(CORE_SRCS)
+
+$(BUILD)/entrain-host: $(APP_SRCS) $(BUILD)/liblvgl_host.a | $(BUILD)
+	$(CC) $(CFLAGS) $(LV_CFLAGS) $(HOST_CFLAGS) -o $@ $(APP_SRCS) \
+	      $(BUILD)/liblvgl_host.a $(HOST_LIBS) $(LDLIBS)
+
+host: $(BUILD)/entrain-host
+
+run: $(BUILD)/entrain-host
+	./$(BUILD)/entrain-host
+
+# Render every screen headlessly and convert to PNG. No display, no SDL and no
+# window manager needed, which is what makes it usable over a plain shell.
+shots: $(BUILD)/entrain-host
+	@mkdir -p ../screenshots
+	@./$(BUILD)/entrain-host --shot ../screenshots
+	@python3 tobmp.py ../screenshots
+	@rm -f ../screenshots/*.bmp
+
+clean:
+	rm -rf $(BUILD)

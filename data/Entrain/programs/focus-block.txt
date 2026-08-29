@@ -1,0 +1,11 @@
+# A short focus block with a pink noise bed.
+# carrier and noise apply to the seg lines that follow them, so a program can
+# change either partway through.
+
+name    Focus Block
+mode    binaural
+carrier 250
+noise   pink 0.15
+
+seg     14   17   1500     # 25 min ramp up through beta
+seg     17   14   300      # 5 min back down to land softly
