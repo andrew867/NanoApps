@@ -26,6 +26,7 @@
 #include "engine.h"
 #include "core/program.h"
 #include "core/freqset.h"
+#include "core/progfile.h"
 #include "platform/audio.h"
 #include "platform/sys.h"
 
@@ -544,6 +545,69 @@ static int fs_index_of_row(int row)
 static en_prog_seg_t s_fs_segs[EN_FREQSET_MAX_STEPS];
 
 
+/* ---- measured programs, from a file -------------------------------------
+ *
+ * Thirty-odd segments each, several layers, and thirty-six of them: compiled
+ * in, that is hundreds of kilobytes of tables in flash for material most
+ * people will never play through once. Held as a file it is a hundred
+ * kilobytes on the volume and nothing in the binary, and a new measurement is
+ * a file drop rather than a rebuild.
+ *
+ * These are APPENDED to the compiled suites rather than replacing them. The
+ * compiled ones work with no volume mounted; a shelf that emptied itself when
+ * the disk was absent would look like a bug in the app rather than like a
+ * missing file.
+ */
+
+#define EN_PROG_BUNDLE_MAX 262144u
+
+static char    *s_pf_text;
+static uint32_t s_pf_len;
+static int      s_pf_count = -1;      /* -1: not looked for it yet */
+
+/* The one parsed program, held here because en_engine_play_segs borrows the
+   table rather than copying it: it has to outlive the call, and only one can
+   be sounding. */
+static en_progfile_t s_pf;
+
+static void progfile_load(void)
+{
+    if (s_pf_count >= 0) return;
+    s_pf_count = 0;
+
+    char path[256];
+    path[0] = 0;
+    str_cat(path, en_sys_data_dir(), sizeof path);
+    str_cat(path, "/measured.prog", sizeof path);
+
+    char *buf = (char *)en_sys_alloc(EN_PROG_BUNDLE_MAX);
+    if (!buf) return;
+
+    uint32_t n = en_sys_read_file(path, buf, EN_PROG_BUNDLE_MAX - 1);
+    if (!n) { en_sys_free(buf); return; }
+
+    /* Back off to the last whole line if the file filled the buffer: a half
+       line is a malformed program, and progfile refuses those - but it would
+       still be counted, and a row that cannot play is worse than no row. */
+    if (n >= EN_PROG_BUNDLE_MAX - 1) {
+        while (n && buf[n - 1] != '\n') n--;
+        if (!n) { en_sys_free(buf); return; }
+    }
+    buf[n] = 0;
+
+    s_pf_text = buf;
+    s_pf_len = n;
+    s_pf_count = en_progfile_count(buf, n);
+}
+
+/* How many suites there are in the binary. The shelf is those followed by the
+   file's, so this is where one list becomes two. */
+static int compiled_suites(void)
+{
+    return en_programs_in_group(EN_GROUP_SUITE, 0, 0);
+}
+
+
 /* ---- library ------------------------------------------------------------- */
 
 /* How many entries a shelf holds. Custom is counted by walking the directory,
@@ -554,7 +618,9 @@ static int shelf_count(int shelf)
     switch (shelf) {
     case LIB_PRESETS:  en_presets(&n); return n;
     case LIB_PROGRAMS: return en_programs_in_group(EN_GROUP_PROGRAM, 0, 0);
-    case LIB_SUITES:   return en_programs_in_group(EN_GROUP_SUITE, 0, 0);
+    case LIB_SUITES:
+        progfile_load();
+        return compiled_suites() + s_pf_count;
     case LIB_FREQSETS:
         freqsets_load();
         /* At the shelf's own root the rows are initials, not sets. The count
@@ -671,9 +737,23 @@ static void activate_row(int row)
     if (s_shelf == LIB_PRESETS) {
         ok = en_engine_play_preset(idx);
     } else if (s_shelf == LIB_PROGRAMS || s_shelf == LIB_SUITES) {
-        idx = program_index_of(s_shelf, row);
-        if (idx < 0) return;
-        ok = en_engine_play_program(idx);
+        /* Past the compiled suites is the file's. Parsed in full only now -
+           the list only ever read the heads. */
+        int n_compiled = compiled_suites();
+        if (s_shelf == LIB_SUITES && row >= n_compiled) {
+            progfile_load();
+            if (!en_progfile_load(s_pf_text, s_pf_len, row - n_compiled, &s_pf))
+                return;
+            /* Measured programmes carry different frequencies in each ear -
+               that is what was measured - so they play as binaural. */
+            ok = en_engine_play_segs(s_pf.segs, s_pf.n_segs,
+                                     EN_MODE_BINAURAL, s_pf.name, "measured");
+            idx = row;
+        } else {
+            idx = program_index_of(s_shelf, row);
+            if (idx < 0) return;
+            ok = en_engine_play_program(idx);
+        }
     } else if (s_shelf == LIB_FREQSETS) {
         freqsets_load();
 
@@ -750,7 +830,8 @@ static void activate_row(int row)
         /* Frequency sets are not recorded as the thing to resume. last_index
            is read back as an index into the compiled program table, and a set
            number in that slot would resume some unrelated program. */
-        if (s_shelf != LIB_FREQSETS) {
+        bool from_file = (s_shelf == LIB_SUITES && row >= compiled_suites());
+        if (s_shelf != LIB_FREQSETS && !from_file) {
             P.last_source = (s_shelf == LIB_PRESETS) ? EN_SRC_PRESET
                                                      : EN_SRC_PROGRAM;
             P.last_index = idx;
@@ -926,6 +1007,25 @@ static void fill_library(void)
             str_cat(buf, " min", sizeof buf);
             add_row(i, en_band_color(en_program_band(p)),
                     p->name, p->detail, buf, i == s_sel);
+        }
+
+        /* Then the measured ones, off the volume. Only the head of each is
+           read here - name and length - because parsing thirty-six programs
+           of eighty segments to draw a list would be most of a second. */
+        if (s_shelf == LIB_SUITES) {
+            progfile_load();
+            char pname[EN_PROGFILE_NAME_MAX + 1];
+            uint32_t psecs = 0;
+            for (int i = 0; i < s_pf_count; i++) {
+                if (!en_progfile_head(s_pf_text, s_pf_len, i, pname,
+                                      (int)sizeof pname, &psecs))
+                    continue;
+                buf[0] = 0;
+                put_uint(buf, 0, psecs / 60u, 1);
+                str_cat(buf, " min", sizeof buf);
+                add_row(n + i, C_TEXT_MUTE, pname, "measured", buf,
+                        n + i == s_sel);
+            }
         }
         return;
     }
