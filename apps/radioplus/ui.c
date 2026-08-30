@@ -698,6 +698,35 @@ static void on_bar_tap(lv_event_t *e)
     rp_act_nudge((int32_t)rp_model.behind_ms - (int32_t)behind);
 }
 
+/*
+ * Tap the stereo pill to cycle auto -> mono -> stereo.
+ *
+ * Forced mono is the one worth having: a weak station is steadier in mono
+ * than blending in and out of stereo every few seconds, and that judgement is
+ * the listener's rather than the chip's.
+ *
+ * The pill then shows two things at once, deliberately. Its LABEL is the mode
+ * that was asked for; its COLOUR stays driven by the chip's own "stereo
+ * active" flag. Which way round the manual-select bit runs is read off the
+ * bit's name in the register table rather than pinned down by the bring-up
+ * sequence, so being able to ask for mono and see the pill stay lit is how
+ * that gets found out - immediately, and by looking.
+ */
+static void on_stereo_tap(lv_event_t *e)
+{
+    (void)e;
+    rp_act_stereo_mode((uint8_t)((rp_model.stereo_mode + 1u) % 3u));
+}
+
+static const char *stereo_mode_text(uint8_t mode)
+{
+    switch (mode) {
+    case EN_FM_STEREO_MONO:   return "MONO";
+    case EN_FM_STEREO_STEREO: return "ST FORCED";
+    default:                  return "STEREO";
+    }
+}
+
 static void build_now(void)
 {
     lv_obj_t *s = s_screen[RP_SCREEN_NOW];
@@ -771,6 +800,12 @@ static void build_now(void)
        it - the meter is 176 px wide and TRAFFIC ran off the right edge - which
        is the sort of thing only a rendered screen shows you. */
     s_stereo = pill(s, MARGIN, 258, "STEREO", C_SIGNAL);
+    /* A pill is normally a readout. This one is also a control, so it gets a
+       target the size of the chip rather than the size of the text. */
+    lv_obj_add_flag(s_stereo, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_stereo, on_stereo_tap, LV_EVENT_CLICKED, 0);
+    lv_obj_set_style_bg_color(s_stereo, lv_color_hex(C_SURFACE_2),
+                              LV_STATE_PRESSED);
     s_ta_badge = pill(s, MARGIN + 76, 258, "TRAFFIC", C_TA);
 
     for (int i = 0; i < 14; i++) {
@@ -926,7 +961,15 @@ static void refresh_now(void)
     }
     lv_label_set_text(s_rssi_lbl, buf);
 
-    pill_set(s_stereo, rp_model.stereo, C_SIGNAL);
+    {
+        /* Label says what was asked for; colour says what the chip is doing.
+           Forced mono is called out in amber because it is a choice that
+           stays made, and one the user should be able to see they made. */
+        lv_obj_t *sl = lv_obj_get_child(s_stereo, 0);
+        if (sl) lv_label_set_text(sl, stereo_mode_text(rp_model.stereo_mode));
+        pill_set(s_stereo, rp_model.stereo,
+                 rp_model.stereo_mode == EN_FM_STEREO_AUTO ? C_SIGNAL : C_TA);
+    }
     pill_set(s_ta_badge, rp_model.rds.ta, C_TA);
 
     /* The buffer strip. How much has been captured, and where in it the
@@ -1192,8 +1235,20 @@ static void scan_pump(void)
     if (dt > 1000) dt = 0;
 
     uint32_t khz = 0;
-    if (en_scan_tick(&s_scan, dt, rp_model.rssi, &rp_model.rds, &khz))
+    switch (en_scan_tick(&s_scan, dt, rp_model.khz, rp_model.rssi,
+                         &rp_model.rds, &khz)) {
+    case EN_SCAN_TUNE:
         rp_act_tune_quiet(khz);
+        break;
+    case EN_SCAN_SEEK:
+        /* The chip crosses the empty band for us. If the platform cannot,
+           say so once and the sweep steps the rest in software rather than
+           waiting out a timeout on every station. */
+        if (!rp_act_seek_quiet(true)) en_scan_seek_failed(&s_scan);
+        break;
+    default:
+        break;
+    }
 
     if (s_scan.phase == EN_SCAN_DONE) {
         s_scan_added = en_scan_commit(&s_scan, &rp_model.presets);
@@ -1223,7 +1278,8 @@ static void on_scan(lv_event_t *e)
     s_scan_last_ms = lv_tick_get();
     s_scan_added = 0;
     s_scan_note_for = 0;
-    if (en_scan_start(&s_scan, rp_model.region, rp_model.khz, RP_SCAN_RSSI))
+    if (en_scan_start(&s_scan, rp_model.region, rp_model.khz, RP_SCAN_RSSI,
+                      rp_model.can_seek))
         rp_act_tune_quiet(s_scan.khz);
 }
 
@@ -1358,8 +1414,8 @@ static void refresh_presets(void)
         buf[0] = 0;
         fmt_mhz(m, sizeof m, s_scan.khz);
         cat(buf, m, sizeof buf);
-        cat(buf, s_scan.phase == EN_SCAN_SWEEP ? "   scanning   "
-                                               : "   reading names   ",
+        cat(buf, s_scan.phase != EN_SCAN_SWEEP ? "   reading names   "
+                 : (s_scan.use_seek ? "   seeking   " : "   scanning   "),
             sizeof buf);
         put_uint(m, s_scan.n_hits, 0);
         cat(buf, m, sizeof buf);

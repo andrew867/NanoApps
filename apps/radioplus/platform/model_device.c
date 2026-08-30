@@ -27,6 +27,7 @@
  */
 
 #include "../model.h"
+#include "../core/fmreg.h"
 
 #include "hb_sdk.h"
 
@@ -77,6 +78,7 @@ static void settings_save(void)
     s_settings.khz = rp_model.khz;
     s_settings.rds_on = rp_model.rds_on;
     s_settings.ta_record = rp_model.ta_record;
+    s_settings.stereo_mode = rp_model.stereo_mode;
 
     static char buf[4096];
     uint32_t n = en_settings_save(&s_settings, buf, sizeof buf);
@@ -148,6 +150,7 @@ static void bring_up(void)
 
     rp_model.rds_on = s_settings.rds_on;
     rp_model.ta_record = s_settings.ta_record;
+    rp_model.stereo_mode = s_settings.stereo_mode;
     en_rds_init(&rp_model.rds, rp_model.region ? rp_model.region->rbds : true);
 
     presets_load();
@@ -220,6 +223,16 @@ void rp_act_set_rec_at(int16_t minutes)
     /* Clear the fired flag with the time itself, or setting a new one inside
        the same minute the last fired in would do nothing. */
     rp_model.rectimer.fired = false;
+    settings_save();
+}
+
+/* The bare-metal path drives the chip through the OS's own tuner calls and
+   has no seek of its own; the scan steps instead. */
+bool rp_act_seek_quiet(bool up) { (void)up; return false; }
+
+void rp_act_stereo_mode(uint8_t mode)
+{
+    rp_model.stereo_mode = mode;
     settings_save();
 }
 

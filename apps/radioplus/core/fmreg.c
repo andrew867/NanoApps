@@ -76,6 +76,27 @@ static const en_fm_enum_t vals_search_method[] = {
     { 2, "RSSI" },
 };
 
+uint8_t en_fm_ctrl_set_stereo(uint8_t ctrl, en_fm_stereo_t mode)
+{
+    /* Read-modify-write: bit 0 is the band and bit 4 is the injection side,
+       and a stereo control that reset the band would be a very confusing
+       stereo control. */
+    ctrl &= (uint8_t)~(EN_FM_CTRL_AUTO | EN_FM_CTRL_MANUAL);
+    switch (mode) {
+    case EN_FM_STEREO_AUTO:   ctrl |= EN_FM_CTRL_AUTO;   break;
+    case EN_FM_STEREO_STEREO: ctrl |= EN_FM_CTRL_MANUAL; break;
+    case EN_FM_STEREO_MONO:   break;      /* manual, and manual means mono */
+    }
+    return ctrl;
+}
+
+en_fm_stereo_t en_fm_ctrl_stereo(uint8_t ctrl)
+{
+    if (ctrl & EN_FM_CTRL_AUTO) return EN_FM_STEREO_AUTO;
+    return (ctrl & EN_FM_CTRL_MANUAL) ? EN_FM_STEREO_STEREO
+                                      : EN_FM_STEREO_MONO;
+}
+
 /* ---- per-register field tables ------------------------------------------- */
 
 #define WHOLE(w) ((uint8_t)((w) * 8u - 1u)), 0u

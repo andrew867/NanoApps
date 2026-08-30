@@ -23,6 +23,9 @@ typedef struct {
     uint8_t  rssi;           /* 0..255 as the chip reports it */
     int8_t   snr;
     bool     stereo;
+    /* What we last asked the chip to do about stereo, which is not the same
+       question as whether it is currently in stereo. */
+    uint8_t  stereo_mode;    /* en_fm_stereo_t */
     bool     powered;
     bool     tuner_ok;
     const char *tuner_note;  /* why not, when tuner_ok is false */
@@ -72,6 +75,13 @@ typedef struct {
     char     library[12][96];   /* a dated, named recording is ~34 chars */
 
     bool     can_raw;        /* show the register explorer at all */
+
+    /* Whether the tuner can seek for itself. The band scan asks the chip to
+       jump from station to station when it can, and steps every channel in
+       software when it cannot - and a seek that never lands would stall the
+       sweep on every station, so this has to say what the platform actually
+       does rather than what the chip is capable of. */
+    bool     can_seek;
     const char *backend;
     const char *capture_backend;
 } rp_model_t;
@@ -106,12 +116,21 @@ void rp_act_tune(uint32_t khz);
    left; rp_act_tune would write the settings file for every one of them. */
 void rp_act_tune_quiet(uint32_t khz);
 
+/* Ask the chip for the next station, without persisting. Returns false when
+   the platform has no hardware seek, so the caller can fall back rather than
+   wait for something that is never going to happen. */
+bool rp_act_seek_quiet(bool up);
+
 /* Persist the preset list. The scan writes many presets at once, so it does
    not go through rp_act_preset_toggle and has to ask for the save itself. */
 void rp_act_presets_save(void);
 void rp_act_step(bool up);
 void rp_act_seek(bool up);
 void rp_act_power(bool on);
+
+/* Auto, forced mono, or forced stereo. Forced mono is the useful one: a weak
+   station is steadier in mono than blending in and out of it. */
+void rp_act_stereo_mode(uint8_t mode);
 void rp_act_record_toggle(void);
 void rp_act_save_live(uint32_t ms);
 void rp_act_preset_toggle(void);

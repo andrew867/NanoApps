@@ -1112,19 +1112,103 @@ static const en_region_t *find_region(const char *name)
 
 /* ---- band scan ------------------------------------------------------------
  *
- * Driven the way the UI drives it: tick, observe, tune where it asks. The
- * fake band has three stations on it, two of which name themselves, so both
- * passes have something to do and the "took the name early" path is exercised
- * alongside the "gave up waiting" one.
+ * Driven the way the UI drives it: tick, observe, do what it asks. Both sweep
+ * modes are exercised - stepping every channel in software, and asking a chip
+ * to jump from station to station - because they find the same three stations
+ * by completely different routes and only one of them can be tested on real
+ * hardware today.
  */
 
 static const uint32_t FAKE_STATIONS[] = { 88300, 95800, 104200 };
+#define FAKE_N ((int)(sizeof FAKE_STATIONS / sizeof FAKE_STATIONS[0]))
 
 static uint8_t fake_rssi(uint32_t khz)
 {
-    for (unsigned i = 0; i < sizeof FAKE_STATIONS / sizeof FAKE_STATIONS[0]; i++)
+    for (int i = 0; i < FAKE_N; i++)
         if (FAKE_STATIONS[i] == khz) return 200;
     return 12;
+}
+
+/* A chip that seeks: the next station above `khz`, wrapping to the bottom of
+   the band the way a real one does when it runs off the top. */
+static uint32_t fake_seek(const en_region_t *rg, uint32_t khz)
+{
+    for (int i = 0; i < FAKE_N; i++)
+        if (FAKE_STATIONS[i] > khz) return FAKE_STATIONS[i];
+    return rg->low_khz;
+}
+
+/* Names on two of the three, so the "took it early" path and the "gave up
+   waiting" path both run. Filled directly rather than through the decoder:
+   this is testing the scan, not the RDS parser. */
+static const en_rds_t *fake_rds(en_rds_t *r, const en_scan_t *s, uint32_t khz,
+                                uint8_t rssi)
+{
+    if (s->phase != EN_SCAN_NAMING || rssi < 100 || khz == 104200)
+        return NULL;
+    r->ps_valid = true;
+    r->pi = 0x1234;
+    r->pty = 3;
+    memcpy(r->ps, khz == 88300 ? "BBC R1  " : "Kiss    ", 9);
+    return r;
+}
+
+/* Run a whole scan and report how many ticks the sweep took. */
+static int run_scan(en_scan_t *s, const en_region_t *rg, int use_seek,
+                    int fail_seek, int *sweep_ticks)
+{
+    uint32_t khz, want = 0;
+    en_rds_t rds;
+    int guard = 0;
+
+    en_rds_init(&rds, false);
+    if (!en_scan_start(s, rg, 98000, 100, use_seek != 0))
+        return 0;
+    khz = s->khz;
+    *sweep_ticks = 0;
+
+    while (s->phase != EN_SCAN_DONE && guard++ < 200000) {
+        uint8_t r = fake_rssi(khz);
+        const en_rds_t *pr = fake_rds(&rds, s, khz, r);
+
+        if (s->phase == EN_SCAN_SWEEP) (*sweep_ticks)++;
+
+        switch (en_scan_tick(s, 40, khz, r, pr, &want)) {
+        case EN_SCAN_TUNE:
+            khz = want;
+            break;
+        case EN_SCAN_SEEK:
+            /* A platform that cannot seek says so, exactly as the UI does. */
+            if (fail_seek) en_scan_seek_failed(s);
+            else khz = fake_seek(rg, khz);
+            break;
+        default:
+            break;
+        }
+    }
+    return khz == 98000 && s->phase == EN_SCAN_DONE;
+}
+
+static void check_hits(en_scan_t *s, const char *how)
+{
+    CHECK(s->n_hits == 3, "%s: expected 3 stations, found %u", how, s->n_hits);
+    CHECK(!s->overflowed, "%s: overflowed on three stations", how);
+    for (uint8_t i = 0; i < s->n_hits && i < 3; i++)
+        CHECK(s->hits[i].khz == FAKE_STATIONS[i],
+              "%s: hit %u was %u, expected %u", how, i, s->hits[i].khz,
+              FAKE_STATIONS[i]);
+
+    /* Trailing pad from the eight-character RDS field must not survive. */
+    if (s->n_hits >= 3) {
+        CHECK(strcmp(s->hits[0].name, "BBC R1") == 0,
+              "%s: name 0 was '%s'", how, s->hits[0].name);
+        CHECK(strcmp(s->hits[1].name, "Kiss") == 0,
+              "%s: name 1 was '%s'", how, s->hits[1].name);
+        CHECK(!s->hits[2].named,
+              "%s: the silent station should have no name", how);
+    }
+    CHECK(en_scan_percent(s) == 100, "%s: percent %u at the end", how,
+          en_scan_percent(s));
 }
 
 static void test_scan(void)
@@ -1133,73 +1217,42 @@ static void test_scan(void)
     CHECK(eu != NULL, "no Europe region");
     if (!eu) return;
 
-    en_scan_t s;
-    CHECK(en_scan_start(&s, eu, 98000, 100), "scan refused to start");
-    CHECK(s.phase == EN_SCAN_SWEEP, "should begin sweeping");
-    CHECK(s.resume_khz == 98000, "resume frequency not kept");
+    en_scan_t soft, hard, fell;
+    int soft_ticks = 0, hard_ticks = 0, fell_ticks = 0;
 
-    uint32_t khz = s.khz;
-    uint32_t want = 0;
-    en_rds_t rds;
-    en_rds_init(&rds, false);
+    /* Stepping every channel. */
+    CHECK(run_scan(&soft, eu, 0, 0, &soft_ticks),
+          "the software sweep did not finish where it started");
+    check_hits(&soft, "software");
 
-    /* 40 ms a tick is the UI's refresh rate. A bound on the loop rather than
-       a while(1): a state machine that never reaches DONE should fail the
-       test, not hang it. */
-    int guard = 0;
-    int sweep_ticks = 0;
-    while (s.phase != EN_SCAN_DONE && guard++ < 200000) {
-        uint8_t r = fake_rssi(khz);
+    /* Letting the chip find them. Same three stations. */
+    CHECK(run_scan(&hard, eu, 1, 0, &hard_ticks),
+          "the seeking sweep did not finish where it started");
+    check_hits(&hard, "seek");
 
-        /* RDS only where there is a station, and only on two of the three -
-         * so one hit has to time out. Filled directly rather than through the
-         * decoder: this is testing the scan, not the RDS parser. */
-        en_rds_t *pr = NULL;
-        if (s.phase == EN_SCAN_NAMING && r > 100 && khz != 104200) {
-            rds.ps_valid = true;
-            rds.pi = 0x1234;
-            rds.pty = 3;
-            memcpy(rds.ps, khz == 88300 ? "BBC R1  " : "Kiss    ", 9);
-            pr = &rds;
-        }
+    /* And it has to be the point of doing it: crossing the empty band in the
+       chip rather than a channel at a time is the whole reason this mode
+       exists, so if it is not dramatically cheaper it is not worth having. */
+    CHECK(hard_ticks * 4 < soft_ticks,
+          "seeking took %d ticks against stepping's %d - no better",
+          hard_ticks, soft_ticks);
 
-        if (s.phase == EN_SCAN_SWEEP) sweep_ticks++;
-        if (en_scan_tick(&s, 40, r, pr, &want)) khz = want;
-    }
-
-    CHECK(s.phase == EN_SCAN_DONE, "scan never finished (%d ticks)", guard);
-    CHECK(khz == 98000, "scan did not tune back to where it started (%u)", khz);
-    CHECK(en_scan_percent(&s) == 100, "percent %u at the end",
-          en_scan_percent(&s));
-
-    CHECK(s.n_hits == 3, "expected 3 stations, found %u", s.n_hits);
-    CHECK(!s.overflowed, "should not have overflowed on three stations");
-    for (uint8_t i = 0; i < s.n_hits && i < 3; i++)
-        CHECK(s.hits[i].khz == FAKE_STATIONS[i],
-              "hit %u was %u, expected %u", i, s.hits[i].khz,
-              FAKE_STATIONS[i]);
-
-    /* Trailing pad from the eight-character RDS field must not survive. */
-    CHECK(strcmp(s.hits[0].name, "BBC R1") == 0,
-          "name 0 was '%s'", s.hits[0].name);
-    CHECK(strcmp(s.hits[1].name, "Kiss") == 0,
-          "name 1 was '%s'", s.hits[1].name);
-    CHECK(!s.hits[2].named, "the silent station should have no name");
-
-    /* The sweep must be the cheap pass. If it ever costs as much per channel
-       as naming does, a full band takes eight minutes and the two-pass split
-       has stopped earning its complexity. */
-    CHECK(sweep_ticks < 1000, "sweep took %d ticks, far too long", sweep_ticks);
+    /* A platform that says it can seek and then cannot must still finish,
+       by stepping the rest. A slower scan is a scan; a stalled one is not. */
+    CHECK(run_scan(&fell, eu, 1, 1, &fell_ticks),
+          "a failed seek stalled the sweep");
+    check_hits(&fell, "fallback");
+    CHECK(!fell.use_seek, "the fallback should have given up on seeking");
 
     /* Committing: new presets appear, and a rescan updates rather than
        duplicates - including leaving the simple-screen choice alone. */
     en_presets_t p;
     en_presets_init(&p, "Europe");
-    CHECK(en_scan_commit(&s, &p) == 3, "commit added %u", p.count);
+    CHECK(en_scan_commit(&soft, &p) == 3, "commit added %u", p.count);
     CHECK(p.count == 3, "preset count %u", p.count);
 
     CHECK(en_preset_set_simple(&p, 95800, true), "could not flag for simple");
-    en_scan_commit(&s, &p);
+    en_scan_commit(&soft, &p);
     CHECK(p.count == 3, "a rescan duplicated presets: %u", p.count);
     int at = en_preset_find(&p, 95800);
     CHECK(at >= 0 && p.list[at].simple,
@@ -1210,16 +1263,12 @@ static void test_scan(void)
     empty.high_khz = empty.low_khz;
     empty.step_khz = 0;
     en_scan_t bad;
-    CHECK(!en_scan_start(&bad, &empty, 98000, 100),
+    CHECK(!en_scan_start(&bad, &empty, 98000, 100, false),
           "an empty band should refuse to scan");
-}
 
-/* ---- the recording timer --------------------------------------------------
- *
- * The two halves are tested apart, because they are two features that share a
- * struct rather than one feature: a length always works, and a start time
- * works only when there is a clock.
- */
+    printf("  sweep cost: %d ticks stepping, %d ticks seeking\n",
+           soft_ticks, hard_ticks);
+}
 
 static void test_rectimer(void)
 {
@@ -1317,6 +1366,121 @@ static void test_rectimer(void)
           "'no start' came back as %d", b.rectimer.at_min);
 }
 
+/* ---- stereo handling ------------------------------------------------------
+ *
+ * One register byte, and the thing that matters is what it does NOT touch:
+ * bit 0 is the band and bit 4 is the injection side, and a stereo control
+ * that reset either would be a very confusing stereo control.
+ */
+
+static void test_stereo_mode(void)
+{
+    /* Every mode round-trips through the register and back. */
+    for (int m = 0; m <= 2; m++) {
+        uint8_t c = en_fm_ctrl_set_stereo(0, (en_fm_stereo_t)m);
+        CHECK(en_fm_ctrl_stereo(c) == (en_fm_stereo_t)m,
+              "mode %d came back as %d", m, en_fm_ctrl_stereo(c));
+    }
+
+    /* Exactly one of the two selector bits at a time, and never both. */
+    uint8_t a = en_fm_ctrl_set_stereo(0, EN_FM_STEREO_AUTO);
+    uint8_t o = en_fm_ctrl_set_stereo(0, EN_FM_STEREO_MONO);
+    uint8_t t = en_fm_ctrl_set_stereo(0, EN_FM_STEREO_STEREO);
+    CHECK(a == EN_FM_CTRL_AUTO, "auto set 0x%02X", a);
+    CHECK(o == 0, "mono set 0x%02X", o);
+    CHECK(t == EN_FM_CTRL_MANUAL, "stereo set 0x%02X", t);
+
+    /* The bits that are not ours survive every mode. Band and injection are
+       set here, and the blend choice with them, because the advanced editor
+       owns that one and this control must not fight it. */
+    const uint8_t keep = 0x01u | 0x10u | EN_FM_CTRL_BLEND;
+    for (int m = 0; m <= 2; m++) {
+        uint8_t c = en_fm_ctrl_set_stereo(keep, (en_fm_stereo_t)m);
+        CHECK((c & keep) == keep,
+              "mode %d cleared a bit it does not own: 0x%02X", m, c);
+    }
+
+    /* And switching between modes does not accumulate: going auto -> stereo
+       must not leave the auto bit set underneath. */
+    uint8_t c = en_fm_ctrl_set_stereo(keep, EN_FM_STEREO_AUTO);
+    c = en_fm_ctrl_set_stereo(c, EN_FM_STEREO_STEREO);
+    CHECK(!(c & EN_FM_CTRL_AUTO), "auto survived a switch to stereo: 0x%02X", c);
+    c = en_fm_ctrl_set_stereo(c, EN_FM_STEREO_MONO);
+    CHECK(!(c & (EN_FM_CTRL_AUTO | EN_FM_CTRL_MANUAL)),
+          "a selector bit survived a switch to mono: 0x%02X", c);
+    CHECK((c & keep) == keep, "the band was lost along the way: 0x%02X", c);
+
+    /* It persists: forcing mono is a preference about a place, so it has to
+       come back after a restart. */
+    en_settings_t x, y;
+    en_settings_default(&x);
+    x.stereo_mode = EN_FM_STEREO_MONO;
+    char buf[2048];
+    uint32_t n = en_settings_save(&x, buf, sizeof buf);
+    en_settings_default(&y);
+    CHECK(en_settings_load(&y, buf, n), "settings with a stereo mode failed");
+    CHECK(y.stereo_mode == EN_FM_STEREO_MONO,
+          "stereo mode came back as %u", y.stereo_mode);
+}
+
+/* ---- register coverage ----------------------------------------------------
+ *
+ * The advanced screen is generated from the register table, so a control that
+ * is missing from the table is a control that does not exist in the app - and
+ * it goes missing silently, because a register with three of its four bytes
+ * described looks exactly like a register with four.
+ *
+ * So: every byte of every fixed-length readable register has to be claimed by
+ * some field. This is what makes "did we expose all of the stereo blend
+ * settings" a question the test suite answers rather than one somebody has to
+ * re-read the datasheet for.
+ */
+
+static void test_reg_coverage(void)
+{
+    int gaps = 0;
+
+    for (uint8_t i = 0; i < en_fm_reg_count; i++) {
+        const en_fm_reg_t *r = &en_fm_regs[i];
+        uint8_t len = r->read_len;
+
+        /* Variable-length and length-unknown registers have nothing fixed to
+           cover. I2C_RDS_DATA is the FIFO; its shape is the RDS group, not a
+           field list. */
+        if (!len || len > 8 || !r->nfields) continue;
+
+        uint8_t seen[8];
+        for (uint8_t b = 0; b < 8; b++) seen[b] = 0;
+
+        for (uint8_t f = 0; f < r->nfields; f++) {
+            const en_fm_field_t *fl = &r->fields[f];
+            for (uint8_t b = fl->off; b < fl->off + fl->width && b < 8; b++)
+                seen[b] = 1;
+        }
+
+        for (uint8_t b = 0; b < len; b++) {
+            if (!seen[b]) {
+                printf("  GAP: %s (0x%02X) byte %u is not described\n",
+                       r->name, r->addr, b);
+                gaps++;
+            }
+        }
+    }
+
+    CHECK(gaps == 0, "%d register byte(s) have no field describing them", gaps);
+
+    /* And the one the stereo control depends on, named explicitly: if the
+       blend curve ever loses a byte, this says which feature broke. */
+    const en_fm_reg_t *blend = en_fm_reg_find(0xF9);
+    CHECK(blend && blend->nfields == 8,
+          "the stereo blend and soft mute register has %u fields, expected 8",
+          blend ? blend->nfields : 0);
+
+    const en_fm_reg_t *ctrl = en_fm_reg_find(EN_FM_CTRL_ADDR);
+    CHECK(ctrl && ctrl->nfields >= 1,
+          "the FM control register the stereo tap writes is not described");
+}
+
 int main(void)
 {
     printf("Radio+ core tests\n");
@@ -1341,6 +1505,8 @@ int main(void)
     test_wav();
     test_presets();
     test_scan();
+    test_stereo_mode();
+    test_reg_coverage();
     test_rectimer();
     test_sidecar();
     test_simple_flags();

@@ -13,6 +13,7 @@
  */
 
 #include "../model.h"
+#include "../core/fmreg.h"
 #include "tuner.h"
 #include "capture.h"
 #include "player.h"
@@ -125,6 +126,7 @@ static void settings_save(void)
     s_settings.khz = rp_model.khz;
     s_settings.rds_on = rp_model.rds_on;
     s_settings.ta_record = rp_model.ta_record;
+    s_settings.stereo_mode = rp_model.stereo_mode;
     s_settings.simple_screen = rp_model.simple_screen;
     s_settings.wide_screen = rp_model.wide_screen;
 
@@ -222,6 +224,8 @@ static void bring_up(void)
     rp_model.tuner_ok = (te == EN_TUNER_OK);
     rp_model.tuner_note = en_tuner_strerror(te);
     rp_model.can_raw = rp_model.tuner_ok && en_tuner_can_raw();
+    /* The driver exposes fm_seek, so the chip does the finding. */
+    rp_model.can_seek = rp_model.tuner_ok;
 
     if (rp_model.tuner_ok) {
         en_tuner_power(true);
@@ -236,6 +240,11 @@ static void bring_up(void)
         }
 
         en_tuner_rds_enable(rp_model.rds_on);
+        /* Re-apply the stereo choice: it is a preference about a place - one
+           weak station you always want in mono - so it has to survive a power
+           cycle rather than reverting to auto every time the app starts. */
+        if (rp_model.stereo_mode != EN_FM_STEREO_AUTO)
+            rp_act_stereo_mode(rp_model.stereo_mode);
     }
 
     /* Capture is started with the tuner rather than with the record button:
@@ -253,6 +262,7 @@ static void bring_up(void)
     rp_model.play_ok = (en_play_start() == EN_PLAY_OK);
     if (!rp_model.play_ok) failed("no playback device");
     rp_model.ta_record = s_settings.ta_record;
+    rp_model.stereo_mode = s_settings.stereo_mode;
     rp_model.simple_screen = s_settings.simple_screen;
     rp_model.wide_screen = s_settings.wide_screen;
 
@@ -431,6 +441,29 @@ void rp_act_set_rec_at(int16_t minutes)
        the same minute the last fired in would do nothing. */
     rp_model.rectimer.fired = false;
     settings_save();
+}
+
+bool rp_act_seek_quiet(bool up)
+{
+    if (!rp_model.tuner_ok) return false;
+    if (en_tuner_seek(up) != EN_TUNER_OK) return false;
+    /* The station changed underneath the decoder, so what it had belongs to
+       the previous one. */
+    en_rds_init(&rp_model.rds, rp_model.region ? rp_model.region->rbds : true);
+    return true;
+}
+
+void rp_act_stereo_mode(uint8_t mode)
+{
+    rp_model.stereo_mode = mode;
+    settings_save();
+
+    if (!rp_model.tuner_ok || !rp_model.can_raw) return;
+
+    uint8_t ctrl = 0;
+    if (en_tuner_reg_read(EN_FM_CTRL_ADDR, &ctrl, 1) != EN_TUNER_OK) return;
+    ctrl = en_fm_ctrl_set_stereo(ctrl, (en_fm_stereo_t)mode);
+    en_tuner_reg_write(EN_FM_CTRL_ADDR, &ctrl, 1);
 }
 
 void rp_act_step(bool up)

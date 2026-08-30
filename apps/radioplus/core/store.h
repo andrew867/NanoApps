@@ -162,6 +162,11 @@ typedef struct {
        a surprise that fills a disk. */
     bool     ta_record;
 
+    /* Auto, mono or stereo - en_fm_stereo_t. Persisted because forcing mono
+       is a preference about a place, not about a session: somewhere with one
+       weak station you want it every time. */
+    uint8_t  stereo_mode;
+
     /* Which optional screens are in the swipe order. Both default off: the
        swipe sequence a user learns should not grow a page because they
        upgraded. */

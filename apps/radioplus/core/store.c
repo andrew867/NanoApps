@@ -449,6 +449,7 @@ uint32_t en_settings_save(const en_settings_t *s, char *buf, uint32_t cap)
     en_json_bool(&j, "rds", s->rds_on);
     en_json_uint(&j, "live_seconds", s->live_seconds);
     en_json_bool(&j, "ta_record", s->ta_record);
+    en_json_uint(&j, "stereo_mode", s->stereo_mode);
     en_json_bool(&j, "simple_screen", s->simple_screen);
     en_json_bool(&j, "wide_screen", s->wide_screen);
     en_json_uint(&j, "rec_limit_min", s->rectimer.limit_min);
@@ -511,6 +512,9 @@ bool en_settings_load(en_settings_t *s, const char *json, uint32_t len)
 
     v = find_key(json, end, "ta_record");
     if (v) s->ta_record = (*v == 't');
+
+    v = find_key(json, end, "stereo_mode");
+    if (v && read_uint(v, end, &n) && n <= 2u) s->stereo_mode = (uint8_t)n;
 
     v = find_key(json, end, "simple_screen");
     if (v) s->simple_screen = (*v == 't');

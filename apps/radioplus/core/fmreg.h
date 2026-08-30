@@ -129,4 +129,31 @@ static inline uint32_t en_fm_reg_to_khz(uint16_t reg)
     return (uint32_t)reg + EN_FM_BASE_KHZ;
 }
 
+/* ---- stereo handling ------------------------------------------------------
+ *
+ * The three ways the chip can decide between stereo and mono, and the bits in
+ * I2C_FM_CTRL that select them. Here rather than in the UI because the bit
+ * layout belongs with the rest of the register knowledge, and because a
+ * function that edits one register without disturbing the others is worth
+ * testing.
+ */
+typedef enum {
+    EN_FM_STEREO_AUTO = 0,   /* the chip decides from signal quality */
+    EN_FM_STEREO_MONO,       /* forced mono - steadier on a weak signal */
+    EN_FM_STEREO_STEREO      /* forced stereo, whatever the signal is doing */
+} en_fm_stereo_t;
+
+#define EN_FM_CTRL_ADDR        0x01u
+#define EN_FM_CTRL_AUTO        0x02u
+#define EN_FM_CTRL_MANUAL      0x04u
+#define EN_FM_CTRL_BLEND       0x08u
+
+/* Apply `mode` to a value read from I2C_FM_CTRL, leaving every other bit -
+   the band, the injection side, the blend choice - exactly as it was. */
+uint8_t en_fm_ctrl_set_stereo(uint8_t ctrl, en_fm_stereo_t mode);
+
+/* And read it back out, so the UI can show what the register actually says
+   rather than only what it last asked for. */
+en_fm_stereo_t en_fm_ctrl_stereo(uint8_t ctrl);
+
 #endif /* RADIOPLUS_FMREG_H */

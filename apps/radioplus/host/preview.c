@@ -23,6 +23,7 @@
 
 #include "../ui.h"
 #include "../model.h"
+#include "../core/fmreg.h"
 
 static uint32_t s_fb[RP_SCREEN_W * RP_SCREEN_H];
 
@@ -144,6 +145,10 @@ int main(int argc, char **argv)
     /* A timer set, so the Recordings shot shows the controls doing something
        rather than three defaults. Set through the actions, which is how the
        screen would set them. */
+    /* Forced mono, so the stereo pill is shot as the control it now is
+       rather than only as the readout it used to be. */
+    rp_act_stereo_mode(EN_FM_STEREO_MONO);
+
     rp_act_set_rec_limit(60);
     rp_act_set_rec_at((int16_t)(7 * 60 + 45));
 

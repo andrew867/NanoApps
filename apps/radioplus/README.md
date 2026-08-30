@@ -214,9 +214,24 @@ bottom of the Presets screen, does it in about a minute.
 
 Two passes, and the split is what makes it a minute rather than eight.
 
-The **sweep** steps every channel in the region and only asks whether anything
-is there. A hundred milliseconds is enough for the signal reading to settle,
-so a European band at 100 kHz spacing — 205 channels — takes twenty seconds.
+The **sweep** asks only whether anything is there, and where the chip can
+seek for itself it is asked to: it jumps straight from one station to the
+next and the app never names the empty channels in between. In the test
+harness that is **20 ticks against 618** for the same three stations — the
+band crossed in the tuner rather than a channel at a time in software. Where
+there is no hardware seek every channel is stepped and measured instead, a
+hundred milliseconds each, so 205 European channels take twenty seconds. A
+platform that claims a seek and then cannot deliver one falls back to
+stepping rather than stalling: a slower scan is still a scan.
+
+The chip can do more than seek — it has a preset-scan mode that would return
+the whole station list in one go (`I2C_FM_SEARCH_METHOD` = Preset, then
+`I2C_FM_PRESET_MAX_CHANNEL` and `I2C_FM_PRESET_CHANNEL`). That is deliberately
+**not** used, and the reason is in `core/fmreg.c`: those registers are marked
+`EN_FM_TBD`, and the `I2C_FM_SEARCH_TUNE_MODE` value that starts a preset
+search is not one the bring-up sequence pinned down. Guessing at a mode
+register on a chip nobody has been able to test against is how you get a scan
+that appears to work and returns furniture.
 
 The **naming** pass goes back to the channels that answered yes and waits for
 RDS on each. That is seconds, not milliseconds: the station name arrives two
@@ -272,6 +287,37 @@ where it should have stopped.
 `core/timer.c` is the whole of it, and it is a pure function of the clock and
 the recording state — which is what lets the awkward cases (no clock, the same
 minute twice, midnight, tomorrow) be tested without a tuner or a calendar.
+
+## Stereo, and the blend curve
+
+Tap the **STEREO** pill on Now Playing to cycle auto → mono → forced stereo.
+
+Forced mono is the one worth having. A weak station is steadier in mono than
+blending in and out of stereo every few seconds, and that judgement is the
+listener's rather than the chip's. It persists, because it is a preference
+about a *place* — somewhere with one weak station you want it every time — and
+it is re-applied to the chip when the tuner comes up.
+
+The pill shows two things at once, on purpose. Its **label** is the mode that
+was asked for; its **colour** stays driven by the chip's own "stereo active"
+flag. Which way round `I2C_FM_CTRL`'s manual-select bit runs is read off the
+bit's name in the register table rather than pinned down by the bring-up
+sequence — so being able to ask for mono and watch the pill stay lit is how
+that gets found out, immediately and by looking, rather than by wondering.
+
+`en_fm_ctrl_set_stereo` is a read-modify-write: bit 0 is the band and bit 4 is
+the injection side, and a stereo control that reset the band would be a very
+confusing stereo control. The test asserts it never touches a bit it does not
+own, including the blend bit, which belongs to the register editor.
+
+**The whole blend curve is in the register editor**, all eight bytes of
+`I2C_FM_STEREO_BLEND_SOFT_MUTE` named and editable: stereo start and stop SNR,
+blend start and stop RSSI, soft-mute start SNR, attenuation and rate, and the
+SNR offset. A test now asserts that every byte of every fixed-length readable
+register is claimed by some field — the advanced screen is generated from that
+table, so a control missing from it is a control missing from the app, and a
+register with three of its four bytes described looks exactly like one with
+four.
 
 ## Known limitations
 

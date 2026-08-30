@@ -170,6 +170,13 @@ void rp_act_set_rec_at(int16_t minutes)
     
 }
 
+/* No tuner on the desktop, so nothing to seek with. */
+bool rp_act_seek_quiet(bool up) { (void)up; return false; }
+
+/* No tuner: the preview remembers the choice so the control can be seen
+   working, and nothing else happens. */
+void rp_act_stereo_mode(uint8_t mode) { rp_model.stereo_mode = mode; }
+
 void rp_act_step(bool up)
 {
     rp_model.khz = en_region_step(rp_model.region, rp_model.khz, up);
