@@ -40,6 +40,7 @@ typedef enum {
     EN_SRC_PRESET,
     EN_SRC_PROGRAM,
     EN_SRC_USER,
+    EN_SRC_FILE,     /* a multi-layer program loaded from a file */
     EN_SRC_LIVE      /* a preset the user is tuning by hand */
 } en_source_kind_t;
 
@@ -53,6 +54,12 @@ void en_engine_tick(void);
 bool en_engine_play_preset(int index);
 bool en_engine_play_program(int index);
 bool en_engine_play_user(const en_user_program_t *up);
+
+/* Play a segment table the caller owns and keeps alive until something else
+   plays. Used by the measured programs, which are parsed out of a file into a
+   buffer the UI holds rather than copied in here. */
+bool en_engine_play_segs(const en_prog_seg_t *segs, int n_segs,
+                         en_mode_t mode, const char *name, const char *detail);
 
 void en_engine_stop(uint32_t fade_ms);
 void en_engine_toggle_pause(void);

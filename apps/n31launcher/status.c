@@ -69,30 +69,49 @@ static bool exists(const char *path)
  * The window is filled with the first reading rather than with zeros, or the
  * bar would climb from empty over the first half minute of every boot.
  */
-#define BATT_WINDOW 30
+#define BATT_WINDOW 60
 
-static int  s_batt_hist[BATT_WINDOW];
-static int  s_batt_n;
-static int  s_batt_at;
+static int  s_mv_hist[BATT_WINDOW];
+static int  s_mv_n;
+static int  s_mv_at;
 
-static int smooth_battery(int pct)
+/*
+ * The MEDIAN of the last minute of voltage readings, not the mean.
+ *
+ * The rail sags under load - measured dropping from 3875 mV to 3775 while NAND
+ * and CPU are busy, which is a hundred millivolts and most of the top of the
+ * scale. Those dips are brief and deep, which is exactly the shape a mean is
+ * bad at: a few outliers drag it down and the bar reads low for the whole
+ * window afterwards. A median ignores them until they are more than half the
+ * window, by which point the battery really has dropped.
+ *
+ * Voltage is smoothed rather than percentage, because the curve below is not
+ * linear - averaging percentages either side of a knee gives a different
+ * answer from converting the average, and the voltage is the thing actually
+ * being measured.
+ */
+static int smooth_millivolts(int mv)
 {
-    if (s_batt_n == 0) {
-        for (int i = 0; i < BATT_WINDOW; i++) s_batt_hist[i] = pct;
-        s_batt_n = BATT_WINDOW;
-        s_batt_at = 0;
-        return pct;
+    if (s_mv_n == 0) {
+        for (int i = 0; i < BATT_WINDOW; i++) s_mv_hist[i] = mv;
+        s_mv_n = BATT_WINDOW;
+        s_mv_at = 0;
+        return mv;
     }
 
-    s_batt_hist[s_batt_at] = pct;
-    s_batt_at = (s_batt_at + 1) % BATT_WINDOW;
+    s_mv_hist[s_mv_at] = mv;
+    s_mv_at = (s_mv_at + 1) % BATT_WINDOW;
 
-    int sum = 0;
-    for (int i = 0; i < BATT_WINDOW; i++) sum += s_batt_hist[i];
-
-    /* Rounded, not truncated: truncating makes the bar read one point low
-       for most of the window. */
-    return (sum + BATT_WINDOW / 2) / BATT_WINDOW;
+    /* Insertion sort of a copy. Sixty ints once a second is nothing, and it is
+       far easier to be sure of than a running median structure. */
+    int sorted[BATT_WINDOW];
+    for (int i = 0; i < BATT_WINDOW; i++) sorted[i] = s_mv_hist[i];
+    for (int i = 1; i < BATT_WINDOW; i++) {
+        int k = sorted[i], j = i - 1;
+        while (j >= 0 && sorted[j] > k) { sorted[j + 1] = sorted[j]; j--; }
+        sorted[j + 1] = k;
+    }
+    return sorted[BATT_WINDOW / 2];
 }
 
 /*
@@ -104,23 +123,28 @@ static int smooth_battery(int pct)
  * lithium battery has a well known and fairly flat discharge curve, so this
  * derives the percentage rather than believing the driver.
  *
- * The breakpoints are the standard open-circuit curve for one Li-ion cell:
- * 4.20 V full, a long plateau either side of 3.70 V where most of the charge
- * lives, and a knee below 3.50 V. Deliberately piecewise-linear and not a fit
- * to anything - the shape is what matters, and pretending to more precision
- * than the measurement supports would be its own kind of wrong.
+ * ANCHORED TO THIS DEVICE. voltage_now reads 3875 mV when RetailOS shows the
+ * battery full, which is nowhere near a bare cell's 4200 - so the standard
+ * curve applied directly read about 72% on a full battery. Whether that is a
+ * divider, an ADC reference or simply where this pack sits, the fixed point is
+ * measured and the curve is scaled onto it: every breakpoint below is the
+ * standard open-circuit shape multiplied by 3875/4200.
  *
- * This is NOT calibrated against this particular cell. It is a great deal
- * closer than a stuck 60, and it moves when the battery moves, which is the
- * property the status bar actually needs. Calibrating it properly wants one
- * reading of voltage_now taken while RetailOS shows full.
+ * So the top of the scale is measured and the shape is assumed. The shape is
+ * the safer half to assume - it is the same for every single-cell lithium
+ * battery and it is mostly flat - but the low end is unverified, and a reading
+ * taken as it approaches empty would pin it properly.
+ *
+ * Piecewise-linear on purpose. Fitting a smooth function would imply precision
+ * the measurement does not have.
  */
 static int pct_from_millivolts(int mv)
 {
+    /* Standard curve x 3875/4200, rounded to the millivolt. */
     static const struct { int mv, pct; } CURVE[] = {
-        { 4200, 100 }, { 4100,  95 }, { 4000,  87 }, { 3900,  76 },
-        { 3800,  62 }, { 3700,  47 }, { 3600,  30 }, { 3500,  16 },
-        { 3400,   7 }, { 3300,   2 }, { 3200,   0 },
+        { 3875, 100 }, { 3783,  95 }, { 3690,  87 }, { 3598,  76 },
+        { 3506,  62 }, { 3413,  47 }, { 3321,  30 }, { 3229,  16 },
+        { 3137,   7 }, { 3045,   2 }, { 2952,   0 },
     };
     const int n = (int)(sizeof CURVE / sizeof CURVE[0]);
 
@@ -173,12 +197,17 @@ static void read_power(n31_status_t *s)
                is not a gauge on this device - see pct_from_millivolts. The
                range test is what makes this safe: a supply that reports a
                plausible cell voltage is one worth deriving from, and anything
-               else falls back to whatever capacity said. */
-            if (s->millivolts >= 3000 && s->millivolts <= 4400) {
-                s->battery_pct = smooth_battery(pct_from_millivolts(s->millivolts));
+               else falls back to whatever capacity said.
+
+               The window is wide because this device reads 3875 mV full and
+               2952 empty - nine hundred millivolts for the whole scale - so a
+               reading outside it is not this battery. */
+            if (s->millivolts >= 2800 && s->millivolts <= 4400) {
+                int mv = smooth_millivolts(s->millivolts);
+                s->battery_pct = pct_from_millivolts(mv);
                 s->have_battery = true;
             } else if (pct >= 0) {
-                s->battery_pct = smooth_battery(pct);
+                s->battery_pct = pct;
                 s->have_battery = true;
             }
 

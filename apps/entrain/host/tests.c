@@ -22,6 +22,8 @@
 #include "../core/noise.h"
 #include "../core/render.h"
 #include "../core/program.h"
+#include "../core/progfile.h"
+#include "../core/freqset.h"
 #include "../core/wavout.h"
 
 static int g_checks, g_fails;
@@ -831,6 +833,191 @@ static void test_layers(void)
     free(b);
 }
 
+static void test_freqset(void)
+{
+    /* A header, a comment, a blank line and three sets: the shipped bundle's
+       shape, small enough to assert every number in. */
+    static const char text[] =
+        "# a bundle\n"
+        "\n"
+        "Alpha Sweep|3|100,200.5,300\n"
+        "# not a set\n"
+        "9 Volt|10|440,880\n"
+        "Too High|3|1000,90000,2000\n";
+    uint32_t len = (uint32_t)(sizeof text - 1);
+
+    CHECK(en_freqset_count(text, len) == 3,
+          "expected 3 sets, got %d", en_freqset_count(text, len));
+
+    char name[EN_FREQSET_NAME_MAX + 1];
+    int steps = 0;
+    uint32_t dwell = 0;
+
+    CHECK(en_freqset_head(text, len, 0, name, sizeof name, &steps, &dwell),
+          "head 0 failed");
+    CHECK(strcmp(name, "Alpha Sweep") == 0, "name 0 was '%s'", name);
+    CHECK(steps == 3, "steps 0 was %d", steps);
+    CHECK(dwell == 3, "dwell 0 was %u", (unsigned)dwell);
+
+    CHECK(en_freqset_head(text, len, 1, name, sizeof name, &steps, &dwell),
+          "head 1 failed");
+    CHECK(strcmp(name, "9 Volt") == 0, "name 1 was '%s'", name);
+    CHECK(steps == 2 && dwell == 10, "head 1 was %d/%u", steps,
+          (unsigned)dwell);
+
+    CHECK(!en_freqset_head(text, len, 3, name, sizeof name, 0, 0),
+          "head past the end should fail");
+
+    /* Expansion: one flat segment per step, at the file's dwell. */
+    static en_prog_seg_t segs[EN_FREQSET_MAX_STEPS];
+    int dropped = -1;
+    int n = en_freqset_segs(text, len, 0, 0, 0.0, segs,
+                            EN_FREQSET_MAX_STEPS, &dropped);
+    CHECK(n == 3, "expected 3 segments, got %d", n);
+    CHECK(dropped == 0, "expected nothing dropped, got %d", dropped);
+    CHECK(segs[0].carrier_hz == 100.0 && segs[1].carrier_hz == 200.5 &&
+          segs[2].carrier_hz == 300.0,
+          "carriers were %g/%g/%g", segs[0].carrier_hz, segs[1].carrier_hz,
+          segs[2].carrier_hz);
+    CHECK(segs[0].seconds == 3 && segs[2].seconds == 3,
+          "dwell was %u/%u", (unsigned)segs[0].seconds,
+          (unsigned)segs[2].seconds);
+    CHECK(segs[0].beat_start == 0.0 && segs[0].beat_end == 0.0 &&
+          segs[0].layers == 0 && segs[0].noise == EN_NOISE_NONE,
+          "a step should be one flat tone with no beat and no noise");
+
+    /* The dwell override, which is what a longer run off the same set is. */
+    n = en_freqset_segs(text, len, 1, 25, 0.0, segs, EN_FREQSET_MAX_STEPS, 0);
+    CHECK(n == 2 && segs[0].seconds == 25 && segs[1].seconds == 25,
+          "dwell override gave %d segments at %u s", n,
+          (unsigned)segs[0].seconds);
+
+    /* Above Nyquist is skipped and counted, never rendered: it would come out
+       as a different frequency, which for a signal generator is a lie. */
+    n = en_freqset_segs(text, len, 2, 0, 22050.0, segs,
+                        EN_FREQSET_MAX_STEPS, &dropped);
+    CHECK(n == 2 && dropped == 1, "got %d segments, %d dropped", n, dropped);
+    CHECK(segs[0].carrier_hz == 1000.0 && segs[1].carrier_hz == 2000.0,
+          "the surviving carriers were %g and %g",
+          segs[0].carrier_hz, segs[1].carrier_hz);
+
+    /* A set too long for the buffer is refused whole. Half a sweep would look
+       like a sweep and play as something else. */
+    n = en_freqset_segs(text, len, 0, 0, 0.0, segs, 2, &dropped);
+    CHECK(n == 0, "a set that does not fit should be refused, got %d", n);
+
+    /* And the real bundle, when it is there to read. */
+    /* The platform layer is not linked into the tests, so the bundle is found
+       the two ways it can be from here: where the device would export it, or
+       where it lives in the tree when running from host/. */
+    const char *env = getenv("ENTRAIN_DATA");
+    char path[512];
+    if (env && *env) snprintf(path, sizeof path, "%s/frequencies.set", env);
+    else             snprintf(path, sizeof path,
+                              "../../../data/Entrain/frequencies.set");
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        static char buf[262144];
+        size_t got = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        buf[got] = 0;
+        int sets = en_freqset_count(buf, (uint32_t)got);
+        CHECK(sets > 0, "the shipped bundle parsed to %d sets", sets);
+        for (int i = 0; i < sets; i++) {
+            CHECK(en_freqset_head(buf, (uint32_t)got, i, name, sizeof name,
+                                  &steps, &dwell),
+                  "bundle set %d has no head", i);
+            CHECK(name[0] != 0, "bundle set %d has no name", i);
+            CHECK(steps > 0 && steps <= EN_FREQSET_MAX_STEPS,
+                  "bundle set %d '%s' has %d steps, past the %d cap",
+                  i, name, steps, EN_FREQSET_MAX_STEPS);
+            CHECK(dwell > 0, "bundle set %d '%s' has no dwell", i, name);
+        }
+        printf("  (bundle: %d sets, all within the cap)\n", sets);
+    } else {
+        printf("  (no bundle at %s, skipped)\n", path);
+    }
+}
+
+static void test_progfile(void)
+{
+    section("programs loaded from a file");
+
+    static const char text[] =
+        "# Entrain measured programs, v1\n"
+        "\n"
+        "@Alpha Thing|600\n"
+        "C102.5,300.25\n"
+        "S120|4.0,4.5,1.0,0.8|3.8,3.8,0.0,0.25\n"
+        "S480|4.5,2.0,0.8,0.2|3.8,3.7,0.25,0.5\n"
+        "\n"
+        "@Beta Thing|60\n"
+        "C200\n"
+        "S60|10.0,12.0,1.0,1.0\n";
+    const uint32_t len = (uint32_t)(sizeof text - 1);
+
+    CHECK(en_progfile_count(text, len) == 2,
+          "expected 2 programs, got %d", en_progfile_count(text, len));
+
+    char name[64];
+    uint32_t secs = 0;
+    CHECK(en_progfile_head(text, len, 0, name, sizeof name, &secs),
+          "head 0 failed");
+    CHECK(strcmp(name, "Alpha Thing") == 0, "name 0 is '%s'", name);
+    CHECK(secs == 600, "seconds 0 is %u", secs);
+
+    CHECK(en_progfile_head(text, len, 1, name, sizeof name, &secs),
+          "head 1 failed");
+    CHECK(strcmp(name, "Beta Thing") == 0, "name 1 is '%s'", name);
+    CHECK(secs == 60, "seconds 1 is %u", secs);
+
+    CHECK(!en_progfile_head(text, len, 2, name, sizeof name, &secs),
+          "a third program was reported");
+
+    static en_progfile_t pf;
+    CHECK(en_progfile_load(text, len, 0, &pf), "load 0 failed");
+    CHECK(pf.n_segs == 2, "expected 2 segments, got %d", pf.n_segs);
+    CHECK(pf.layers == 2, "expected 2 layers, got %u", pf.layers);
+
+    CHECK(pf.segs[0].seconds == 120, "seg 0 is %u s", pf.segs[0].seconds);
+    CHECK(fabs(pf.segs[0].layer[0].carrier_hz - 102.5) < 1e-9,
+          "layer 0 carrier %.4f", pf.segs[0].layer[0].carrier_hz);
+    CHECK(fabs(pf.segs[0].layer[1].carrier_hz - 300.25) < 1e-9,
+          "layer 1 carrier %.4f", pf.segs[0].layer[1].carrier_hz);
+    CHECK(fabs(pf.segs[0].layer[1].level_start - 0.0) < 1e-9,
+          "a layer silent at the start was not read as silent");
+    CHECK(fabs(pf.segs[0].layer[1].level_end - 0.25) < 1e-9,
+          "layer 1 end gain %.4f", pf.segs[0].layer[1].level_end);
+
+    /* The scalar fields mirror layer zero, because the readout reads those. */
+    CHECK(fabs(pf.segs[0].beat_start - 4.0) < 1e-9, "beat_start not mirrored");
+    CHECK(fabs(pf.segs[1].beat_end - 2.0) < 1e-9, "beat_end not mirrored");
+
+    /* Fields the format does not carry must be their documented defaults, not
+       whatever the previous parse left behind. */
+    CHECK(pf.segs[0].noise == EN_NOISE_NONE, "noise was not defaulted");
+    CHECK(pf.segs[0].interp == EN_INTERP_SMOOTH, "interp was not set");
+
+    /* And it evaluates like any other program. */
+    en_layer_t lay[EN_MAX_LAYERS];
+    en_noise_kind_t nk;
+    double nl;
+    uint8_t n = en_segs_layers_at(pf.segs, pf.n_segs, 0.0, EN_MODE_BINAURAL,
+                                  lay, &nk, &nl);
+    CHECK(n == 2, "evaluated %u layers", n);
+    CHECK(fabs(lay[0].beat_hz - 4.0) < 1e-9, "beat at t=0 is %.3f",
+          lay[0].beat_hz);
+
+    CHECK(en_progfile_load(text, len, 1, &pf), "load 1 failed");
+    CHECK(pf.n_segs == 1 && pf.layers == 1,
+          "second program is %d segs / %u layers", pf.n_segs, pf.layers);
+
+    /* Malformed input is refused rather than half-parsed. */
+    static const char broken[] = "@No Carriers|10\nS10|1.0,1.0,1.0,1.0\n";
+    CHECK(!en_progfile_load(broken, (uint32_t)(sizeof broken - 1), 0, &pf),
+          "a segment before its carrier line was accepted");
+}
+
 static void test_wav_header(void)
 {
     section("wav header");
@@ -1164,6 +1351,8 @@ int main(void)
     test_glide();
     test_levels();
     test_layers();
+    test_progfile();
+    test_freqset();
     test_wav_header();
     test_programs();
     test_bands();

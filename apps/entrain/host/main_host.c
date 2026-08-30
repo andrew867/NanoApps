@@ -461,6 +461,7 @@ int main(int argc, char **argv)
             { 0, "library-presets" },
             { 1, "library-programs" },
             { 3, "library-suites" },
+            { 4, "library-frequencies" },
         };
         for (unsigned i = 0; i < sizeof SHELVES / sizeof SHELVES[0]; i++) {
             en_ui_goto(EN_SCREEN_LIBRARY, false);
@@ -470,6 +471,21 @@ int main(int argc, char **argv)
 
             char path[512];
             snprintf(path, sizeof path, "%s/%s.bmp", shot_dir, SHELVES[i].name);
+            if (write_bmp(path)) printf("  %s\n", path);
+        }
+
+        /* One level deeper on the frequency shelf, which is the only shelf
+           that has one: initials, then the sets under an initial. A shot of
+           the initials alone would not show what a set row looks like. */
+        en_ui_set_tab(4);
+        en_ui_key(EN_KEY_VOL_DOWN);      /* off the digits, onto A */
+        en_ui_key(EN_KEY_PLAY_PAUSE);    /* open it */
+        pump(20);
+        lv_refr_now(disp);
+        {
+            char path[512];
+            snprintf(path, sizeof path, "%s/library-frequency-sets.bmp",
+                     shot_dir);
             if (write_bmp(path)) printf("  %s\n", path);
         }
 

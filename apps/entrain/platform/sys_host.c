@@ -173,6 +173,17 @@ const char *en_sys_programs_dir(void)
     return s_programs;
 }
 
+const char *en_sys_data_dir(void)
+{
+    /* ENTRAIN_DATA is what the device sets, to the app's own folder on the
+       read-only volume. Falling back to ENTRAIN_HOME rather than to the
+       programs directory keeps a host run working with nothing exported: drop
+       frequencies.set in ~/.entrain and it is found. */
+    const char *env = getenv("ENTRAIN_DATA");
+    if (env && *env) return env;
+    return base_dir();
+}
+
 bool en_sys_prefs_load(void *blob, uint32_t size)
 {
     char path[600];

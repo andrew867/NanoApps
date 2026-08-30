@@ -47,6 +47,12 @@ const char *en_sys_cache_dir(void);
 /* Where user program files live. */
 const char *en_sys_programs_dir(void);
 
+/* Where read-only data shipped with the app lives - the frequency bundle, and
+   anything else added later that is neither a setting nor a cache. Separate
+   from the programs directory because that one is a directory the user drops
+   files into, and separate from the cache because this is never written. */
+const char *en_sys_data_dir(void);
+
 /* Read a whole small file. Returns bytes read, 0 on failure. */
 uint32_t en_sys_read_file(const char *path, void *buf, uint32_t max);
 

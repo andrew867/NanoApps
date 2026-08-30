@@ -13,11 +13,13 @@ nothing else. See [No claims](#no-claims).
 | | | |
 | --- | --- | --- |
 | ![Library](screenshots/library.png) | ![Presets](screenshots/library-presets.png) | ![Suites](screenshots/library-suites.png) |
-| Library — four shelves | Presets | Suites |
+| Library — five shelves | Presets | Suites |
 | ![Now Playing](screenshots/now-playing.png) | ![Live Tune](screenshots/live-tune.png) | ![Programs](screenshots/library-programs.png) |
 | Now Playing | Live Tune | Programs |
 | ![Sleep Timer](screenshots/timer.png) | ![Settings](screenshots/settings.png) | ![First run](screenshots/first-run.png) |
 | Sleep Timer | Settings | First run |
+| ![Frequencies](screenshots/library-frequencies.png) | ![Frequency sets](screenshots/library-frequency-sets.png) | |
+| Frequencies — by initial | One initial's sets | |
 
 These are rendered from the host build at the device's exact 240x432, with
 `cd host && make -f Makefile.host shots` — no display or window manager required.
@@ -35,8 +37,13 @@ These are rendered from the host build at the device's exact 240x432, with
 - **Ten suites**: longer sessions that sound up to five carriers at once, each
   layer with its own beat and gain envelope. Four are ported from a generator's
   own metadata; six are measured from recordings.
-- **A library you can browse.** Four shelves — Presets, Programs, Suites,
-  Custom — rather than three tabs across the top, which had run out of room.
+- **Four hundred and sixteen frequency sets.** Flat tone lists — play this
+  frequency for three seconds, then this one — which turn the device into a
+  pocket signal generator with a list of presets. See
+  [Frequencies](#frequencies).
+- **A library you can browse.** Five shelves — Presets, Programs, Suites,
+  Frequencies, Custom — rather than three tabs across the top, which had run
+  out of room.
 - **Noise beds**: white, pink (Kellett 3-pole) or brown, mixable under the
   tones with their own level.
 - **Live Tune**: drag to move the beat and carrier while the current loop keeps
@@ -394,7 +401,45 @@ technically are — "10 Hz binaural beat, 200 Hz carrier" — never by what they
 allegedly cause. Band names (Delta, Theta, Alpha, Beta, Gamma) are used as the
 conventional labels for frequency ranges and nothing more.
 
-### Trademark
+### Frequencies
+
+The fifth shelf is not entrainment at all. Each entry is a list of plain tones
+and a dwell — 273.4 Hz for three seconds, then 384.8 Hz for three seconds, and
+so on — so the device works as a cheap signal generator that happens to ship
+with four hundred named presets.
+
+Four hundred and sixteen sets, 8,118 steps, in `data/Entrain/frequencies.set`.
+Two levels deep in the browser: initials first, then the sets under one
+initial. That is not decoration. Four hundred rows is past the point where
+building every row up front is free on this device, and it is also simply how
+you find a named thing in a list of four hundred.
+
+The format is one set per line, so a set can be found by counting newlines and
+the bundle never has to be parsed whole:
+
+```
+# comments and blank lines are ignored
+<name>|<dwell seconds>|<hz>,<hz>,<hz>,...
+```
+
+Add your own by adding lines. `core/freqset.c` reads it with a pointer and no
+allocation, the same way `core/progfile.c` reads multi-layer programs.
+
+**Steps above Nyquist are skipped, not played.** The output runs at 44.1 kHz,
+so anything at or above 22,050 Hz is dropped and the count is shown on the
+Now Playing detail line. A tone above Nyquist does not come out quiet, it comes
+out as a *different frequency*, and a signal generator that lies about what it
+is emitting is worse than one that admits it skipped a step. Nothing in the
+shipped bundle is affected — its highest step is 19,996.75 Hz.
+
+**No claims are made for any of these frequencies**, by this README, by the
+app, or by the file. They are a list of numbers to emit.
+
+On the device the bundle is read from `ENTRAIN_DATA`, which
+`/bin/n31-autostart` sets to the app's own folder on the volume — beside the
+binary, not under `programs/`, which is the directory your own files go in.
+
+## Trademark
 
 This app is not affiliated with, endorsed by, or derived from The Monroe
 Institute. "Hemi-Sync" is their registered trademark and appears nowhere in

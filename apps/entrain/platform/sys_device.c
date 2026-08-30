@@ -96,6 +96,12 @@ const char *en_sys_programs_dir(void)
     return EN_PROGRAMS_DIR;
 }
 
+const char *en_sys_data_dir(void)
+{
+    ensure_dirs();
+    return EN_DATA_DIR;
+}
+
 uint32_t en_sys_read_file(const char *path, void *buf, uint32_t max)
 {
     return hb_fs_read(path, buf, max);

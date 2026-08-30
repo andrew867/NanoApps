@@ -25,6 +25,7 @@
 #include "ui.h"
 #include "engine.h"
 #include "core/program.h"
+#include "core/freqset.h"
 #include "platform/audio.h"
 #include "platform/sys.h"
 
@@ -130,6 +131,7 @@ typedef enum {
     LIB_PRESETS = 0,
     LIB_PROGRAMS,
     LIB_SUITES,
+    LIB_FREQSETS,
     LIB_CUSTOM,
     LIB_SHELF_COUNT
 } lib_shelf_t;
@@ -138,7 +140,6 @@ static lv_obj_t *s_list;
 static lv_obj_t *s_battery_lbl;
 static lv_obj_t *s_lib_title;
 static lv_obj_t *s_lib_back;      /* the back row, hidden at the root */
-static lv_obj_t *s_lib_hint;
 static lv_obj_t *s_sel_row;       /* the highlighted row, for scroll-into-view */
 static int       s_shelf = LIB_ROOT;
 static int       s_sel;           /* highlighted row, for key navigation */
@@ -409,6 +410,140 @@ static void on_gesture(lv_event_t *e)
         en_ui_goto(n->down, true);
 }
 
+/* ---- frequency sets ------------------------------------------------------
+ *
+ * Four hundred flat tone lists, read from a file on the volume. Two things
+ * about that number drive the code below.
+ *
+ * First, it is read once and kept. Re-reading a hundred kilobytes to redraw a
+ * list would cost a syscall and the whole file per keypress, and freeing it on
+ * leaving the shelf would make coming back cost that again.
+ *
+ * Second, four hundred rows is past the point where building every row is
+ * free — the comment at the top of this section says so — so the shelf has a
+ * level of its own: initials first, then the sets under one initial. That
+ * keeps any one list to a few dozen rows, which is what the rest of the
+ * browser is built for, and it is also simply how you find a named thing in a
+ * list of four hundred.
+ *
+ * Entry offsets are indexed at load. Without that, drawing row n means
+ * scanning n lines from the top of the file, and drawing a whole list means
+ * scanning the file a hundred times over.
+ */
+
+/* Room above the shipped bundle - 416 sets in 76 KB - so a longer one still
+   loads. A file past either limit is read up to the last whole line rather
+   than truncated mid-entry, so what does load is all valid. */
+#define EN_FREQ_BUNDLE_MAX 262144u
+#define EN_FREQ_MAX_SETS   1024
+
+static char    *s_fs_text;
+static uint32_t s_fs_len;
+static int      s_fs_count = -1;          /* -1: not looked for it yet */
+static uint32_t s_fs_off[EN_FREQ_MAX_SETS];
+static uint8_t  s_fs_bucket[EN_FREQ_MAX_SETS];   /* 0 = '#', 1..26 = A..Z */
+
+/* Which initials are actually present, and how many under each. Built once so
+   the initial list is not a scan of every name per frame. */
+static uint8_t  s_fs_letter[27];          /* bucket ids, in display order */
+static uint16_t s_fs_letter_n[27];
+static int      s_fs_letters;
+static int      s_fs_letter_sel = -1;     /* -1: showing the initials */
+
+static int fs_bucket_of(char c)
+{
+    if (c >= 'a' && c <= 'z') return c - 'a' + 1;
+    if (c >= 'A' && c <= 'Z') return c - 'A' + 1;
+    return 0;
+}
+
+static void freqsets_load(void)
+{
+    if (s_fs_count >= 0) return;
+    s_fs_count = 0;
+
+    char path[256];
+    path[0] = 0;
+    str_cat(path, en_sys_data_dir(), sizeof path);
+    str_cat(path, "/frequencies.set", sizeof path);
+
+    char *buf = (char *)en_sys_alloc(EN_FREQ_BUNDLE_MAX);
+    if (!buf) return;
+
+    uint32_t n = en_sys_read_file(path, buf, EN_FREQ_BUNDLE_MAX - 1);
+    if (!n) { en_sys_free(buf); return; }
+
+    /* A file bigger than the buffer comes back filled to the brim with its
+       last line cut in half. Drop back to the last newline: a half line is a
+       malformed set, and one of those in the list is a row that cannot play. */
+    if (n >= EN_FREQ_BUNDLE_MAX - 1) {
+        while (n && buf[n - 1] != '\n') n--;
+        if (!n) { en_sys_free(buf); return; }
+    }
+    buf[n] = 0;
+
+    s_fs_text = buf;
+    s_fs_len  = n;
+
+    int total = en_freqset_count(buf, n);
+    if (total > EN_FREQ_MAX_SETS) total = EN_FREQ_MAX_SETS;
+
+    /* Index the entry lines in one pass, then bucket them by initial. The
+       offsets are what make every later lookup a pointer add instead of a
+       scan from the top of the file. */
+    uint32_t i = 0;
+    int found = 0;
+    while (i < n && found < total) {
+        uint32_t j = i;
+        while (j < n && buf[j] != '\n') j++;
+
+        uint32_t k = i;
+        while (k < j && (buf[k] == ' ' || buf[k] == '\t' || buf[k] == '\r')) k++;
+        if (k < j && buf[k] != '#') {
+            s_fs_off[found] = k;
+            s_fs_bucket[found] = (uint8_t)fs_bucket_of(buf[k]);
+            found++;
+        }
+        i = j < n ? j + 1 : n;
+    }
+    s_fs_count = found;
+
+    for (int b = 0; b < 27; b++) s_fs_letter_n[b] = 0;
+    for (int s = 0; s < found; s++) s_fs_letter_n[s_fs_bucket[s]]++;
+
+    s_fs_letters = 0;
+    for (int b = 0; b < 27; b++)
+        if (s_fs_letter_n[b]) s_fs_letter[s_fs_letters++] = (uint8_t)b;
+}
+
+/* Head of set `i`, addressed through the offset index. */
+static bool fs_head(int i, char *name, int cap, int *steps, uint32_t *dwell)
+{
+    if (!s_fs_text || i < 0 || i >= s_fs_count) return false;
+    uint32_t off = s_fs_off[i];
+    return en_freqset_head(s_fs_text + off, s_fs_len - off, 0,
+                           name, cap, steps, dwell);
+}
+
+/* The `row`th set under the initial currently open, as a global set index. */
+static int fs_index_of_row(int row)
+{
+    if (s_fs_letter_sel < 0 || s_fs_letter_sel >= s_fs_letters) return -1;
+    uint8_t want = s_fs_letter[s_fs_letter_sel];
+    for (int i = 0, seen = 0; i < s_fs_count; i++) {
+        if (s_fs_bucket[i] != want) continue;
+        if (seen == row) return i;
+        seen++;
+    }
+    return -1;
+}
+
+/* Segments for whatever is playing off this shelf. Held here rather than in
+   the engine because en_engine_play_segs borrows the table: it has to outlive
+   the call, and there is only ever one of them sounding. */
+static en_prog_seg_t s_fs_segs[EN_FREQSET_MAX_STEPS];
+
+
 /* ---- library ------------------------------------------------------------- */
 
 /* How many entries a shelf holds. Custom is counted by walking the directory,
@@ -420,6 +555,16 @@ static int shelf_count(int shelf)
     case LIB_PRESETS:  en_presets(&n); return n;
     case LIB_PROGRAMS: return en_programs_in_group(EN_GROUP_PROGRAM, 0, 0);
     case LIB_SUITES:   return en_programs_in_group(EN_GROUP_SUITE, 0, 0);
+    case LIB_FREQSETS:
+        freqsets_load();
+        /* At the shelf's own root the rows are initials, not sets. The count
+           shown on the Library page is still the number of sets, because that
+           is what someone reading "Frequencies ... 416" wants to know. */
+        return s_fs_letter_sel < 0 && s_shelf == LIB_FREQSETS
+                   ? s_fs_letters
+                   : (s_shelf == LIB_FREQSETS
+                          ? s_fs_letter_n[s_fs_letter[s_fs_letter_sel]]
+                          : s_fs_count);
     case LIB_CUSTOM: {
         char name[64];
         int i = 0;
@@ -438,19 +583,9 @@ static const char *shelf_name(int shelf)
     case LIB_PRESETS:  return "Presets";
     case LIB_PROGRAMS: return "Programs";
     case LIB_SUITES:   return "Suites";
+    case LIB_FREQSETS: return "Frequencies";
     case LIB_CUSTOM:   return "Custom";
     default:           return "Library";
-    }
-}
-
-static const char *shelf_detail(int shelf)
-{
-    switch (shelf) {
-    case LIB_PRESETS:  return "One steady beat";
-    case LIB_PROGRAMS: return "Timelines that ramp";
-    case LIB_SUITES:   return "Two or three carriers";
-    case LIB_CUSTOM:   return "Your own .txt files";
-    default:           return "";
     }
 }
 
@@ -459,6 +594,10 @@ static const char *shelf_detail(int shelf)
 static void lib_open(int shelf)
 {
     if (s_shelf >= 0 && s_shelf < LIB_SHELF_COUNT) s_sel_of[s_shelf] = s_sel;
+    /* Opening the frequency shelf always lands on the initials. It is only
+       ever opened from the Library page, and the drill into an initial goes
+       through activate_row rather than through here. */
+    s_fs_letter_sel = -1;
     s_shelf = shelf;
     s_sel = (shelf >= 0 && shelf < LIB_SHELF_COUNT) ? s_sel_of[shelf] : 0;
 
@@ -473,6 +612,14 @@ static void on_lib_back(lv_event_t *e)
 {
     (void)e;
     wake_screen();
+    /* The frequency shelf has a level of its own, so back from inside an
+       initial goes to the initials rather than all the way out. */
+    if (s_shelf == LIB_FREQSETS && s_fs_letter_sel >= 0) {
+        s_fs_letter_sel = -1;
+        s_sel = s_sel_of[LIB_FREQSETS];
+        refresh_library();
+        return;
+    }
     lib_open(LIB_ROOT);
 }
 
@@ -527,6 +674,51 @@ static void activate_row(int row)
         idx = program_index_of(s_shelf, row);
         if (idx < 0) return;
         ok = en_engine_play_program(idx);
+    } else if (s_shelf == LIB_FREQSETS) {
+        freqsets_load();
+
+        /* First level: pick an initial. Remember where we were on it, so the
+           back chevron returns to the same place in a list of twenty-six. */
+        if (s_fs_letter_sel < 0) {
+            if (row < 0 || row >= s_fs_letters) return;
+            s_sel_of[LIB_FREQSETS] = row;
+            s_fs_letter_sel = row;
+            s_sel = 0;
+            refresh_library();
+            return;
+        }
+
+        int set = fs_index_of_row(row);
+        if (set < 0) return;
+        uint32_t off = s_fs_off[set];
+        const char *t = s_fs_text + off;
+        uint32_t tl = s_fs_len - off;
+
+        char fname[EN_FREQSET_NAME_MAX + 1];
+        if (!en_freqset_head(t, tl, 0, fname, (int)sizeof fname, 0, 0)) return;
+
+        uint32_t rate = en_audio_preferred_rate();
+        if (!rate) rate = 44100u;
+
+        int dropped = 0;
+        int n = en_freqset_segs(t, tl, 0, 0, (double)rate / 2.0,
+                                s_fs_segs, EN_FREQSET_MAX_STEPS, &dropped);
+        if (n <= 0) return;
+
+        /* The detail line is where a skipped step gets said. A generator that
+           quietly drops part of a sweep is worse than one that tells you. */
+        char det[64];
+        det[0] = 0;
+        put_uint(det, 0, (uint32_t)n, 1);
+        str_cat(det, " tones", (int)sizeof det);
+        if (dropped) {
+            str_cat(det, ", ", (int)sizeof det);
+            put_uint(det + strlen(det), 0, (uint32_t)dropped, 1);
+            str_cat(det, " too high to play", (int)sizeof det);
+        }
+
+        ok = en_engine_play_segs(s_fs_segs, n, EN_MODE_MONAURAL, fname, det);
+        idx = set;
     } else {
         /* A user program: read the file, parse it, play it. A malformed file
            is reported on its own row rather than failing silently. */
@@ -555,10 +747,15 @@ static void activate_row(int row)
     }
 
     if (ok) {
-        P.last_source = (s_shelf == LIB_PRESETS) ? EN_SRC_PRESET
-                                                 : EN_SRC_PROGRAM;
-        P.last_index = idx;
-        prefs_save();
+        /* Frequency sets are not recorded as the thing to resume. last_index
+           is read back as an index into the compiled program table, and a set
+           number in that slot would resume some unrelated program. */
+        if (s_shelf != LIB_FREQSETS) {
+            P.last_source = (s_shelf == LIB_PRESETS) ? EN_SRC_PRESET
+                                                     : EN_SRC_PROGRAM;
+            P.last_index = idx;
+            prefs_save();
+        }
         en_engine_set_sleep_timer((uint32_t)P.sleep_timer_s);
         en_ui_goto(EN_SCREEN_NOW, true);
     }
@@ -603,24 +800,32 @@ static void add_row(int index, uint32_t color, const char *name,
     lv_obj_remove_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_size(dot, 8, 8);
     lv_obj_set_style_radius(dot, 4, 0);
-    lv_obj_set_pos(dot, 0, 15);
+    lv_obj_set_pos(dot, 0, (detail && detail[0]) ? 15 : 26);
+
+    /* A row with no measurement to show is one line, centred, rather than
+       a line of text sitting high in a two-line row with a gap under it. */
+    bool two_line = detail && detail[0];
 
     lv_obj_t *n = make_label(row, name, F_BODY, C_TEXT);
     /* Bounded and elided. A suite name is longer than anything that was here
        before and would otherwise run under the value on the right. */
     lv_obj_set_size(n, CONTENT_W - 18 - 66, 22);
     lv_label_set_long_mode(n, LV_LABEL_LONG_DOT);
-    lv_obj_set_pos(n, 18, 8);
+    lv_obj_set_pos(n, 18, two_line ? 8 : 19);
 
-    lv_obj_t *d = make_label(row, detail, F_CAPTION, C_TEXT_MUTE);
-    /* Width and height first, then the mode: LV_LABEL_LONG_DOT wraps instead
-       of eliding unless it has both, and a detail line that wrapped would push
-       into the row below. Stops short of the value column rather than running
-       under it - the value is short today, and a row whose two halves overlap
-       only when the data is long is a row that looks fine until it does not. */
-    lv_obj_set_size(d, CONTENT_W - 18 - 46, 18);
-    lv_label_set_long_mode(d, LV_LABEL_LONG_DOT);
-    lv_obj_set_pos(d, 18, 31);
+    if (two_line) {
+        lv_obj_t *d = make_label(row, detail, F_CAPTION, C_TEXT_MUTE);
+        /* Width and height first, then the mode: LV_LABEL_LONG_DOT wraps
+           instead of eliding unless it has both, and a detail line that
+           wrapped would push into the row below. Takes the full width: the
+           value sits on the first line and ends at y=30, the detail starts at
+           y=31, so there is nothing beside it to collide with - and holding
+           back 46 px for a column that is not there was eliding half of every
+           suite's line. */
+        lv_obj_set_size(d, CONTENT_W - 18, 18);
+        lv_label_set_long_mode(d, LV_LABEL_LONG_DOT);
+        lv_obj_set_pos(d, 18, 31);
+    }
 
     lv_obj_t *v = make_label(row, value, F_CAPTION,
                              selected ? C_TEXT : C_TEXT_DIM);
@@ -629,7 +834,7 @@ static void add_row(int index, uint32_t color, const char *name,
        detail underneath - which is what "100 min" did at 54 px. */
     lv_obj_set_style_text_align(v, LV_TEXT_ALIGN_RIGHT, 0);
     lv_obj_set_size(v, 62, 20);
-    lv_obj_set_pos(v, CONTENT_W - 62, 10);
+    lv_obj_set_pos(v, CONTENT_W - 62, two_line ? 10 : 20);
 
     make_hairline(row, ROW_H - 1, 18, CONTENT_W - 18);
 
@@ -655,7 +860,19 @@ static void empty_state(const char *title, const char *body)
    has to happen after all of them lives in its caller. */
 static void fill_library(void)
 {
-    lv_label_set_text(s_lib_title, shelf_name(s_shelf));
+    if (s_shelf == LIB_FREQSETS && s_fs_letter_sel >= 0 &&
+        s_fs_letter_sel < s_fs_letters) {
+        int b = s_fs_letter[s_fs_letter_sel];
+        char t[24];
+        t[0] = 0;
+        str_cat(t, "Frequencies  ", (int)sizeof t);
+        int at = (int)strlen(t);
+        t[at] = b ? (char)('A' + b - 1) : '#';
+        t[at + 1] = 0;
+        lv_label_set_text(s_lib_title, t);
+    } else {
+        lv_label_set_text(s_lib_title, shelf_name(s_shelf));
+    }
     /* Indented only when the back chevron is there to be cleared. At the root
        the gutter is empty and the title was floating in the middle of it. */
     lv_obj_set_pos(s_lib_title, MARGIN + (s_shelf == LIB_ROOT ? 0 : 40), 64);
@@ -670,9 +887,8 @@ static void fill_library(void)
             /* The count is the value, and an empty shelf says so rather than
                showing a bare nought that reads like a broken readout. */
             add_row(i, n ? C_ACCENT : C_HAIRLINE, shelf_name(i),
-                    shelf_detail(i), n ? buf : "empty", i == s_sel);
+                    "", n ? buf : "empty", i == s_sel);
         }
-        lv_label_set_text(s_lib_hint, "");
         return;
     }
 
@@ -691,7 +907,6 @@ static void fill_library(void)
             add_row(i, en_band_color(en_band_of(ps[i].beat_hz)),
                     ps[i].name, ps[i].detail, buf, i == s_sel);
         }
-        lv_label_set_text(s_lib_hint, "");
         return;
     }
 
@@ -712,12 +927,63 @@ static void fill_library(void)
             add_row(i, en_band_color(en_program_band(p)),
                     p->name, p->detail, buf, i == s_sel);
         }
-        /* Said once, on the shelf where it applies, rather than in every
-           suite's detail line where it would crowd out the frequencies. */
-        lv_label_set_text(s_lib_hint,
-                          s_shelf == LIB_SUITES
-                              ? "Ported and measured. No claims made."
-                              : "");
+        return;
+    }
+
+    if (s_shelf == LIB_FREQSETS) {
+        freqsets_load();
+
+        if (s_fs_count <= 0) {
+            empty_state("No frequency sets",
+                        "Expected /Apps/Data/Entrain/frequencies.set");
+                return;
+        }
+
+        if (s_fs_letter_sel < 0) {
+            for (int i = 0; i < s_fs_letters; i++) {
+                int b = s_fs_letter[i];
+                char ini[2];
+                ini[0] = b ? (char)('A' + b - 1) : '#';
+                ini[1] = 0;
+                buf[0] = 0;
+                put_uint(buf, 0, (uint32_t)s_fs_letter_n[b], 1);
+                add_row(i, C_ACCENT, ini, "", buf, i == s_sel);
+            }
+            return;
+        }
+
+        uint8_t want = s_fs_letter[s_fs_letter_sel];
+        char fname[EN_FREQSET_NAME_MAX + 1], det[48];
+        int row = 0;
+        for (int i = 0; i < s_fs_count; i++) {
+            if (s_fs_bucket[i] != want) continue;
+
+            int steps = 0;
+            uint32_t dwell = 0;
+            if (!fs_head(i, fname, (int)sizeof fname, &steps, &dwell)) {
+                row++;
+                continue;
+            }
+
+            det[0] = 0;
+            put_uint(det, 0, (uint32_t)steps, 1);
+            str_cat(det, " tones, ", (int)sizeof det);
+            put_uint(det + strlen(det), 0, dwell, 1);
+            str_cat(det, " s each", (int)sizeof det);
+
+            uint32_t total = (uint32_t)steps * dwell;
+            buf[0] = 0;
+            if (total >= 60u) {
+                put_uint(buf, 0, total / 60u, 1);
+                str_cat(buf, " min", (int)sizeof buf);
+            } else {
+                put_uint(buf, 0, total, 1);
+                str_cat(buf, " s", (int)sizeof buf);
+            }
+
+            add_row(row, C_ACCENT, fname, det, buf, row == s_sel);
+            row++;
+        }
         return;
     }
 
@@ -727,14 +993,12 @@ static void fill_library(void)
     for (int i = 0; i < EN_LIB_MAX_CUSTOM; i++) {
         if (!en_sys_list_dir(en_sys_programs_dir(), i, name, sizeof name))
             break;
-        add_row(i, C_TEXT_MUTE, name, "user program", "", i == s_sel);
+        add_row(i, C_TEXT_MUTE, name, "", "", i == s_sel);
         shown++;
     }
     if (shown == 0)
         empty_state("No user programs",
-                    "Drop .txt program files into "
-                    "/Apps/Data/Entrain/programs. The format is in the README.");
-    lv_label_set_text(s_lib_hint, "");
+                    "Drop .txt files in /Apps/Data/Entrain/programs");
 }
 
 static void refresh_library(void)
@@ -814,10 +1078,6 @@ static void build_library(void)
     /* One line under the list for whatever is true of the shelf as a whole.
        It shares the bottom strip with the parse-error line, which only ever
        appears after a tap and takes priority when it does. */
-    s_lib_hint = make_label(s, "", F_CAPTION, C_TEXT_MUTE);
-    lv_obj_set_size(s_lib_hint, CONTENT_W, 18);
-    lv_label_set_long_mode(s_lib_hint, LV_LABEL_LONG_DOT);
-    lv_obj_set_pos(s_lib_hint, MARGIN, EN_SCREEN_H - 20);
 
     s_row_error = make_label(s, "", F_CAPTION, 0xE06C6C);
     lv_obj_set_width(s_row_error, CONTENT_W);
@@ -1600,15 +1860,16 @@ void en_ui_set_blanking(bool enabled)
 
 void en_ui_set_tab(int tab)
 {
-    /* The tabs became shelves, and there are four of them now.
+    /* The tabs became shelves, and there are five of them now.
        0, 1 and 2 still name exactly what they always did, so anything holding
        an old number keeps working; Suites took 3 rather than its natural place
-       in the middle, for that reason. -1 opens the root. */
-    static const int SHELF_OF_TAB[4] = {
-        LIB_PRESETS, LIB_PROGRAMS, LIB_CUSTOM, LIB_SUITES
+       in the middle, for that reason, and Frequencies took 4 for the same one.
+       -1 opens the root. */
+    static const int SHELF_OF_TAB[5] = {
+        LIB_PRESETS, LIB_PROGRAMS, LIB_CUSTOM, LIB_SUITES, LIB_FREQSETS
     };
     if (tab < 0) { lib_open(LIB_ROOT); return; }
-    if (tab > 3) return;
+    if (tab > 4) return;
     lib_open(SHELF_OF_TAB[tab]);
 }
 
@@ -1713,7 +1974,15 @@ void en_ui_key(en_key_t key)
         case EN_KEY_PLAY_PAUSE: activate_row(s_sel); return;
         case EN_KEY_BACK:
             /* Out of a shelf first, out of the app only from the root - so
-               back never skips a level it should have unwound. */
+               back never skips a level it should have unwound. The frequency
+               shelf has an extra level and unwinds it the same way the back
+               chevron does. */
+            if (s_shelf == LIB_FREQSETS && s_fs_letter_sel >= 0) {
+                s_fs_letter_sel = -1;
+                s_sel = s_sel_of[LIB_FREQSETS];
+                refresh_library();
+                return;
+            }
             if (s_shelf != LIB_ROOT) { lib_open(LIB_ROOT); return; }
             en_sys_request_exit();
             return;

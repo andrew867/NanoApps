@@ -27,7 +27,7 @@ include ../../lvgl-mirror.mk
 BUILD   := build
 
 CORE_SRCS := $(CORE)/osc.c $(CORE)/noise.c $(CORE)/render.c \
-             $(CORE)/program.c $(CORE)/measured.c $(CORE)/wavout.c
+             $(CORE)/program.c $(CORE)/measured.c $(CORE)/progfile.c $(CORE)/freqset.c $(CORE)/wavout.c
 
 WARN    := -Wall -Wextra -Wshadow -Wpointer-arith
 CFLAGS  ?= -O2 -g -std=c99 $(WARN)
@@ -121,11 +121,15 @@ LV_SRCS := $(shell find $(LVGL_SRC)/src -name '*.c' \
 # switch moves its mtime without changing a byte - which used to rebuild all
 # four hundred and sixty-six objects for a file that had not changed.
 #
-# The key is the config AND the host flags, because which backends are enabled
-# changes the objects: it was a real dependency before and it still is, just
-# expressed as a different directory rather than as a timestamp.
+# The key is the config, the host flags AND the compiler's target triple.
+# Which backends are enabled changes the objects, so the flags were always a
+# real dependency. The triple joined them after a build from Git Bash and a
+# build from WSL - which share $(HOME)/.cache through the same Windows drive -
+# hashed identically and handed each other the other's object files. The
+# symptom is a link full of undefined LVGL symbols, which reads like a missing
+# archive rather than an archive built by the wrong compiler.
 CCACHE  := $(shell command -v ccache 2>/dev/null)
-LV_KEY  := $(shell { md5sum lv_conf_host.h; echo '$(HOST_CFLAGS)'; }                    2>/dev/null | md5sum | cut -c1-12)
+LV_KEY  := $(shell { md5sum lv_conf_host.h; echo '$(HOST_CFLAGS)';                      $(CC) -dumpmachine; }                    2>/dev/null | md5sum | cut -c1-12)
 LV_CACHE ?= $(HOME)/.cache/n31-lvgl/entrain-host-$(LV_KEY)
 
 LV_OBJS := $(patsubst $(LVGL_SRC)/%.c,$(LV_CACHE)/%.o,$(LV_SRCS))
@@ -160,7 +164,10 @@ run: $(BUILD)/entrain-host
 # window manager needed, which is what makes it usable over a plain shell.
 shots: $(BUILD)/entrain-host
 	@mkdir -p ../screenshots
-	@./$(BUILD)/entrain-host --shot ../screenshots
+	@# The frequency shelf reads its bundle from ENTRAIN_DATA, which on the
+	@# device is the app's folder on the volume. Point it at the tree, or the
+	@# shot is of the shelf's empty state rather than of four hundred sets.
+	@ENTRAIN_DATA=../../../data/Entrain ./$(BUILD)/entrain-host --shot ../screenshots
 	@python3 tobmp.py ../screenshots
 	@rm -f ../screenshots/*.bmp
 

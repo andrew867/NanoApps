@@ -43,6 +43,11 @@ static struct {
     int              index;
     en_user_program_t user;      /* valid when source is EN_SRC_USER */
 
+    /* Valid when source is EN_SRC_FILE. Borrowed, not owned - see
+       en_engine_play_segs for why, and for what the caller must guarantee. */
+    const en_prog_seg_t *file_segs;
+    int                  file_segs_n;
+
     /* what is playing */
     char        title[48];
     char        detail[96];
@@ -338,6 +343,10 @@ static void job_step(void)
    engine has to evaluate both through one path or they drift apart. */
 static const en_prog_seg_t *program_segs(int *n_out)
 {
+    if (E.source == EN_SRC_FILE) {
+        *n_out = E.file_segs_n;
+        return E.file_segs;
+    }
     if (E.source == EN_SRC_USER) {
         *n_out = E.user.n_segs;
         return E.user.segs;
@@ -635,6 +644,38 @@ bool en_engine_play_program(int index)
     if (en_audio_can_stream()) return stream_start(true, E.total_s);
 
     en_render_init(&E.rnd, EN_RATES[0], ps[index].segs[0].noise, 1);
+    return start_next_chunk(true);
+}
+
+/*
+ * Play a segment table the caller owns.
+ *
+ * The measured programs are parsed out of a file into a buffer the UI holds,
+ * and the largest is thirty-odd kilobytes; copying it in here would mean two
+ * copies of the biggest thing in the app for no gain. The pointer is borrowed,
+ * so the caller has to keep it alive until something else plays - which the UI
+ * does by parsing into a single static.
+ */
+bool en_engine_play_segs(const en_prog_seg_t *segs, int n_segs,
+                         en_mode_t mode, const char *name, const char *detail)
+{
+    if (!segs || n_segs <= 0) return false;
+
+    E.file_segs = segs;
+    E.file_segs_n = n_segs;
+    E.source = EN_SRC_FILE;
+    E.index = -1;
+    copy_str(E.title, name ? name : "", (int)sizeof E.title);
+    copy_str(E.detail, detail ? detail : "", (int)sizeof E.detail);
+    E.mode = mode;
+    E.total_s = 0.0;
+    for (int i = 0; i < n_segs; i++)
+        E.total_s += (double)segs[i].seconds;
+    E.render_pos_s = 0.0;
+
+    if (en_audio_can_stream()) return stream_start(true, E.total_s);
+
+    en_render_init(&E.rnd, EN_RATES[0], segs[0].noise, 1);
     return start_next_chunk(true);
 }
 
