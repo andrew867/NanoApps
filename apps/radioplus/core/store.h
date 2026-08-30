@@ -29,6 +29,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "timer.h"
+
 #include "rds.h"
 
 /* ---- a very small JSON writer -------------------------------------------- */
@@ -165,6 +167,10 @@ typedef struct {
        upgraded. */
     bool     simple_screen;
     bool     wide_screen;
+
+    /* Stop a recording after so long, and start one at a time of day. See
+       timer.h for why those are two fields and not one feature. */
+    en_rectimer_t rectimer;
 
     en_overrides_t overrides;
 } en_settings_t;

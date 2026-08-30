@@ -241,6 +241,38 @@ it says which channel it wants to be on and is told what is there. That is
 what lets it run identically on the device and in the host preview, and be
 tested with neither.
 
+## The recording timer
+
+Two things that share a struct rather than one feature, and the interface
+keeps them apart because their reliability is not the same.
+
+A **length** — 5 minutes to 3 hours, or no limit — is dependable. Press
+record, say "an hour", walk away. Nothing can go wrong with it that would not
+also go wrong with a recording you stopped by hand, because the app is running
+the whole time by definition: it is recording.
+
+A **start time** is not dependable and the screen says so. This device has no
+real-time wake. Something has to be running to notice the moment arrived, and
+that something is Radio+ — on screen or blanked, but never closed. The clock
+it reads is the one broadcast in RDS group 4A, so it is only as good as the
+station's, it arrives a minute or so after tuning, and a station that does not
+send group 4A has no clock at all. With no clock the start never fires and the
+note says `Waiting for the station clock` rather than firing at some arbitrary
+later moment — a scheduled recording that begins whenever the time eventually
+turns up is worse than one that does not begin, because you could not tell
+which you got.
+
+Fifteen-minute steps, forward on the button and back on the narrow one beside
+it. Arbitrary minutes would need a keyboard this device does not have, and a
+quarter of an hour is the granularity broadcast schedules actually use.
+
+When both are set the length wins: a schedule cannot extend a recording past
+where it should have stopped.
+
+`core/timer.c` is the whole of it, and it is a pure function of the clock and
+the recording state — which is what lets the awkward cases (no clock, the same
+minute twice, midnight, tomorrow) be tested without a tuner or a calendar.
+
 ## Known limitations
 
 - **The RDS FIFO framing is not confirmed.** How the BCM part frames its FIFO is
@@ -249,7 +281,6 @@ tested with neither.
   `core/rds.c` and named so nobody mistakes it for established fact. Group
   decoding above it is verifiable against the standard and tested with no
   hardware. This is also why the sidecar stores raw groups.
-- **No scheduled or timed recording.** You start it and you stop it.
 - **Presets cannot be renamed or reordered** from the list. Renaming would
   need an on-screen keyboard, and RDS fills the name in by itself on any
   station that broadcasts one, which is most of them.

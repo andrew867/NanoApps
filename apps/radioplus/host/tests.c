@@ -21,6 +21,7 @@
 #include "../core/wav.h"
 #include "../core/store.h"
 #include "../core/scan.h"
+#include "../core/timer.h"
 
 static int checks, failures;
 
@@ -1213,6 +1214,109 @@ static void test_scan(void)
           "an empty band should refuse to scan");
 }
 
+/* ---- the recording timer --------------------------------------------------
+ *
+ * The two halves are tested apart, because they are two features that share a
+ * struct rather than one feature: a length always works, and a start time
+ * works only when there is a clock.
+ */
+
+static void test_rectimer(void)
+{
+    en_rectimer_t t;
+    en_rectimer_init(&t);
+    CHECK(t.limit_min == 0 && t.at_min == EN_REC_AT_NONE,
+          "a fresh timer should do nothing");
+
+    /* Nothing set: a recording runs forever. */
+    CHECK(en_rectimer_tick(&t, true, 600, true, 9999999u) == EN_REC_NOTHING,
+          "an unset timer stopped a recording");
+
+    /* A length. Stops at it, not before, and does nothing when not recording
+       - a limit is not a reason to start. */
+    t.limit_min = 30;
+    CHECK(en_rectimer_tick(&t, true, 600, true, 29u * 60000u)
+              == EN_REC_NOTHING, "stopped a minute early");
+    CHECK(en_rectimer_tick(&t, true, 600, true, 30u * 60000u) == EN_REC_STOP,
+          "did not stop at the length");
+    CHECK(en_rectimer_tick(&t, true, 600, false, 0) == EN_REC_NOTHING,
+          "a length should not start anything");
+
+    /* A start time, with no clock. Never fires: a scheduled recording that
+       begins whenever the time eventually turns up is worse than one that
+       does not begin, because you cannot tell which you got. */
+    en_rectimer_init(&t);
+    t.at_min = 7 * 60 + 45;
+    for (int m = 0; m < 24 * 60; m++)
+        CHECK(en_rectimer_tick(&t, false, m, false, 0) == EN_REC_NOTHING,
+              "fired at minute %d with no clock", m);
+
+    /* With a clock: once, at the right minute, and not again during it. */
+    en_rectimer_init(&t);
+    t.at_min = 7 * 60 + 45;
+    CHECK(en_rectimer_tick(&t, true, 7 * 60 + 44, false, 0) == EN_REC_NOTHING,
+          "fired a minute early");
+    CHECK(en_rectimer_tick(&t, true, 7 * 60 + 45, false, 0) == EN_REC_START,
+          "did not fire at the time");
+    CHECK(en_rectimer_tick(&t, true, 7 * 60 + 45, true, 1000) == EN_REC_NOTHING,
+          "fired again while already recording");
+    CHECK(en_rectimer_tick(&t, true, 7 * 60 + 45, false, 0) == EN_REC_NOTHING,
+          "fired twice in the same minute");
+
+    /* Tomorrow. Passing the minute rearms it, which is what makes a daily
+       recording a daily recording rather than a single one. */
+    CHECK(en_rectimer_tick(&t, true, 7 * 60 + 46, false, 0) == EN_REC_NOTHING,
+          "fired after the minute passed");
+    CHECK(en_rectimer_tick(&t, true, 7 * 60 + 45, false, 0) == EN_REC_START,
+          "did not fire again the next day");
+
+    /* Both together: the length wins while a recording is running, so a
+       schedule cannot extend one past where it should have stopped. */
+    en_rectimer_init(&t);
+    t.at_min = 8 * 60;
+    t.limit_min = 5;
+    CHECK(en_rectimer_tick(&t, true, 8 * 60, true, 5u * 60000u) == EN_REC_STOP,
+          "the schedule overrode the length");
+
+    /* The countdown, including across midnight. */
+    en_rectimer_init(&t);
+    CHECK(en_rectimer_until(&t, true, 600) == -1,
+          "a countdown with nothing scheduled");
+    t.at_min = 10;                       /* 00:10 */
+    CHECK(en_rectimer_until(&t, true, 23 * 60 + 50) == 20,
+          "across midnight read %d, expected 20",
+          en_rectimer_until(&t, true, 23 * 60 + 50));
+    CHECK(en_rectimer_until(&t, false, 0) == -1,
+          "a countdown with no clock");
+
+    /* And that it survives a round trip through the settings file, since a
+       timer that forgets itself on reboot is not a timer. */
+    en_settings_t a, b;
+    en_settings_default(&a);
+    a.rectimer.limit_min = 90;
+    a.rectimer.at_min = 6 * 60 + 30;
+    char buf[2048];
+    uint32_t n = en_settings_save(&a, buf, sizeof buf);
+    CHECK(n > 0, "settings with a timer overflowed");
+    en_settings_default(&b);
+    CHECK(en_settings_load(&b, buf, n), "settings with a timer failed to load");
+    CHECK(b.rectimer.limit_min == 90, "limit came back as %u",
+          b.rectimer.limit_min);
+    CHECK(b.rectimer.at_min == 6 * 60 + 30, "start came back as %d",
+          b.rectimer.at_min);
+
+    /* No start time is the absence of the key, so it has to survive as an
+       absence and come back as none rather than as midnight. */
+    en_settings_default(&a);
+    a.rectimer.at_min = EN_REC_AT_NONE;
+    n = en_settings_save(&a, buf, sizeof buf);
+    en_settings_default(&b);
+    b.rectimer.at_min = 123;
+    CHECK(en_settings_load(&b, buf, n), "load failed");
+    CHECK(b.rectimer.at_min == EN_REC_AT_NONE,
+          "'no start' came back as %d", b.rectimer.at_min);
+}
+
 int main(void)
 {
     printf("Radio+ core tests\n");
@@ -1237,6 +1341,7 @@ int main(void)
     test_wav();
     test_presets();
     test_scan();
+    test_rectimer();
     test_sidecar();
     test_simple_flags();
     test_settings();

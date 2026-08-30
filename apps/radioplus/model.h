@@ -53,6 +53,11 @@ typedef struct {
     bool     play_ok;
 
     bool     ta_record;          /* auto-record traffic announcements */
+
+    /* The recording timer: stop after so long, start at a time of day. Here
+       rather than private to the UI because it persists, and persistence is
+       the platform's job. */
+    en_rectimer_t rectimer;
     bool     ta_recording;       /* one is being recorded right now */
 
     /* Which optional screens are in the swipe order. Here rather than private
@@ -132,6 +137,11 @@ void rp_act_play_live(void);        /* jump to the front of the buffer */
 void rp_act_nudge(int32_t ms);      /* negative goes back */
 void rp_act_pause_toggle(void);
 void rp_act_ta_record(bool on);
+
+/* Length to stop a recording after, in minutes; 0 runs until stopped. */
+void rp_act_set_rec_limit(uint16_t minutes);
+/* Minute of the day to start one at, or EN_REC_AT_NONE. */
+void rp_act_set_rec_at(int16_t minutes);
 
 /* Turn the optional screens on or off, and remember it. */
 void rp_act_show_simple(bool on);

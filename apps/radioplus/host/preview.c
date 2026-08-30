@@ -141,6 +141,12 @@ int main(int argc, char **argv)
                                  rp_model.presets.list[2].khz, true);
     }
 
+    /* A timer set, so the Recordings shot shows the controls doing something
+       rather than three defaults. Set through the actions, which is how the
+       screen would set them. */
+    rp_act_set_rec_limit(60);
+    rp_act_set_rec_at((int16_t)(7 * 60 + 45));
+
     static const struct { rp_screen_t s; const char *name; } shots[] = {
         { RP_SCREEN_SIMPLE,   "0-simple" },
         { RP_SCREEN_NOW,      "1-now" },

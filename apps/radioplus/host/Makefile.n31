@@ -74,7 +74,7 @@ LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_n31.h\"
              -I$(LVGL_SRC) -I$(LVGL_SRC)/src -I$(LVGL_SRC)/include -I$(LVGL_SRC)/.. -I..
 
 CORE_SRCS := $(CORE)/fmcmd.c $(CORE)/fmreg.c $(CORE)/rds.c $(CORE)/region.c \
-             $(CORE)/wav.c $(CORE)/store.c $(CORE)/scan.c
+             $(CORE)/wav.c $(CORE)/store.c $(CORE)/scan.c $(CORE)/timer.c
 
 PLAT_SRCS := $(PLAT)/tuner_linux.c $(PLAT)/capture_linux.c \
              $(PLAT)/player_linux.c $(PLAT)/model_linux.c

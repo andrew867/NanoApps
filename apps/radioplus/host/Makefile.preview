@@ -59,7 +59,7 @@ LVLIB   := $(LV_CACHE)/liblvgl_preview.a
 
 SRCS := preview.c ../ui.c $(PLAT)/model_host.c \
         $(CORE)/fmcmd.c $(CORE)/fmreg.c $(CORE)/rds.c $(CORE)/region.c \
-        $(CORE)/wav.c $(CORE)/store.c $(CORE)/scan.c
+        $(CORE)/wav.c $(CORE)/store.c $(CORE)/scan.c $(CORE)/timer.c
 
 .PHONY: shots clean clean-lvgl
 

@@ -34,6 +34,7 @@
 
 #include "core/fmreg.h"
 #include "core/scan.h"
+#include "core/timer.h"
 
 /* ---- palette -------------------------------------------------------------- */
 
@@ -1387,6 +1388,87 @@ static void refresh_presets(void)
     }
 }
 
+/* ---- the recording timer --------------------------------------------------
+ *
+ * The clock comes from RDS group 4A, which is the only one this device has:
+ * there is no RTC. That is why a start time is offered with a caveat printed
+ * next to it and a length is not - see core/timer.h.
+ */
+
+static lv_obj_t *s_rec_limit_btn, *s_rec_limit_lbl;
+static lv_obj_t *s_rec_at_btn, *s_rec_at_lbl;
+static lv_obj_t *s_rec_timer_note;
+
+/* Minutes since local midnight, from the broadcast clock. The transmitted
+   time is UTC with a local offset in half hours beside it, and the offset is
+   signed - a station in Newfoundland sends -5 for a half-hour zone. */
+static bool clock_minutes(int *out)
+{
+    if (!rp_model.rds.ct_valid) return false;
+    int m = rp_model.rds.ct_hour * 60 + rp_model.rds.ct_minute;
+    m += rp_model.rds.ct_offset * 30;
+    while (m < 0) m += 24 * 60;
+    m %= 24 * 60;
+    *out = m;
+    return true;
+}
+
+static void rectimer_pump(void)
+{
+    int now = 0;
+    bool have = clock_minutes(&now);
+
+    switch (en_rectimer_tick(&rp_model.rectimer, have, now,
+                             rp_model.recording, rp_model.rec_ms)) {
+    case EN_REC_START:
+        if (!rp_model.recording) rp_act_record_toggle();
+        break;
+    case EN_REC_STOP:
+        if (rp_model.recording) rp_act_record_toggle();
+        break;
+    default:
+        break;
+    }
+}
+
+static void on_rec_limit(lv_event_t *e)
+{
+    (void)e;
+    uint8_t at = 0;
+    for (uint8_t i = 0; i < EN_REC_LIMITS_COUNT; i++)
+        if (EN_REC_LIMITS[i] == rp_model.rectimer.limit_min) { at = i; break; }
+    at = (uint8_t)((at + 1) % EN_REC_LIMITS_COUNT);
+    rp_act_set_rec_limit(EN_REC_LIMITS[at]);
+}
+
+/* Fifteen-minute steps, wrapping through the day and off the end back to
+   "none". Arbitrary minutes would need a second control and this device has
+   no keyboard; a quarter of an hour is the granularity broadcast schedules
+   actually use. */
+static void on_rec_at(lv_event_t *e)
+{
+    (void)e;
+    int at = rp_model.rectimer.at_min;
+    if (at == EN_REC_AT_NONE) at = 0;
+    else {
+        at += 15;
+        if (at >= 24 * 60) at = EN_REC_AT_NONE;
+    }
+    rp_act_set_rec_at((int16_t)at);
+}
+
+static void on_rec_at_back(lv_event_t *e)
+{
+    (void)e;
+    int at = rp_model.rectimer.at_min;
+    if (at == EN_REC_AT_NONE) at = 24 * 60 - 15;
+    else {
+        at -= 15;
+        if (at < 0) at = EN_REC_AT_NONE;
+    }
+    rp_act_set_rec_at((int16_t)at);
+}
+
 /* ---- Recordings ------------------------------------------------------------ */
 
 static void on_library_pick(lv_event_t *e)
@@ -1402,14 +1484,109 @@ static void build_library(void)
     lv_obj_set_pos(cap, MARGIN, 10);
     hairline(s, 32);
 
-    s_library_list = panel(s, 0, 40, RP_SCREEN_W, RP_SCREEN_H - 66, C_BG);
+    s_library_list = panel(s, 0, 40, RP_SCREEN_W, RP_SCREEN_H - 176, C_BG);
     lv_obj_add_flag(s_library_list, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scroll_dir(s_library_list, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(s_library_list, LV_SCROLLBAR_MODE_OFF);
+
+    hairline(s, RP_SCREEN_H - 132);
+
+    lv_obj_t *tcap = label(s, "TIMER", F_CAPTION, C_TEXT_MUTE);
+    lv_obj_set_pos(tcap, MARGIN, RP_SCREEN_H - 126);
+
+    /* Length on the left, start time on the right, both cycling on tap. The
+       start time also steps backwards on its own narrow target, because
+       reaching 07:45 by tapping forward ninety-six times is not a control. */
+    s_rec_limit_btn = panel(s, MARGIN, RP_SCREEN_H - 104, CONTENT_W / 2 - 4,
+                            TAP_MIN, C_SURFACE);
+    lv_obj_add_flag(s_rec_limit_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_rec_limit_btn, on_rec_limit, LV_EVENT_CLICKED, 0);
+    lv_obj_set_style_bg_color(s_rec_limit_btn, lv_color_hex(C_SURFACE_2),
+                              LV_STATE_PRESSED);
+    s_rec_limit_lbl = label(s_rec_limit_btn, "", F_BODY, C_TEXT);
+    lv_obj_center(s_rec_limit_lbl);
+
+    s_rec_at_btn = panel(s, MARGIN + CONTENT_W / 2 + 4, RP_SCREEN_H - 104,
+                         CONTENT_W / 2 - 4 - 30, TAP_MIN, C_SURFACE);
+    lv_obj_add_flag(s_rec_at_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_rec_at_btn, on_rec_at, LV_EVENT_CLICKED, 0);
+    lv_obj_set_style_bg_color(s_rec_at_btn, lv_color_hex(C_SURFACE_2),
+                              LV_STATE_PRESSED);
+    s_rec_at_lbl = label(s_rec_at_btn, "", F_BODY, C_TEXT);
+    lv_obj_center(s_rec_at_lbl);
+
+    lv_obj_t *back = panel(s, MARGIN + CONTENT_W - 26, RP_SCREEN_H - 104, 26,
+                           TAP_MIN, C_SURFACE);
+    lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(back, on_rec_at_back, LV_EVENT_CLICKED, 0);
+    lv_obj_set_style_bg_color(back, lv_color_hex(C_SURFACE_2),
+                              LV_STATE_PRESSED);
+    lv_obj_center(label(back, "-", F_BODY, C_TEXT_DIM));
+
+    /* Two lines: what will happen, and - when a start time is set - the
+       caveat, because a scheduled recording on a device with no real-time
+       wake is a promise this app cannot keep on its own. */
+    s_rec_timer_note = label(s, "", F_CAPTION, C_TEXT_MUTE);
+    lv_obj_set_size(s_rec_timer_note, CONTENT_W, 36);
+    lv_obj_set_pos(s_rec_timer_note, MARGIN, RP_SCREEN_H - 54);
+}
+
+static void refresh_timer_controls(void)
+{
+    if (!s_rec_limit_btn) return;
+
+    char buf[96], n[16];
+
+    if (rp_model.rectimer.limit_min) {
+        buf[0] = 0;
+        put_uint(n, rp_model.rectimer.limit_min, 0);
+        cat(buf, n, sizeof buf);
+        cat(buf, " min", sizeof buf);
+        lv_label_set_text(s_rec_limit_lbl, buf);
+    } else {
+        lv_label_set_text(s_rec_limit_lbl, "No limit");
+    }
+
+    int at = rp_model.rectimer.at_min;
+    if (at == EN_REC_AT_NONE) {
+        lv_label_set_text(s_rec_at_lbl, "No start");
+    } else {
+        buf[0] = 0;
+        put_uint(n, (uint32_t)(at / 60), 0);
+        if (at / 60 < 10) cat(buf, "0", sizeof buf);
+        cat(buf, n, sizeof buf);
+        cat(buf, ":", sizeof buf);
+        put_uint(n, (uint32_t)(at % 60), 0);
+        if (at % 60 < 10) cat(buf, "0", sizeof buf);
+        cat(buf, n, sizeof buf);
+        lv_label_set_text(s_rec_at_lbl, buf);
+    }
+
+    int now = 0;
+    bool have = clock_minutes(&now);
+    buf[0] = 0;
+    if (at == EN_REC_AT_NONE) {
+        cat(buf, rp_model.rectimer.limit_min
+                     ? "Recordings stop at the length above."
+                     : "Recordings run until you stop them.",
+            sizeof buf);
+    } else if (!have) {
+        /* The honest version. The clock is the station's, not the device's. */
+        cat(buf, "Waiting for the station clock. No RDS time, no start.",
+            sizeof buf);
+    } else {
+        int until = en_rectimer_until(&rp_model.rectimer, have, now);
+        put_uint(n, (uint32_t)(until < 0 ? 0 : until), 0);
+        cat(buf, "Starts in ", sizeof buf);
+        cat(buf, n, sizeof buf);
+        cat(buf, " min. Radio+ must stay open.", sizeof buf);
+    }
+    lv_label_set_text(s_rec_timer_note, buf);
 }
 
 static void refresh_library(void)
 {
+    refresh_timer_controls();
     lv_obj_clean(s_library_list);
 
     if (!rp_model.library_count) {
@@ -2148,9 +2325,11 @@ void rp_ui_scan_start_for_preview(void) { on_scan(NULL); }
 
 void rp_ui_tick(void)
 {
-    /* Before the screens, and not inside the Presets case: a scan has to keep
-       running when the user swipes away from the screen that started it. */
+    /* Before the screens, and not inside their cases: a scan and a timed
+       recording both have to keep running when the user swipes away from the
+       screen that set them going. */
     scan_pump();
+    rectimer_pump();
 
     switch (s_current) {
     case RP_SCREEN_SIMPLE:   refresh_simple();   break;

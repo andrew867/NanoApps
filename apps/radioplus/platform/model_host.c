@@ -155,6 +155,21 @@ void rp_act_tune_quiet(uint32_t khz) { rp_act_tune(khz); }
    memory and is thrown away with the process. */
 void rp_act_presets_save(void) { }
 
+void rp_act_set_rec_limit(uint16_t minutes)
+{
+    rp_model.rectimer.limit_min = minutes;
+    
+}
+
+void rp_act_set_rec_at(int16_t minutes)
+{
+    rp_model.rectimer.at_min = minutes;
+    /* Clear the fired flag with the time itself, or setting a new one inside
+       the same minute the last fired in would do nothing. */
+    rp_model.rectimer.fired = false;
+    
+}
+
 void rp_act_step(bool up)
 {
     rp_model.khz = en_region_step(rp_model.region, rp_model.khz, up);

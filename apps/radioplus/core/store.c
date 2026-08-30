@@ -432,6 +432,7 @@ void en_settings_default(en_settings_t *s)
     s->khz = 0;                 /* 0 means "the bottom of whatever band" */
     s->rds_on = true;
     s->live_seconds = 30;
+    en_rectimer_init(&s->rectimer);
     s->ta_record = false;
 }
 
@@ -450,6 +451,13 @@ uint32_t en_settings_save(const en_settings_t *s, char *buf, uint32_t cap)
     en_json_bool(&j, "ta_record", s->ta_record);
     en_json_bool(&j, "simple_screen", s->simple_screen);
     en_json_bool(&j, "wide_screen", s->wide_screen);
+    en_json_uint(&j, "rec_limit_min", s->rectimer.limit_min);
+    /* Written only when there is one. A start time of "none" is the absence
+       of the key rather than a sentinel, so nothing has to agree on what the
+       sentinel is between the writer, the reader and whoever reads the file
+       with their eyes. */
+    if (s->rectimer.at_min >= 0)
+        en_json_uint(&j, "rec_at_min", (uint32_t)s->rectimer.at_min);
 
     /* Written as hex bytes rather than a number, because a register payload is
        a byte string of its own length and turning it into an integer would
@@ -509,6 +517,14 @@ bool en_settings_load(en_settings_t *s, const char *json, uint32_t len)
 
     v = find_key(json, end, "wide_screen");
     if (v) s->wide_screen = (*v == 't');
+
+    v = find_key(json, end, "rec_limit_min");
+    if (v && read_uint(v, end, &n) && n <= 24u * 60u)
+        s->rectimer.limit_min = (uint16_t)n;
+
+    v = find_key(json, end, "rec_at_min");
+    if (v && read_uint(v, end, &n) && n < 24u * 60u)
+        s->rectimer.at_min = (int16_t)n;
 
     const char *arr = find_key(json, end, "registers");
     if (arr && *arr == '[') {
