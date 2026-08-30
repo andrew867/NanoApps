@@ -864,7 +864,7 @@ static void test_programs(void)
 
     int n;
     const en_program_t *ps = en_programs(&n);
-    CHECK(n == 10, "expected 10 built-in programs, got %d", n);
+    CHECK(n == 16, "expected 16 built-in programs, got %d", n);
 
     for (int i = 0; i < n; i++) {
         uint32_t secs = en_program_seconds(&ps[i]);

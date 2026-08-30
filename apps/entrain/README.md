@@ -32,8 +32,9 @@ These are rendered from the host build at the device's exact 240x432, with
   a 7.83 Hz Schumann preset. Every one realises its requested beat exactly —
   see the table below.
 - **Six programs**: timelines that ramp the beat over 15 to 60 minutes.
-- **Four suites**: longer sessions that sound two or three carriers at once,
-  each layer with its own beat and gain envelope.
+- **Ten suites**: longer sessions that sound up to five carriers at once, each
+  layer with its own beat and gain envelope. Four are ported from a generator's
+  own metadata; six are measured from recordings.
 - **A library you can browse.** Four shelves — Presets, Programs, Suites,
   Custom — rather than three tabs across the top, which had run out of room.
 - **Noise beds**: white, pink (Kellett 3-pole) or brown, mixable under the
@@ -129,7 +130,40 @@ Listed in the app as **Extended Practice**, **Stage 1**, **Stage 2** and
 | Stage 2 (Body Still) | 38 min | 300 / 104 / 496 Hz | 10 Hz down to a sustained 4 Hz, then out |
 | Stage 3 (Field Practice) | 38 min | 300 / 104 / 496 Hz | As stage 2, then rise and settle three times |
 
-### Where they come from
+### Six more, measured rather than read
+
+The first four above come from a generator's own metadata. Six others —
+**Practice 1** through **Practice 6** — were measured from recordings, because
+no schedule for them existed in any form.
+
+`tools/analyse-layers.py` decodes through ffmpeg at 4 kHz, then per eight-second
+window and per carrier band takes the strongest peak in each channel, pairs
+them, and reports the carrier, the beat between the ears and how present that
+band is. `tools/port-measured.py` bins that into segments and emits the C table
+in `core/measured.c`.
+
+What crosses over is a measurement: frequencies, differences and timings, four
+seconds apart. Nothing of the recordings is retained and Entrain synthesises
+its own tones. The names are deliberately not the originals — see
+[Trademark](#trademark).
+
+Two things the measurement had to get right, both of which were wrong first:
+
+- **Pairing.** Searching each channel independently across the whole band had
+  the left ear lock to the 300 Hz family and the right to the 102 Hz one, and
+  reported a 190 Hz "beat". A beat is the difference between two tones that are
+  nearly the same, so the partner is searched for within 25 Hz of the first.
+- **Bands.** 96–126 Hz was one band to begin with, which straddles two
+  different tones — the ~102 Hz signal and the ~114/119 Hz reference — so it
+  reported a carrier jumping between them. Each band has to hold one stable
+  carrier to mean anything.
+
+Every band that actually sounds becomes a layer, including through the
+stretches where its gain is zero. A layer that goes quiet for ten minutes and
+comes back is what the recording does. Nothing is dropped to fit a layer count:
+`EN_MAX_LAYERS` is sized to the material, not the other way round.
+
+### Where the first four come from
 
 The **schedule** is ported — beat breakpoints, layer carriers, per-phase gains
 — read out of the generators' own metadata in a research archive of original

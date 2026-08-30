@@ -71,7 +71,22 @@ typedef struct {
  * and a multi-layer one is still subject to the same headroom discipline.
  */
 
-#define EN_MAX_LAYERS 4
+/*
+ * The ceiling, not a budget. It exists only so the arrays can be fixed-size in
+ * a core that does not allocate; it is not a claim about how many layers are
+ * worth having, and nothing may be discarded to fit under it.
+ *
+ * Measured material decides the number. The imported practice recordings carry
+ * five concurrent carrier families, and a measurement that found six would
+ * mean six. Sixteen is chosen to be past anything the analysis has turned up
+ * rather than at it.
+ *
+ * The cost is bounded and per-segment, not per-ceiling: render_inner loops over
+ * seg->layers, so a two-layer program does two layers' work whatever this says.
+ * What this does set is the size of en_segment_t, which job_step copies - see
+ * the note there.
+ */
+#define EN_MAX_LAYERS 16
 
 typedef struct {
     en_mode_t mode;

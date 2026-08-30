@@ -716,7 +716,7 @@ static void fill_library(void)
            suite's detail line where it would crowd out the frequencies. */
         lv_label_set_text(s_lib_hint,
                           s_shelf == LIB_SUITES
-                              ? "Ported schedules. No effect is claimed."
+                              ? "Ported and measured. No claims made."
                               : "");
         return;
     }
@@ -801,7 +801,9 @@ static void build_library(void)
 
     s_list = lv_obj_create(s);
     flat(s_list, C_BG);
-    lv_obj_set_size(s_list, CONTENT_W, EN_SCREEN_H - 118);
+    /* Stops short of the hint line rather than running under it. At the old
+       height the last row and the shelf note drew on top of each other. */
+    lv_obj_set_size(s_list, CONTENT_W, EN_SCREEN_H - 106 - 26);
     lv_obj_set_pos(s_list, MARGIN, 106);
     lv_obj_set_flex_flow(s_list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(s_list, 0, 0);

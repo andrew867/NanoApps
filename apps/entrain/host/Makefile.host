@@ -27,7 +27,7 @@ include ../../lvgl-mirror.mk
 BUILD   := build
 
 CORE_SRCS := $(CORE)/osc.c $(CORE)/noise.c $(CORE)/render.c \
-             $(CORE)/program.c $(CORE)/wavout.c
+             $(CORE)/program.c $(CORE)/measured.c $(CORE)/wavout.c
 
 WARN    := -Wall -Wextra -Wshadow -Wpointer-arith
 CFLAGS  ?= -O2 -g -std=c99 $(WARN)

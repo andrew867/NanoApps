@@ -1,0 +1,7 @@
+# Raw measurements from analyse-layers.py, kept so the tables in
+# core/measured.c can be re-derived without the source audio.
+#
+# The exploratory single-pair output from analyse-binaural.py is not kept:
+# it is superseded by the layered measurement, and its filenames carried the
+# original exercise names.
+cd*.json
