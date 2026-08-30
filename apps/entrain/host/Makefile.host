@@ -19,6 +19,11 @@ CC      ?= cc
 AR      ?= ar
 CORE    := ../core
 LVGL    ?= ../../../lvgl
+
+# Compile LVGL from a native mirror rather than across the Windows mount,
+# which is nineteen times faster - see apps/lvgl-mirror.mk.
+include ../../lvgl-mirror.mk
+
 BUILD   := build
 
 CORE_SRCS := $(CORE)/osc.c $(CORE)/noise.c $(CORE)/render.c \
@@ -28,7 +33,9 @@ WARN    := -Wall -Wextra -Wshadow -Wpointer-arith
 CFLAGS  ?= -O2 -g -std=c99 $(WARN)
 LDLIBS  := -lm
 
-.PHONY: all test glyphs wav host run shots clean
+.PHONY: all test glyphs wav host run shots clean clean-lvgl
+
+.DEFAULT_GOAL := test
 
 all: test
 
@@ -67,7 +74,7 @@ HAVE_ALSA := $(shell pkg-config --exists alsa && echo 1)
 HAVE_DRM  := $(shell pkg-config --exists libdrm gbm && echo 1)
 
 LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_host.h\" \
-             -I$(LVGL) -I$(LVGL)/src -I$(LVGL)/include -I$(LVGL)/..
+             -I$(LVGL_SRC) -I$(LVGL_SRC)/src -I$(LVGL_SRC)/include -I$(LVGL_SRC)/..
 
 # POSIX bits (usleep, gettimeofday) that -std=c99 alone hides. core/ still
 # compiles as strict C99 in the test and wav targets.
@@ -95,7 +102,7 @@ endif
 
 # LVGL's own sources. The drivers are included — that is where SDL, fbdev, DRM
 # and evdev live — minus the platforms this build will never target.
-LV_SRCS := $(shell find $(LVGL)/src -name '*.c' \
+LV_SRCS := $(shell find $(LVGL_SRC)/src -name '*.c' \
              -not -name 'lv_freertos.c' -not -name 'lv_cmsis_rtos2.c' \
              -not -name 'lv_mqx.c'      -not -name 'lv_rtthread.c' \
              -not -name 'lv_windows.c'  -not -name 'lv_sdl2.c' \
@@ -106,18 +113,36 @@ LV_SRCS := $(shell find $(LVGL)/src -name '*.c' \
              $(LV_DRM_EXCLUDE) \
              2>/dev/null)
 
-LV_OBJS := $(patsubst $(LVGL)/%.c,$(BUILD)/lvgl/%.o,$(LV_SRCS))
+# Objects live on the native filesystem, not the Windows drive, under a
+# directory named for what produced them.
+#
+# Two things drive this. The Windows drive costs more in filesystem time than
+# the compiler costs in CPU. And lv_conf is a tracked file, so every branch
+# switch moves its mtime without changing a byte - which used to rebuild all
+# four hundred and sixty-six objects for a file that had not changed.
+#
+# The key is the config AND the host flags, because which backends are enabled
+# changes the objects: it was a real dependency before and it still is, just
+# expressed as a different directory rather than as a timestamp.
+CCACHE  := $(shell command -v ccache 2>/dev/null)
+LV_KEY  := $(shell { md5sum lv_conf_host.h; echo '$(HOST_CFLAGS)'; }                    2>/dev/null | md5sum | cut -c1-12)
+LV_CACHE ?= $(HOME)/.cache/n31-lvgl/entrain-host-$(LV_KEY)
 
-# The config is a real dependency: changing which backends are enabled has to
-# rebuild the driver objects, or they stay compiled-out and the link fails on
-# a symbol the header promised.
-$(BUILD)/lvgl/%.o: $(LVGL)/%.c lv_conf_host.h
+LV_OBJS := $(patsubst $(LVGL_SRC)/%.c,$(LV_CACHE)/%.o,$(LV_SRCS))
+LVLIB   := $(LV_CACHE)/liblvgl_host.a
+
+$(LV_CACHE)/%.o: $(LVGL_SRC)/%.c
 	@mkdir -p $(dir $@)
-	@$(CC) -O2 -std=gnu99 -w $(LV_CFLAGS) $(HOST_CFLAGS) -c -o $@ $<
+	@$(CCACHE) $(CC) -O2 -std=gnu99 -w $(LV_CFLAGS) $(HOST_CFLAGS) -c -o $@ $<
 
-$(BUILD)/liblvgl_host.a: $(LV_OBJS)
+$(LVLIB): $(LV_OBJS)
 	@echo "  AR  $@"
 	@$(AR) crs $@ $^
+
+# Kept where it has always been. Nothing links it from here any more - Radio+
+# builds its own now - but `make clean` should still take the archive with it.
+$(BUILD)/liblvgl_host.a: $(LVLIB) | $(BUILD)
+	@cp -f $< $@
 
 APP_SRCS := main_host.c ../ui.c ../engine.c \
             ../platform/audio_host.c ../platform/sys_host.c $(CORE_SRCS)
@@ -139,5 +164,10 @@ shots: $(BUILD)/entrain-host
 	@python3 tobmp.py ../screenshots
 	@rm -f ../screenshots/*.bmp
 
+# Leaves the LVGL cache alone, which is the point of it: `clean` should cost
+# seconds, not the better part of an hour. Use clean-lvgl to drop that too.
 clean:
 	rm -rf $(BUILD)
+
+clean-lvgl:
+	rm -rf $(LV_CACHE)

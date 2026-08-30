@@ -11,6 +11,11 @@
  * once per 64-sample control block — 5.8 ms at 11025 Hz, far finer than the
  * 50-200 ms glide the UI asks for and far coarser than recomputing a phase step
  * per sample.
+ *
+ * A segment may carry up to EN_MAX_LAYERS carrier pairs sounding together,
+ * each with its own mode, beat and gain, over one shared noise bed. See the
+ * layer block below. Every phase in every layer is held across calls for the
+ * same reason the single-layer phases always were.
  */
 
 #ifndef ENTRAIN_RENDER_H
@@ -46,6 +51,35 @@ typedef struct {
     double noise_level;   /* 0..1 */
 } en_params_t;
 
+/* ---- layers -------------------------------------------------------------
+ *
+ * A layer is one carrier pair with its own mode, beat and gain. Most of what
+ * this app plays is a single layer, but a long practice program is typically
+ * two or three sounding at once: a main training carrier, a quiet warm one
+ * below it, and a quieter support above. They are separate layers rather than
+ * separate segments because they overlap in time and each has its own beat.
+ *
+ * `level` is an ABSOLUTE peak amplitude, not a share of a normalised mix.
+ * Layers sum, and it is the caller's job to keep the sum sane — the source
+ * material this exists to render specifies peak amplitudes directly (0.045,
+ * 0.070, 0.018 and so on, summing well under one). Normalising here would
+ * silently rescale a mix whose balance is the whole point of it. The soft
+ * clipper remains as a backstop and nothing more.
+ *
+ * `start.tone_level` stays the master gain over the summed layers, so a
+ * single-layer segment at unity layer gain is bit-for-bit what it always was,
+ * and a multi-layer one is still subject to the same headroom discipline.
+ */
+
+#define EN_MAX_LAYERS 4
+
+typedef struct {
+    en_mode_t mode;
+    double    carrier_hz;   /* binaural: the left frequency */
+    double    beat_hz;
+    double    level;        /* absolute peak amplitude, 0..1; layers SUM */
+} en_layer_t;
+
 typedef struct {
     uint32_t        sample_rate;
     en_mode_t       mode;
@@ -55,15 +89,36 @@ typedef struct {
     uint32_t        frames;
     double          fade_in_s;   /* raised cosine; 0 for a mid-program segment */
     double          fade_out_s;
+
+    /* Multi-layer form. When `layers` is zero the segment is single-layer and
+       `mode`, `start` and `end` above describe it exactly as they always have,
+       so every existing caller keeps working untouched. When it is non-zero,
+       `lstart`/`lend` describe the layers and `start.carrier_hz`,
+       `start.beat_hz` and `start.tone_level` are ignored — only the noise
+       levels are still read from `start`/`end`, because the bed is one stream
+       shared by the whole mix rather than a property of any one layer. */
+    uint8_t         layers;
+    en_layer_t      lstart[EN_MAX_LAYERS];
+    en_layer_t      lend[EN_MAX_LAYERS];
 } en_segment_t;
 
 typedef struct {
     uint32_t   sample_rate;
-    en_osc_t   osc_l;     /* left / sole carrier */
-    en_osc_t   osc_r;     /* right carrier (binaural, monaural) */
-    en_osc_t   osc_gate;  /* isochronic amplitude gate */
+    /* One oscillator triple per layer: left/sole carrier, right carrier
+       (binaural and monaural), and the isochronic amplitude gate. */
+    struct {
+        en_osc_t l, r, gate;
+    } lay[EN_MAX_LAYERS];
     en_noise_t noise;
 } en_render_t;
+
+/* Expand whatever form the segment is in into the uniform layer arrays, and
+   return the layer count (always at least 1). A single-layer segment maps to
+   one layer at unity gain, its tone_level staying the master. Exposed because
+   the tests assert that the legacy mapping renders identically to the explicit
+   one-layer segment it produces. */
+uint8_t en_segment_layers(const en_segment_t *seg,
+                          en_layer_t *start, en_layer_t *end);
 
 void en_render_init(en_render_t *r, uint32_t sample_rate,
                     en_noise_kind_t noise, uint32_t seed);
@@ -75,7 +130,15 @@ void en_render_segment(en_render_t *r, const en_segment_t *seg, int16_t *out);
 /* Render a seamless loop: no fades, and the phases are seeded from zero and
    land back on zero at the wrap, provided the caller passed cycle-exact
    frequencies (see program.h's loop planner). Leaves the renderer's phases
-   where the loop started, so calling it twice gives identical bytes. */
+   where the loop started, so calling it twice gives identical bytes.
+
+   Multi-layer segments render correctly here, but note what "cycle-exact"
+   costs: EVERY carrier in EVERY layer has to complete a whole number of cycles
+   in the same number of frames, and en_plan_loop solves that for one layer
+   only. A looped multi-layer segment is therefore the caller's problem to make
+   seamless. Nothing in the app asks for one: looping exists for the RetailOS
+   backend, which can only be handed a file, and its presets are single-layer.
+   Multi-layer material is streamed, where the question does not arise. */
 void en_render_loop(en_render_t *r, const en_segment_t *seg, int16_t *out);
 
 const char *en_mode_name(en_mode_t mode);

@@ -9,9 +9,14 @@
 #   cd host && make -f Makefile.n31 push       send it to the device
 #   cd host && make -f Makefile.n31 run        push and run it
 #
-# LVGL and tinyalsa are shared with the Entrain ARM build rather than rebuilt:
-# the two apps use the same lv_conf, and cross-compiling LVGL twice costs
-# several minutes and buys nothing.
+# LVGL used to be shared with the Entrain ARM build, on the grounds that the two
+# apps had the same lv_conf. They no longer do: the landscape readout needs
+# ARGB8888 in the software renderer, which no other app in the repo wants. This
+# builds its own, which also means the app builds from a clone of itself rather
+# than requiring a sibling app to have been built first.
+#
+# tinyalsa is still borrowed. It is eight files with no configuration at all, so
+# there is nothing for the two builds to disagree about.
 
 IPOD_ROOT ?= /mnt/c/src/ipod/artifacts/linux-n31
 TOOLCHAIN ?= $(IPOD_ROOT)/tinyalsa-build/arm-linux-musleabi-cross
@@ -19,14 +24,43 @@ TINYALSA  ?= $(IPOD_ROOT)/tinyalsa-build/tinyalsa-2.0.0
 SSH_KEY   ?= $(IPOD_ROOT)/n31_id
 DEVICE    ?= root@192.168.7.2
 
-CC     := $(TOOLCHAIN)/bin/arm-linux-musleabi-gcc
+CCACHE := $(shell command -v ccache 2>/dev/null)
+CC     := $(CCACHE) $(TOOLCHAIN)/bin/arm-linux-musleabi-gcc
+AR     := $(TOOLCHAIN)/bin/arm-linux-musleabi-ar
 STRIP  := $(TOOLCHAIN)/bin/arm-linux-musleabi-strip
 BUILD  := build-n31
 CORE   := ../core
 PLAT   := ../platform
 LVGL   ?= ../../../lvgl
 
-LVLIB  ?= ../../entrain/host/build-n31/liblvgl_n31.a
+# Compile LVGL from a native mirror rather than across the Windows mount,
+# which is nineteen times faster - see apps/lvgl-mirror.mk.
+include ../../lvgl-mirror.mk
+
+# Objects live on the native filesystem under a directory named for the hash of
+# the config that produced them - the Windows drive costs more in filesystem
+# time than the compiler costs in CPU, and lv_conf is a tracked file whose mtime
+# moves on every branch switch even when not one byte of it changed.
+LV_CONF    := lv_conf_n31.h
+LV_CONF_ID := $(shell md5sum $(LV_CONF) 2>/dev/null | cut -c1-12)
+LV_CACHE   ?= $(HOME)/.cache/n31-lvgl/radioplus-n31-$(LV_CONF_ID)
+
+# LVGL, minus every platform this target will never be.
+LV_SRCS := $(shell find $(LVGL_SRC)/src -name '*.c' \
+             -not -name 'lv_freertos.c' -not -name 'lv_cmsis_rtos2.c' \
+             -not -name 'lv_mqx.c'      -not -name 'lv_rtthread.c' \
+             -not -name 'lv_windows.c'  -not -name 'lv_sdl2.c' \
+             -not -path '*/drivers/nuttx/*'    -not -path '*/drivers/qnx/*' \
+             -not -path '*/drivers/uefi/*'     -not -path '*/drivers/windows/*' \
+             -not -path '*/drivers/wayland/*'  -not -path '*/drivers/x11/*' \
+             -not -path '*/drivers/libinput/*' -not -path '*/drivers/opengles/*' \
+             -not -path '*/drivers/sdl/*'      -not -path '*/drivers/display/drm/*' \
+             2>/dev/null)
+
+LV_OBJS := $(patsubst $(LVGL_SRC)/%.c,$(LV_CACHE)/%.o,$(LV_SRCS))
+LVLIB   := $(LV_CACHE)/liblvgl_n31.a
+
+# Still borrowed: eight files, no configuration, nothing to disagree about.
 TALIB  ?= ../../entrain/host/build-n31/libtinyalsa_n31.a
 
 ARCH_FLAGS := -mcpu=cortex-a8 -mthumb -mfpu=vfpv3-d16 -mfloat-abi=softfp
@@ -37,7 +71,7 @@ CFLAGS := -O2 -g0 -std=gnu99 $(ARCH_FLAGS) \
           -I$(TINYALSA)/include
 
 LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_n31.h\" \
-             -I$(LVGL) -I$(LVGL)/src -I$(LVGL)/include -I$(LVGL)/.. -I..
+             -I$(LVGL_SRC) -I$(LVGL_SRC)/src -I$(LVGL_SRC)/include -I$(LVGL_SRC)/.. -I..
 
 CORE_SRCS := $(CORE)/fmcmd.c $(CORE)/fmreg.c $(CORE)/rds.c $(CORE)/region.c \
              $(CORE)/wav.c $(CORE)/store.c
@@ -51,13 +85,30 @@ APP_SRCS := main_n31.c ../ui.c $(CORE_SRCS) $(PLAT_SRCS)
 OBJS := $(patsubst %.c,$(BUILD)/%.o,$(notdir $(CORE_SRCS) $(PLAT_SRCS)))
 HDRS := $(wildcard $(CORE)/*.h $(PLAT)/*.h ../*.h)
 
-.PHONY: all app objs push run log stop clean toolchain-check
+.PHONY: all app objs push run log stop clean clean-lvgl toolchain-check
+
+# Stated rather than implied: adding a rule above the first target silently
+# makes THAT what a bare `make` builds, and the failure mode is a build that
+# reports success having done nothing.
+.DEFAULT_GOAL := all
+
 all: app
 app: $(APP)
 
+# No lv_conf prerequisite: the cache directory name already carries that file's
+# hash, so a config change selects different objects rather than invalidating
+# these by timestamp.
+$(LV_CACHE)/%.o: $(LVGL_SRC)/%.c
+	@mkdir -p $(dir $@)
+	@$(CC) $(CFLAGS) -w $(LV_CFLAGS) -c -o $@ $<
+
+$(LVLIB): $(LV_OBJS)
+	@echo "  AR  $@"
+	@$(AR) crs $@ $^
+
 # Static, so it needs nothing on the device but a kernel.
-$(APP): $(APP_SRCS) $(HDRS) | $(BUILD)
-	@test -f $(LVLIB) || { echo "no ARM LVGL at $(LVLIB)"; \
+$(APP): $(APP_SRCS) $(HDRS) $(LVLIB) | $(BUILD)
+	@test -f $(TALIB) || { echo "no ARM tinyalsa at $(TALIB)"; \
 	  echo "build it once from the entrain n31 target"; exit 1; }
 	$(CC) $(CFLAGS) $(LV_CFLAGS) -static -Wl,--gc-sections \
 	      -o $@ $(APP_SRCS) $(LVLIB) $(TALIB) -lm -lpthread
@@ -107,3 +158,7 @@ run: stop push
 
 clean:
 	rm -rf $(BUILD)
+
+# Leaves the LVGL cache alone, which is the point of it.
+clean-lvgl:
+	rm -rf $(LV_CACHE)

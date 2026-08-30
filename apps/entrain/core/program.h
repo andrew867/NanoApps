@@ -96,6 +96,35 @@ const en_preset_t *en_presets(int *count);
 
 /* ---- programs (timelines) ----------------------------------------------- */
 
+/*
+ * How a segment glides from its start value to its end value.
+ *
+ * LINEAR is what the hand-written programs have always done and is what a
+ * segment gets when the field is left out, so nothing that existed before this
+ * enum did behaves differently.
+ *
+ * SMOOTH is smoothstep: zero slope at both ends. It matters where a long
+ * timeline is a chain of glides and holds, because a linear glide meeting a
+ * hold has a corner in it — the beat stops moving all at once — and over a
+ * forty-minute descent that corner is the one moment you notice. The imported
+ * suites were authored with it and are ported with it.
+ */
+typedef enum {
+    EN_INTERP_LINEAR = 0,
+    EN_INTERP_SMOOTH
+} en_interp_t;
+
+#define EN_PROG_MAX_LAYERS EN_MAX_LAYERS
+
+/* One layer's contribution across a segment. Carrier is fixed for the segment;
+   beat and level ramp. See render.h for what `level` means — absolute peak
+   amplitude, relative to a primary layer conventionally carried at 1.0. */
+typedef struct {
+    double carrier_hz;
+    double beat_start,  beat_end;
+    double level_start, level_end;
+} en_prog_layer_t;
+
 typedef struct {
     double          beat_start;
     double          beat_end;
@@ -103,7 +132,31 @@ typedef struct {
     uint32_t        seconds;
     en_noise_kind_t noise;
     double          noise_level;
+
+    /* Zero layers means the four fields above describe a single layer, which
+       is how every hand-written program and every user program is expressed.
+       Non-zero means `layer` describes the mix and those fields are ignored
+       except that beat_start/beat_end stay the segment's PRIMARY beat — the
+       one the Now Playing readout shows and en_program_band colours by. Keep
+       them in step with layer[0] when writing a multi-layer table. */
+    en_interp_t     interp;
+    uint8_t         layers;
+    en_prog_layer_t layer[EN_PROG_MAX_LAYERS];
 } en_prog_seg_t;
+
+/*
+ * Which shelf a program sits on in the library.
+ *
+ * Not a cosmetic split. The hand-written timelines are a handful of numbers
+ * each and are meant to be read, changed and argued with; the imported suites
+ * are ported schedules that should stay exactly as their source authored them.
+ * Mixing them in one list would invite editing the second kind as casually as
+ * the first.
+ */
+typedef enum {
+    EN_GROUP_PROGRAM = 0,   /* the hand-written timelines */
+    EN_GROUP_SUITE          /* imported multi-layer suites */
+} en_group_t;
 
 typedef struct {
     const char          *name;
@@ -111,7 +164,12 @@ typedef struct {
     en_mode_t            mode;
     const en_prog_seg_t *segs;
     int                  n_segs;
+    en_group_t           group;
 } en_program_t;
+
+/* Programs in `group`, in table order. Pass a null `out` to count only.
+   Returns how many there are; fills at most `cap` indices. */
+int en_programs_in_group(en_group_t group, int *out, int cap);
 
 const en_program_t *en_programs(int *count);
 
@@ -122,6 +180,23 @@ en_band_t en_program_band(const en_program_t *p);
 double    en_program_beat_at(const en_program_t *p, double t_seconds);
 /* Index of the segment covering `t`, or -1 past the end. */
 int       en_program_seg_at(const en_program_t *p, double t_seconds);
+
+/*
+ * Evaluate a timeline at `t` seconds into renderer layer form, and report the
+ * noise bed in force there. Returns the layer count, always at least one.
+ *
+ * Takes the segment array rather than an en_program_t because a user program
+ * holds the same segments in a different wrapper, and the engine has to
+ * evaluate both through one path or the two would drift apart.
+ *
+ * `mode` is the program's mode and is stamped onto every layer: a program is
+ * binaural or isochronic as a whole, never half of each — mixing them would
+ * put a beat in the signal and a beat in the listener at once, which is two
+ * different beats claiming to be the same one.
+ */
+uint8_t en_segs_layers_at(const en_prog_seg_t *segs, int n_segs, double t,
+                          en_mode_t mode, en_layer_t *out,
+                          en_noise_kind_t *noise, double *noise_level);
 
 /* ---- user programs loaded from disk ------------------------------------- */
 

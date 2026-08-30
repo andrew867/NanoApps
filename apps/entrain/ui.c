@@ -102,11 +102,48 @@ static en_prefs_t P = {
 static lv_obj_t *s_screen[EN_SCREEN_COUNT];
 static en_screen_t s_current = EN_SCREEN_LIBRARY;
 
-/* library */
-static lv_obj_t *s_tab_btn[3];
+/* ---- library ------------------------------------------------------------
+ *
+ * Two levels. The first is a short list of shelves; the second is what is on
+ * one shelf. It replaced three tabs across the top, which had run out of room
+ * at three and could not have held a fourth without shrinking the targets
+ * below what a finger can hit.
+ *
+ * Rows are two lines and a right-hand value, which is the shape the rest of
+ * the N31 apps use: what it is called, what it technically is, and the one
+ * number worth comparing rows by.
+ *
+ * The list scrolls natively rather than recycling a fixed set of row widgets.
+ * With nine presets and ten programs, building every row costs nothing and
+ * native scrolling is what gives a flick its momentum. A shelf that grows to
+ * hundreds of entries is the point at which that stops being true, and the
+ * fill-visible-rows-only approach earns its complexity.
+ */
+
+/* How deep the Custom shelf will look. A directory listing is a syscall per
+   entry on this device, and a person hand-writing program files will not have
+   written more than this many. */
+#define EN_LIB_MAX_CUSTOM 64
+
+typedef enum {
+    LIB_ROOT = -1,
+    LIB_PRESETS = 0,
+    LIB_PROGRAMS,
+    LIB_SUITES,
+    LIB_CUSTOM,
+    LIB_SHELF_COUNT
+} lib_shelf_t;
+
 static lv_obj_t *s_list;
 static lv_obj_t *s_battery_lbl;
-static int       s_tab;          /* 0 presets, 1 programs, 2 custom */
+static lv_obj_t *s_lib_title;
+static lv_obj_t *s_lib_back;      /* the back row, hidden at the root */
+static lv_obj_t *s_lib_hint;
+static lv_obj_t *s_sel_row;       /* the highlighted row, for scroll-into-view */
+static int       s_shelf = LIB_ROOT;
+static int       s_sel;           /* highlighted row, for key navigation */
+static int       s_sel_of[LIB_SHELF_COUNT];   /* remembered per shelf */
+
 
 /* now playing */
 static lv_obj_t *s_ring;         /* progress arc */
@@ -374,11 +411,69 @@ static void on_gesture(lv_event_t *e)
 
 /* ---- library ------------------------------------------------------------- */
 
-static void on_tab(lv_event_t *e)
+/* How many entries a shelf holds. Custom is counted by walking the directory,
+   which is also the only way to know whether it is empty. */
+static int shelf_count(int shelf)
 {
-    wake_screen();
-    s_tab = (int)(lv_uintptr_t)lv_event_get_user_data(e);
+    int n = 0;
+    switch (shelf) {
+    case LIB_PRESETS:  en_presets(&n); return n;
+    case LIB_PROGRAMS: return en_programs_in_group(EN_GROUP_PROGRAM, 0, 0);
+    case LIB_SUITES:   return en_programs_in_group(EN_GROUP_SUITE, 0, 0);
+    case LIB_CUSTOM: {
+        char name[64];
+        int i = 0;
+        while (i < EN_LIB_MAX_CUSTOM &&
+               en_sys_list_dir(en_sys_programs_dir(), i, name, sizeof name))
+            i++;
+        return i;
+    }
+    default: return 0;
+    }
+}
+
+static const char *shelf_name(int shelf)
+{
+    switch (shelf) {
+    case LIB_PRESETS:  return "Presets";
+    case LIB_PROGRAMS: return "Programs";
+    case LIB_SUITES:   return "Suites";
+    case LIB_CUSTOM:   return "Custom";
+    default:           return "Library";
+    }
+}
+
+static const char *shelf_detail(int shelf)
+{
+    switch (shelf) {
+    case LIB_PRESETS:  return "One steady beat";
+    case LIB_PROGRAMS: return "Timelines that ramp";
+    case LIB_SUITES:   return "Two or three carriers";
+    case LIB_CUSTOM:   return "Your own .txt files";
+    default:           return "";
+    }
+}
+
+/* Open a shelf, or return to the root. Selection is remembered per shelf, so
+   coming back from Now Playing lands where you left rather than at the top. */
+static void lib_open(int shelf)
+{
+    if (s_shelf >= 0 && s_shelf < LIB_SHELF_COUNT) s_sel_of[s_shelf] = s_sel;
+    s_shelf = shelf;
+    s_sel = (shelf >= 0 && shelf < LIB_SHELF_COUNT) ? s_sel_of[shelf] : 0;
+
+    int n = shelf < 0 ? LIB_SHELF_COUNT : shelf_count(shelf);
+    if (s_sel >= n) s_sel = n > 0 ? n - 1 : 0;
+    if (s_sel < 0) s_sel = 0;
+
     refresh_library();
+}
+
+static void on_lib_back(lv_event_t *e)
+{
+    (void)e;
+    wake_screen();
+    lib_open(LIB_ROOT);
 }
 
 /* Report a bad user-program file on its own row: the line number is the only
@@ -397,15 +492,40 @@ static void show_row_error(int index, const char *what, int line)
     lv_label_set_text(s_row_error, buf);
 }
 
+/* Row `row` of a program shelf, as an index into the one program table. The
+   shelves are views onto that table, not separate tables, so everything that
+   already takes a program index keeps working. */
+static int program_index_of(int shelf, int row)
+{
+    int idx[16];
+    en_group_t g = (shelf == LIB_SUITES) ? EN_GROUP_SUITE : EN_GROUP_PROGRAM;
+    int n = en_programs_in_group(g, idx, (int)(sizeof idx / sizeof idx[0]));
+    if (row < 0 || row >= n) return -1;
+    return idx[row];
+}
+
+static void activate_row(int row);
+
 static void on_row(lv_event_t *e)
 {
     wake_screen();
-    int idx = (int)(lv_uintptr_t)lv_event_get_user_data(e);
+    s_sel = (int)(lv_intptr_t)lv_event_get_user_data(e);
+    activate_row(s_sel);
+}
 
+/* Play, or open, whatever row `row` of the current shelf is. */
+static void activate_row(int row)
+{
+    if (s_shelf == LIB_ROOT) { lib_open(row); return; }
+
+    int idx = row;
     bool ok = false;
-    if (s_tab == 0) {
+
+    if (s_shelf == LIB_PRESETS) {
         ok = en_engine_play_preset(idx);
-    } else if (s_tab == 1) {
+    } else if (s_shelf == LIB_PROGRAMS || s_shelf == LIB_SUITES) {
+        idx = program_index_of(s_shelf, row);
+        if (idx < 0) return;
         ok = en_engine_play_program(idx);
     } else {
         /* A user program: read the file, parse it, play it. A malformed file
@@ -435,7 +555,8 @@ static void on_row(lv_event_t *e)
     }
 
     if (ok) {
-        P.last_source = s_tab == 0 ? EN_SRC_PRESET : EN_SRC_PROGRAM;
+        P.last_source = (s_shelf == LIB_PRESETS) ? EN_SRC_PRESET
+                                                 : EN_SRC_PROGRAM;
         P.last_index = idx;
         prefs_save();
         en_engine_set_sleep_timer((uint32_t)P.sleep_timer_s);
@@ -443,27 +564,38 @@ static void on_row(lv_event_t *e)
     }
 }
 
-static void style_tab(int i, bool on)
+/* Move the highlight. Only key navigation uses this - a finger acts on the row
+   it touched and never needs a cursor - so it exists for bringing the device up
+   before the touchscreen works, and does nothing a touch user would notice. */
+static void lib_move(int delta)
 {
-    lv_obj_set_style_bg_color(s_tab_btn[i],
-                              lv_color_hex(on ? C_SURFACE_2 : C_SURFACE), 0);
-    lv_obj_t *l = lv_obj_get_child(s_tab_btn[i], 0);
-    if (l) lv_obj_set_style_text_color(l,
-              lv_color_hex(on ? C_TEXT : C_TEXT_DIM), 0);
+    int n = (s_shelf == LIB_ROOT) ? LIB_SHELF_COUNT : shelf_count(s_shelf);
+    if (n <= 0) return;
+
+    s_sel += delta;
+    if (s_sel < 0) s_sel = n - 1;          /* wrap: a short list is a ring */
+    if (s_sel >= n) s_sel = 0;
+    refresh_library();
 }
 
-/* A library row: band dot, name, technical one-liner, right-aligned value. */
+/*
+ * A library row: band dot, name, technical one-liner, right-aligned value.
+ *
+ * `selected` draws the key-navigation highlight and scrolls the row into view.
+ * A finger never sees it - touching a row acts on that row directly - so it is
+ * only ever set while the buttons are driving.
+ */
 static void add_row(int index, uint32_t color, const char *name,
-                    const char *detail, const char *value)
+                    const char *detail, const char *value, bool selected)
 {
     lv_obj_t *row = lv_obj_create(s_list);
-    flat(row, C_BG);
+    flat(row, selected ? C_SURFACE : C_BG);
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_size(row, CONTENT_W, ROW_H);
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(row, on_row, LV_EVENT_CLICKED,
-                        (void *)(lv_uintptr_t)index);
-    lv_obj_set_style_bg_color(row, lv_color_hex(C_SURFACE), LV_STATE_PRESSED);
+                        (void *)(lv_intptr_t)index);
+    lv_obj_set_style_bg_color(row, lv_color_hex(C_SURFACE_2), LV_STATE_PRESSED);
     lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_STATE_PRESSED);
 
     lv_obj_t *dot = lv_obj_create(row);
@@ -474,31 +606,77 @@ static void add_row(int index, uint32_t color, const char *name,
     lv_obj_set_pos(dot, 0, 15);
 
     lv_obj_t *n = make_label(row, name, F_BODY, C_TEXT);
+    /* Bounded and elided. A suite name is longer than anything that was here
+       before and would otherwise run under the value on the right. */
+    lv_obj_set_size(n, CONTENT_W - 18 - 66, 22);
+    lv_label_set_long_mode(n, LV_LABEL_LONG_DOT);
     lv_obj_set_pos(n, 18, 8);
 
     lv_obj_t *d = make_label(row, detail, F_CAPTION, C_TEXT_MUTE);
-    lv_obj_set_width(d, CONTENT_W - 18);
-    /* Width first, then the mode: a detail line that wrapped would push into
-       the row below instead of being trimmed. */
+    /* Width and height first, then the mode: LV_LABEL_LONG_DOT wraps instead
+       of eliding unless it has both, and a detail line that wrapped would push
+       into the row below. Stops short of the value column rather than running
+       under it - the value is short today, and a row whose two halves overlap
+       only when the data is long is a row that looks fine until it does not. */
+    lv_obj_set_size(d, CONTENT_W - 18 - 46, 18);
     lv_label_set_long_mode(d, LV_LABEL_LONG_DOT);
     lv_obj_set_pos(d, 18, 31);
 
-    lv_obj_t *v = make_label(row, value, F_CAPTION, C_TEXT_DIM);
+    lv_obj_t *v = make_label(row, value, F_CAPTION,
+                             selected ? C_TEXT : C_TEXT_DIM);
+    /* Fixed height as well as width, so a value that does not quite fit is
+       clipped rather than wrapping onto a second line and colliding with the
+       detail underneath - which is what "100 min" did at 54 px. */
     lv_obj_set_style_text_align(v, LV_TEXT_ALIGN_RIGHT, 0);
-    lv_obj_set_width(v, 78);
-    lv_obj_set_pos(v, CONTENT_W - 78, 10);
+    lv_obj_set_size(v, 62, 20);
+    lv_obj_set_pos(v, CONTENT_W - 62, 10);
 
     make_hairline(row, ROW_H - 1, 18, CONTENT_W - 18);
+
+    /* Noted, not scrolled to. The list has no layout yet while rows are still
+       being added, so scrolling here would aim at a position that does not
+       exist. refresh_library does it once everything is placed. */
+    if (selected) s_sel_row = row;
 }
 
-static void refresh_library(void)
+static void empty_state(const char *title, const char *body)
 {
-    for (int i = 0; i < 3; i++) style_tab(i, i == s_tab);
-    if (s_row_error) lv_label_set_text(s_row_error, "");
-    lv_obj_clean(s_list);
+    lv_obj_t *empty = lv_obj_create(s_list);
+    flat(empty, C_BG);
+    lv_obj_remove_flag(empty, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(empty, CONTENT_W, 140);
+    lv_obj_t *t = make_label(empty, title, F_BODY, C_TEXT_DIM);
+    lv_obj_set_pos(t, 0, 24);
+    lv_obj_t *h = make_para(empty, body, F_CAPTION, C_TEXT_MUTE, CONTENT_W);
+    lv_obj_set_pos(h, 0, 50);
+}
+
+/* Builds the rows. Has several exits, which is why the scroll-into-view that
+   has to happen after all of them lives in its caller. */
+static void fill_library(void)
+{
+    lv_label_set_text(s_lib_title, shelf_name(s_shelf));
+    /* Indented only when the back chevron is there to be cleared. At the root
+       the gutter is empty and the title was floating in the middle of it. */
+    lv_obj_set_pos(s_lib_title, MARGIN + (s_shelf == LIB_ROOT ? 0 : 40), 64);
 
     char buf[64];
-    if (s_tab == 0) {
+
+    if (s_shelf == LIB_ROOT) {
+        for (int i = 0; i < LIB_SHELF_COUNT; i++) {
+            int n = shelf_count(i);
+            buf[0] = 0;
+            put_uint(buf, 0, (uint32_t)n, 1);
+            /* The count is the value, and an empty shelf says so rather than
+               showing a bare nought that reads like a broken readout. */
+            add_row(i, n ? C_ACCENT : C_HAIRLINE, shelf_name(i),
+                    shelf_detail(i), n ? buf : "empty", i == s_sel);
+        }
+        lv_label_set_text(s_lib_hint, "");
+        return;
+    }
+
+    if (s_shelf == LIB_PRESETS) {
         int n;
         const en_preset_t *ps = en_presets(&n);
         for (int i = 0; i < n; i++) {
@@ -511,42 +689,73 @@ static void refresh_library(void)
                 str_cat(buf, " Hz", sizeof buf);
             }
             add_row(i, en_band_color(en_band_of(ps[i].beat_hz)),
-                    ps[i].name, ps[i].detail, buf);
+                    ps[i].name, ps[i].detail, buf, i == s_sel);
         }
-    } else if (s_tab == 1) {
-        int n;
-        const en_program_t *ps = en_programs(&n);
+        lv_label_set_text(s_lib_hint, "");
+        return;
+    }
+
+    if (s_shelf == LIB_PROGRAMS || s_shelf == LIB_SUITES) {
+        int idx[16];
+        en_group_t g = (s_shelf == LIB_SUITES) ? EN_GROUP_SUITE
+                                               : EN_GROUP_PROGRAM;
+        int n = en_programs_in_group(g, idx, (int)(sizeof idx / sizeof idx[0]));
+        int count;
+        const en_program_t *ps = en_programs(&count);
+
         for (int i = 0; i < n; i++) {
-            uint32_t secs = en_program_seconds(&ps[i]);
+            const en_program_t *p = &ps[idx[i]];
+            uint32_t secs = en_program_seconds(p);
             buf[0] = 0;
             put_uint(buf, 0, secs / 60u, 1);
             str_cat(buf, " min", sizeof buf);
-            add_row(i, en_band_color(en_program_band(&ps[i])),
-                    ps[i].name, ps[i].detail, buf);
+            add_row(i, en_band_color(en_program_band(p)),
+                    p->name, p->detail, buf, i == s_sel);
         }
-    } else {
-        int shown = 0;
-        char name[64];
-        for (int i = 0; i < 32; i++) {
-            if (!en_sys_list_dir(en_sys_programs_dir(), i, name, sizeof name))
-                break;
-            add_row(i, C_TEXT_MUTE, name, "user program", "");
-            shown++;
-        }
-        if (shown == 0) {
-            lv_obj_t *empty = lv_obj_create(s_list);
-            flat(empty, C_BG);
-            lv_obj_remove_flag(empty, LV_OBJ_FLAG_SCROLLABLE);
-            lv_obj_set_size(empty, CONTENT_W, 120);
-            lv_obj_t *t = make_label(empty, "No user programs", F_BODY,
-                                     C_TEXT_DIM);
-            lv_obj_set_pos(t, 0, 24);
-            lv_obj_t *h = make_para(empty,
-                "Drop .txt program files into "
-                "/Apps/Data/Entrain/programs. The format is in the README.",
-                F_CAPTION, C_TEXT_MUTE, CONTENT_W);
-            lv_obj_set_pos(h, 0, 50);
-        }
+        /* Said once, on the shelf where it applies, rather than in every
+           suite's detail line where it would crowd out the frequencies. */
+        lv_label_set_text(s_lib_hint,
+                          s_shelf == LIB_SUITES
+                              ? "Ported schedules. No effect is claimed."
+                              : "");
+        return;
+    }
+
+    /* Custom. */
+    int shown = 0;
+    char name[64];
+    for (int i = 0; i < EN_LIB_MAX_CUSTOM; i++) {
+        if (!en_sys_list_dir(en_sys_programs_dir(), i, name, sizeof name))
+            break;
+        add_row(i, C_TEXT_MUTE, name, "user program", "", i == s_sel);
+        shown++;
+    }
+    if (shown == 0)
+        empty_state("No user programs",
+                    "Drop .txt program files into "
+                    "/Apps/Data/Entrain/programs. The format is in the README.");
+    lv_label_set_text(s_lib_hint, "");
+}
+
+static void refresh_library(void)
+{
+    if (s_row_error) lv_label_set_text(s_row_error, "");
+    if (!s_list) return;
+
+    lv_obj_clean(s_list);
+    s_sel_row = 0;
+
+    if (s_shelf == LIB_ROOT) lv_obj_add_flag(s_lib_back, LV_OBJ_FLAG_HIDDEN);
+    else                     lv_obj_remove_flag(s_lib_back, LV_OBJ_FLAG_HIDDEN);
+
+    fill_library();
+
+    /* Now that every row exists and has a position, put the highlighted one on
+       screen. Without the layout pass this scrolls to where the row was going
+       to be rather than where it is. */
+    if (s_sel_row) {
+        lv_obj_update_layout(s_list);
+        lv_obj_scroll_to_view(s_sel_row, LV_ANIM_OFF);
     }
 }
 
@@ -568,30 +777,45 @@ static void build_library(void)
 
     make_hairline(s, 46, 0, EN_SCREEN_W);
 
-    static const char *TABS[3] = { "Presets", "Programs", "Custom" };
-    for (int i = 0; i < 3; i++) {
-        lv_obj_t *b = lv_obj_create(s);
-        flat(b, C_SURFACE);
-        lv_obj_remove_flag(b, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_size(b, CONTENT_W / 3, TAP_MIN);
-        lv_obj_set_pos(b, MARGIN + i * (CONTENT_W / 3), 58);
-        lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(b, on_tab, LV_EVENT_CLICKED,
-                            (void *)(lv_uintptr_t)i);
-        lv_obj_t *l = make_label(b, TABS[i], F_CAPTION, C_TEXT_DIM);
-        lv_obj_center(l);
-        s_tab_btn[i] = b;
-    }
+    /* Which shelf you are on, in place of the tab strip. A title rather than
+       three buttons: there are four shelves now and the strip could not have
+       held a fourth at a size a finger can hit. */
+    s_lib_title = make_label(s, "Library", F_BODY, C_TEXT);
+    lv_obj_set_pos(s_lib_title, MARGIN + 40, 64);
+
+    /* The back target is the full height of the header row and the width of
+       the gutter beside the title, not just the chevron glyph. */
+    s_lib_back = lv_obj_create(s);
+    flat(s_lib_back, C_BG);
+    lv_obj_remove_flag(s_lib_back, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(s_lib_back, 40, TAP_MIN);
+    lv_obj_set_pos(s_lib_back, MARGIN - 8, 56);
+    lv_obj_add_flag(s_lib_back, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_lib_back, on_lib_back, LV_EVENT_CLICKED, 0);
+    lv_obj_set_style_bg_color(s_lib_back, lv_color_hex(C_SURFACE),
+                              LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(s_lib_back, LV_OPA_COVER, LV_STATE_PRESSED);
+    lv_obj_t *chev = make_label(s_lib_back, LV_SYMBOL_LEFT, F_CAPTION, C_ACCENT);
+    lv_obj_center(chev);
+    lv_obj_add_flag(s_lib_back, LV_OBJ_FLAG_HIDDEN);
 
     s_list = lv_obj_create(s);
     flat(s_list, C_BG);
     lv_obj_set_size(s_list, CONTENT_W, EN_SCREEN_H - 118);
-    lv_obj_set_pos(s_list, MARGIN, 114);
+    lv_obj_set_pos(s_list, MARGIN, 106);
     lv_obj_set_flex_flow(s_list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(s_list, 0, 0);
     /* Momentum, no snapping — the list should coast, not click into place. */
     lv_obj_set_scroll_snap_y(s_list, LV_SCROLL_SNAP_NONE);
     lv_obj_set_scrollbar_mode(s_list, LV_SCROLLBAR_MODE_OFF);
+
+    /* One line under the list for whatever is true of the shelf as a whole.
+       It shares the bottom strip with the parse-error line, which only ever
+       appears after a tap and takes priority when it does. */
+    s_lib_hint = make_label(s, "", F_CAPTION, C_TEXT_MUTE);
+    lv_obj_set_size(s_lib_hint, CONTENT_W, 18);
+    lv_label_set_long_mode(s_lib_hint, LV_LABEL_LONG_DOT);
+    lv_obj_set_pos(s_lib_hint, MARGIN, EN_SCREEN_H - 20);
 
     s_row_error = make_label(s, "", F_CAPTION, 0xE06C6C);
     lv_obj_set_width(s_row_error, CONTENT_W);
@@ -1374,9 +1598,16 @@ void en_ui_set_blanking(bool enabled)
 
 void en_ui_set_tab(int tab)
 {
-    if (tab < 0 || tab > 2) return;
-    s_tab = tab;
-    if (s_list) refresh_library();
+    /* The tabs became shelves, and there are four of them now.
+       0, 1 and 2 still name exactly what they always did, so anything holding
+       an old number keeps working; Suites took 3 rather than its natural place
+       in the middle, for that reason. -1 opens the root. */
+    static const int SHELF_OF_TAB[4] = {
+        LIB_PRESETS, LIB_PROGRAMS, LIB_CUSTOM, LIB_SUITES
+    };
+    if (tab < 0) { lib_open(LIB_ROOT); return; }
+    if (tab > 3) return;
+    lib_open(SHELF_OF_TAB[tab]);
 }
 
 /* ---- lifecycle ----------------------------------------------------------- */
@@ -1414,11 +1645,21 @@ void en_ui_init(void)
     } else {
         s_current = EN_SCREEN_LIBRARY;
         lv_screen_load(s_screen[EN_SCREEN_LIBRARY]);
-        /* Resume whatever was playing last, ready to start but silent until
-           the user asks — waking to sudden audio would be hostile. */
-        if (P.last_source == EN_SRC_PRESET) s_tab = 0;
-        else if (P.last_source == EN_SRC_PROGRAM) s_tab = 1;
-        refresh_library();
+        /* Open on the shelf whatever played last came from, ready to start but
+           silent until the user asks — waking to sudden audio would be
+           hostile. The root is the right landing place the first time, when
+           there is no last anything. */
+        if (P.last_source == EN_SRC_PRESET) {
+            lib_open(LIB_PRESETS);
+        } else if (P.last_source == EN_SRC_PROGRAM) {
+            int count;
+            const en_program_t *ps = en_programs(&count);
+            bool suite = P.last_index >= 0 && P.last_index < count &&
+                         ps[P.last_index].group == EN_GROUP_SUITE;
+            lib_open(suite ? LIB_SUITES : LIB_PROGRAMS);
+        } else {
+            refresh_library();
+        }
     }
 }
 
@@ -1452,6 +1693,32 @@ void en_ui_tick(void)
 void en_ui_key(en_key_t key)
 {
     wake_screen();
+
+    /*
+     * On the Library screen the volume keys walk the list and play opens what
+     * is highlighted. Everywhere else they are the volume, which is what they
+     * are for.
+     *
+     * This exists so the device can be driven before its touchscreen works.
+     * It is additive: the browser is built for a finger, a touch acts on the
+     * row it landed on, and the highlight this moves is invisible until a
+     * button is pressed. When touch lands, none of it is in the way.
+     */
+    if (s_current == EN_SCREEN_LIBRARY) {
+        switch (key) {
+        case EN_KEY_VOL_DOWN:   lib_move(+1); return;
+        case EN_KEY_VOL_UP:     lib_move(-1); return;
+        case EN_KEY_PLAY_PAUSE: activate_row(s_sel); return;
+        case EN_KEY_BACK:
+            /* Out of a shelf first, out of the app only from the root - so
+               back never skips a level it should have unwound. */
+            if (s_shelf != LIB_ROOT) { lib_open(LIB_ROOT); return; }
+            en_sys_request_exit();
+            return;
+        default: break;
+        }
+    }
+
     switch (key) {
     case EN_KEY_VOL_UP:
         P.volume += 5;
@@ -1471,8 +1738,7 @@ void en_ui_key(en_key_t key)
         en_engine_toggle_pause();
         break;
     case EN_KEY_BACK:
-        if (s_current == EN_SCREEN_LIBRARY) en_sys_request_exit();
-        else en_ui_goto(EN_SCREEN_LIBRARY, true);
+        en_ui_goto(EN_SCREEN_LIBRARY, true);
         break;
     case EN_KEY_NEXT_PROGRAM: {
         int n = 0;
@@ -1484,7 +1750,6 @@ void en_ui_key(en_key_t key)
             P.last_index = s_prog_cycle;
             prefs_save();
             en_engine_set_sleep_timer((uint32_t)P.sleep_timer_s);
-            s_tab = 1;
             en_ui_goto(EN_SCREEN_NOW, true);
         }
         break;

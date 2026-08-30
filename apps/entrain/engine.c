@@ -263,6 +263,11 @@ static void job_finish(void)
 /* Render one slice. Slicing works because the renderer carries its phase
    across calls, so a sub-segment picks up exactly where the last left off —
    the same property that makes program segment joins click-free. */
+static double slerp(double a, double b, double u)
+{
+    return a + (b - a) * u;
+}
+
 static void job_step(void)
 {
     if (!E.job.active) return;
@@ -277,22 +282,42 @@ static void job_step(void)
     double u0 = (double)E.job.done / (double)E.job.frames;
     double u1 = (double)(E.job.done + n) / (double)E.job.frames;
 
-    en_segment_t slice = E.job.seg;
+    const en_segment_t *src = &E.job.seg;
+
+    en_segment_t slice = *src;
     slice.frames = n;
     slice.fade_in_s = 0.0;
     slice.fade_out_s = 0.0;
-    slice.start.carrier_hz = E.job.seg.start.carrier_hz
-        + (E.job.seg.end.carrier_hz - E.job.seg.start.carrier_hz) * u0;
-    slice.start.beat_hz = E.job.seg.start.beat_hz
-        + (E.job.seg.end.beat_hz - E.job.seg.start.beat_hz) * u0;
-    slice.start.tone_level = E.job.seg.start.tone_level;
-    slice.start.noise_level = E.job.seg.start.noise_level;
-    slice.end.carrier_hz = E.job.seg.start.carrier_hz
-        + (E.job.seg.end.carrier_hz - E.job.seg.start.carrier_hz) * u1;
-    slice.end.beat_hz = E.job.seg.start.beat_hz
-        + (E.job.seg.end.beat_hz - E.job.seg.start.beat_hz) * u1;
-    slice.end.tone_level = E.job.seg.end.tone_level;
-    slice.end.noise_level = E.job.seg.end.noise_level;
+
+    /* Every ramped quantity is sampled at this slice's own two points in the
+       chunk. tone_level and noise_level used to be copied whole, so each slice
+       ramped them across the entire chunk's range rather than its own share -
+       a sawtooth, had either ever actually ramped. Neither does today, which
+       is why it was invisible; it is wrong all the same and a multi-layer
+       program is the first thing here whose gains really do move. */
+    slice.start.carrier_hz  = slerp(src->start.carrier_hz,  src->end.carrier_hz,  u0);
+    slice.start.beat_hz     = slerp(src->start.beat_hz,     src->end.beat_hz,     u0);
+    slice.start.tone_level  = slerp(src->start.tone_level,  src->end.tone_level,  u0);
+    slice.start.noise_level = slerp(src->start.noise_level, src->end.noise_level, u0);
+    slice.end.carrier_hz    = slerp(src->start.carrier_hz,  src->end.carrier_hz,  u1);
+    slice.end.beat_hz       = slerp(src->start.beat_hz,     src->end.beat_hz,     u1);
+    slice.end.tone_level    = slerp(src->start.tone_level,  src->end.tone_level,  u1);
+    slice.end.noise_level   = slerp(src->start.noise_level, src->end.noise_level, u1);
+
+    for (uint8_t j = 0; j < src->layers; j++) {
+        slice.lstart[j].carrier_hz =
+            slerp(src->lstart[j].carrier_hz, src->lend[j].carrier_hz, u0);
+        slice.lstart[j].beat_hz =
+            slerp(src->lstart[j].beat_hz, src->lend[j].beat_hz, u0);
+        slice.lstart[j].level =
+            slerp(src->lstart[j].level, src->lend[j].level, u0);
+        slice.lend[j].carrier_hz =
+            slerp(src->lstart[j].carrier_hz, src->lend[j].carrier_hz, u1);
+        slice.lend[j].beat_hz =
+            slerp(src->lstart[j].beat_hz, src->lend[j].beat_hz, u1);
+        slice.lend[j].level =
+            slerp(src->lstart[j].level, src->lend[j].level, u1);
+    }
 
     en_render_segment(&E.rnd, &slice, E.job.buf + (size_t)E.job.done * 2);
     E.job.done += n;
@@ -303,36 +328,38 @@ static void job_step(void)
 /* ---- program chunking ---------------------------------------------------- */
 
 /* Parameters of the program at a given instant. */
+/* Whichever timeline is playing, as a plain segment array. Built-in programs
+   and user programs hold the same segments in different wrappers, and the
+   engine has to evaluate both through one path or they drift apart. */
+static const en_prog_seg_t *program_segs(int *n_out)
+{
+    if (E.source == EN_SRC_USER) {
+        *n_out = E.user.n_segs;
+        return E.user.segs;
+    }
+    int count;
+    const en_program_t *ps = en_programs(&count);
+    *n_out = ps[E.index].n_segs;
+    return ps[E.index].segs;
+}
+
+/* Evaluate the timeline at `t` into layer form. Returns the layer count. */
+static uint8_t program_layers_at(double t, en_layer_t *lay,
+                                 en_noise_kind_t *noise, double *nlevel)
+{
+    int n;
+    const en_prog_seg_t *segs = program_segs(&n);
+    return en_segs_layers_at(segs, n, t, E.mode, lay, noise, nlevel);
+}
+
 static void program_params_at(double t, double *beat, double *carrier,
                               en_noise_kind_t *noise, double *nlevel)
 {
-    const en_prog_seg_t *segs;
-    int n;
-    if (E.source == EN_SRC_USER) { segs = E.user.segs; n = E.user.n_segs; }
-    else {
-        int count;
-        const en_program_t *ps = en_programs(&count);
-        segs = ps[E.index].segs;
-        n = ps[E.index].n_segs;
-    }
-
-    double acc = 0.0;
-    for (int i = 0; i < n; i++) {
-        double dur = (double)segs[i].seconds;
-        if (t < acc + dur || i == n - 1) {
-            double u = dur > 0.0 ? (t - acc) / dur : 0.0;
-            if (u < 0.0) u = 0.0;
-            if (u > 1.0) u = 1.0;
-            *beat = segs[i].beat_start
-                  + (segs[i].beat_end - segs[i].beat_start) * u;
-            *carrier = segs[i].carrier_hz;
-            *noise = segs[i].noise;
-            *nlevel = segs[i].noise_level;
-            return;
-        }
-        acc += dur;
-    }
-    *beat = 10.0; *carrier = 200.0; *noise = EN_NOISE_NONE; *nlevel = 0.0;
+    en_layer_t lay[EN_MAX_LAYERS];
+    program_layers_at(t, lay, noise, nlevel);
+    /* Layer zero is the primary by convention — see program.h. */
+    *beat = lay[0].beat_hz;
+    *carrier = lay[0].carrier_hz;
 }
 
 /* Queue the next slice of the program timeline, if any is left. */
@@ -348,25 +375,28 @@ static bool start_next_chunk(bool first)
     uint32_t frames = (uint32_t)(dur * (double)rate);
     if (frames == 0) return false;
 
-    double b0, c0, b1, c1, nl0, nl1;
+    double nl0, nl1;
     en_noise_kind_t nk0, nk1;
-    program_params_at(t0, &b0, &c0, &nk0, &nl0);
-    program_params_at(t0 + dur, &b1, &c1, &nk1, &nl1);
 
     en_segment_t seg;
     memset(&seg, 0, sizeof seg);
     seg.sample_rate = rate;
     seg.mode = E.mode;
-    seg.noise = nk0;
     seg.frames = frames;
-    seg.start.carrier_hz = c0;
-    seg.start.beat_hz = b0;
+
+    uint8_t n0 = program_layers_at(t0, seg.lstart, &nk0, &nl0);
+    uint8_t n1 = program_layers_at(t0 + dur, seg.lend, &nk1, &nl1);
+    seg.layers = n0 < n1 ? n0 : n1;
+
+    seg.noise = nk0;
     seg.start.tone_level = 0.8;
     seg.start.noise_level = nl0;
-    seg.end.carrier_hz = c1;
-    seg.end.beat_hz = b1;
     seg.end.tone_level = 0.8;
     seg.end.noise_level = nl1;
+    seg.start.carrier_hz = seg.lstart[0].carrier_hz;
+    seg.start.beat_hz = seg.lstart[0].beat_hz;
+    seg.end.carrier_hz = seg.lend[0].carrier_hz;
+    seg.end.beat_hz = seg.lend[0].beat_hz;
 
     /* Alternate between two keys. A program chunk is not worth caching — it is
        unique to its position in the timeline — but it does need a name of its
@@ -394,20 +424,32 @@ static void stream_segment(en_segment_t *seg, const stream_params_t *p,
 
     if (S_is_program) {
         /* Evaluate the timeline across exactly this block, so the ramp stays
-           continuous over every block boundary and every segment join. */
-        double b0, c0, b1, c1, nl0, nl1;
+           continuous over every block boundary and every segment join. Both
+           ends go through the layer evaluator, which is what carries a
+           multi-layer program's per-layer gain ramps into the renderer. */
+        double nl0, nl1;
         en_noise_kind_t nk0, nk1;
-        program_params_at(t, &b0, &c0, &nk0, &nl0);
-        program_params_at(t + span, &b1, &c1, &nk1, &nl1);
+        uint8_t n0 = program_layers_at(t, seg->lstart, &nk0, &nl0);
+        uint8_t n1 = program_layers_at(t + span, seg->lend, &nk1, &nl1);
+
+        /* A block that straddles a join between segments with different layer
+           counts takes the smaller: ramping a layer that only exists at one
+           end would ramp it from uninitialised memory. Nothing shipped does
+           this - the suites keep one layer count throughout - but a user
+           program need not, and silence is the right failure. */
+        seg->layers = n0 < n1 ? n0 : n1;
+
         seg->noise = nk0;
-        seg->start.carrier_hz  = c0;
-        seg->start.beat_hz     = b0;
         seg->start.tone_level  = p->tone_level;
         seg->start.noise_level = nl0;
-        seg->end.carrier_hz    = c1;
-        seg->end.beat_hz       = b1;
         seg->end.tone_level    = p->tone_level;
         seg->end.noise_level   = nl1;
+
+        /* Kept in step for anything that still reads the scalar form. */
+        seg->start.carrier_hz  = seg->lstart[0].carrier_hz;
+        seg->start.beat_hz     = seg->lstart[0].beat_hz;
+        seg->end.carrier_hz    = seg->lend[0].carrier_hz;
+        seg->end.beat_hz       = seg->lend[0].beat_hz;
     } else {
         /* A preset, or one being tuned by hand. The renderer's control-rate
            interpolation turns a changed target into a glide, so live tuning

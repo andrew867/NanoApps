@@ -55,6 +55,12 @@ typedef struct {
     bool     ta_record;          /* auto-record traffic announcements */
     bool     ta_recording;       /* one is being recorded right now */
 
+    /* Which optional screens are in the swipe order. Here rather than private
+       to the UI because they persist, and persistence is the platform's job -
+       the same reason ta_record lives here and not beside the checkbox. */
+    bool     simple_screen;      /* big preset buttons and nothing else */
+    bool     wide_screen;        /* the landscape readout */
+
     /* Presets and recordings */
     en_presets_t presets;
     uint8_t  library_count;
@@ -102,5 +108,13 @@ void rp_act_play_live(void);        /* jump to the front of the buffer */
 void rp_act_nudge(int32_t ms);      /* negative goes back */
 void rp_act_pause_toggle(void);
 void rp_act_ta_record(bool on);
+
+/* Turn the optional screens on or off, and remember it. */
+void rp_act_show_simple(bool on);
+void rp_act_show_wide(bool on);
+
+/* Flag or unflag the tuned station for the simple screen, saving the presets.
+   Returns false when the grid is full, which the UI says out loud. */
+bool rp_act_simple_toggle(uint32_t khz);
 
 #endif /* RADIOPLUS_MODEL_H */

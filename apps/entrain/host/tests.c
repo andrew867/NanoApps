@@ -676,6 +676,161 @@ static void test_levels(void)
 
 /* ---- 8. WAV header ------------------------------------------------------ */
 
+/* Magnitude of one frequency bin, by direct correlation. Used instead of the
+   zero-crossing measure_freq() because a mix of three carriers has no useful
+   zero crossings — the whole point of these tests is that several tones are
+   present at once, which is exactly what that helper cannot see. Pick `frames`
+   so every frequency completes a whole number of cycles and there is no
+   leakage to worry about. */
+static double bin_mag(const int16_t *pcm, uint32_t frames, int ch,
+                      uint32_t sr, double hz)
+{
+    const double two_pi = 6.283185307179586;
+    double re = 0.0, im = 0.0;
+    for (uint32_t i = 0; i < frames; i++) {
+        double t = (double)i / (double)sr;
+        double a = (double)pcm[2 * i + ch] / 32767.0;
+        re += a * cos(two_pi * hz * t);
+        im += a * sin(two_pi * hz * t);
+    }
+    return 2.0 * sqrt(re * re + im * im) / (double)frames;
+}
+
+static void test_layers(void)
+{
+    section("layers");
+
+    const uint32_t sr = 11025;
+    const uint32_t frames = sr;          /* one second: every carrier is exact */
+    int16_t *a = malloc(frames * 2 * sizeof *a);
+    int16_t *b = malloc(frames * 2 * sizeof *b);
+
+    /* ---- 1. the legacy form and an explicit one-layer form are the same
+       bytes. This is the check that lets every existing caller stay untouched:
+       if it ever fails, single-layer material has silently changed. */
+    en_segment_t legacy;
+    memset(&legacy, 0, sizeof legacy);
+    legacy.sample_rate = sr;
+    legacy.mode = EN_MODE_BINAURAL;
+    legacy.noise = EN_NOISE_NONE;
+    legacy.frames = frames;
+    legacy.start.carrier_hz = 200.0;
+    legacy.start.beat_hz = 10.0;
+    legacy.start.tone_level = 0.8;
+    legacy.start.noise_level = 0.0;
+    legacy.end = legacy.start;
+
+    en_segment_t explicit_one = legacy;
+    explicit_one.layers = 1;
+    explicit_one.lstart[0].mode = EN_MODE_BINAURAL;
+    explicit_one.lstart[0].carrier_hz = 200.0;
+    explicit_one.lstart[0].beat_hz = 10.0;
+    explicit_one.lstart[0].level = 1.0;
+    explicit_one.lend[0] = explicit_one.lstart[0];
+
+    en_render_t r;
+    en_render_init(&r, sr, EN_NOISE_NONE, 1);
+    en_render_segment(&r, &legacy, a);
+    en_render_init(&r, sr, EN_NOISE_NONE, 1);
+    en_render_segment(&r, &explicit_one, b);
+    CHECK(memcmp(a, b, frames * 2 * sizeof *a) == 0,
+          "one explicit layer is not bit-identical to the legacy form");
+
+    /* en_segment_layers agrees, and reports one layer for the legacy form. */
+    en_layer_t ls[EN_MAX_LAYERS], le[EN_MAX_LAYERS];
+    CHECK(en_segment_layers(&legacy, ls, le) == 1, "legacy is not one layer");
+    CHECK(ls[0].level == 1.0, "legacy layer gain is not unity");
+    CHECK(ls[0].carrier_hz == 200.0, "legacy carrier did not map through");
+
+    /* ---- 2. layers sum, at the gains asked for. Three carriers in the left
+       ear at 4:2:1, measured back out of the rendered PCM. */
+    en_segment_t mix;
+    memset(&mix, 0, sizeof mix);
+    mix.sample_rate = sr;
+    mix.noise = EN_NOISE_NONE;
+    mix.frames = frames;
+    mix.start.tone_level = 1.0;
+    mix.start.noise_level = 0.0;
+    mix.end = mix.start;
+    mix.layers = 3;
+    const double carr[3] = { 200.0, 300.0, 500.0 };
+    const double lvl[3]  = { 0.20, 0.10, 0.05 };
+    for (int j = 0; j < 3; j++) {
+        mix.lstart[j].mode = EN_MODE_BINAURAL;
+        mix.lstart[j].carrier_hz = carr[j];
+        mix.lstart[j].beat_hz = 4.0;
+        mix.lstart[j].level = lvl[j];
+        mix.lend[j] = mix.lstart[j];
+    }
+
+    en_render_init(&r, sr, EN_NOISE_NONE, 1);
+    en_render_segment(&r, &mix, a);
+
+    for (int j = 0; j < 3; j++) {
+        double got = bin_mag(a, frames, 0, sr, carr[j]);
+        double want = lvl[j] * EN_HEADROOM;
+        CHECK(fabs(got - want) < want * 0.04,
+              "layer %d at %.0f Hz measured %.4f, wanted %.4f",
+              j, carr[j], got, want);
+    }
+    /* And nothing appeared where no layer was put. */
+    CHECK(bin_mag(a, frames, 0, sr, 400.0) < 0.004,
+          "energy at 400 Hz where no layer sounds");
+
+    /* ---- 3. a layer at zero gain still advances. Skipping silent layers is
+       the obvious optimisation and it is wrong: the phase would stall and the
+       layer would re-enter wherever it stopped, which is a click at the exact
+       moment it fades back in. */
+    en_segment_t silent = mix;
+    silent.lstart[1].level = 0.0;
+    silent.lend[1].level = 0.0;
+
+    en_render_init(&r, sr, EN_NOISE_NONE, 1);
+    en_render_segment(&r, &silent, a);
+    uint32_t after_silent = r.lay[1].l.phase;
+
+    en_render_init(&r, sr, EN_NOISE_NONE, 1);
+    en_render_segment(&r, &mix, b);
+    uint32_t after_audible = r.lay[1].l.phase;
+
+    CHECK(after_silent == after_audible,
+          "a silent layer did not advance its phase (0x%08x vs 0x%08x)",
+          after_silent, after_audible);
+    /* It really was silent, though. */
+    CHECK(bin_mag(a, frames, 0, sr, 300.0) < 0.004,
+          "the muted layer is still audible");
+
+    /* ---- 4. more layers than the renderer holds are clamped, not overrun. */
+    en_segment_t too_many = mix;
+    too_many.layers = EN_MAX_LAYERS + 3;
+    CHECK(en_segment_layers(&too_many, ls, le) == EN_MAX_LAYERS,
+          "layer count was not clamped to EN_MAX_LAYERS");
+
+    /* ---- 5. a multi-layer loop still wraps without a step. Both carriers are
+       cycle-exact in one second at this rate, which is what the seam needs. */
+    en_segment_t loop = mix;
+    loop.layers = 2;
+    loop.lstart[0].beat_hz = 0.0; loop.lend[0].beat_hz = 0.0;
+    loop.lstart[1].beat_hz = 0.0; loop.lend[1].beat_hz = 0.0;
+
+    en_render_init(&r, sr, EN_NOISE_NONE, 1);
+    en_render_loop(&r, &loop, a);
+
+    int32_t seam = (int32_t)a[0] - (int32_t)a[2 * (frames - 1)];
+    int32_t worst = 0;
+    for (uint32_t i = 1; i < frames; i++) {
+        int32_t d = (int32_t)a[2 * i] - (int32_t)a[2 * (i - 1)];
+        if (d < 0) d = -d;
+        if (d > worst) worst = d;
+    }
+    if (seam < 0) seam = -seam;
+    printf("  two-layer loop seam %d, worst interior step %d\n", seam, worst);
+    CHECK(seam <= worst, "the two-layer loop seam is bigger than any interior step");
+
+    free(a);
+    free(b);
+}
+
 static void test_wav_header(void)
 {
     section("wav header");
@@ -709,7 +864,7 @@ static void test_programs(void)
 
     int n;
     const en_program_t *ps = en_programs(&n);
-    CHECK(n == 6, "expected 6 built-in programs, got %d", n);
+    CHECK(n == 10, "expected 10 built-in programs, got %d", n);
 
     for (int i = 0; i < n; i++) {
         uint32_t secs = en_program_seconds(&ps[i]);
@@ -734,6 +889,181 @@ static void test_programs(void)
         CHECK(en_program_seg_at(&ps[i], 0.0) == 0, "%s: seg at t=0", ps[i].name);
         CHECK(en_program_seg_at(&ps[i], (double)secs + 1.0) == -1,
               "%s: seg past the end should be -1", ps[i].name);
+
+        /* Multi-layer tables carry the primary beat twice — once in the
+           segment and once in layer zero — because the readout reads one and
+           the renderer the other. They have to agree, and nothing but a test
+           can keep two hand-written columns of numbers in step. */
+        for (int s = 0; s < ps[i].n_segs; s++) {
+            const en_prog_seg_t *sg = &ps[i].segs[s];
+            if (!sg->layers) continue;
+            CHECK(fabs(sg->layer[0].beat_start - sg->beat_start) < 1e-9,
+                  "%s seg %d: layer 0 starts at %.3f, segment says %.3f",
+                  ps[i].name, s, sg->layer[0].beat_start, sg->beat_start);
+            CHECK(fabs(sg->layer[0].beat_end - sg->beat_end) < 1e-9,
+                  "%s seg %d: layer 0 ends at %.3f, segment says %.3f",
+                  ps[i].name, s, sg->layer[0].beat_end, sg->beat_end);
+
+            /* Every layer's gain and carrier must be continuous too, or a
+               layer steps in level at a join — which is a click, and the whole
+               reason the source authored these as breakpoint curves. */
+            if (s > 0) {
+                const en_prog_seg_t *pv = &ps[i].segs[s - 1];
+                CHECK(pv->layers == sg->layers,
+                      "%s: layer count changes at segment %d", ps[i].name, s);
+                for (uint8_t j = 0; j < sg->layers && j < pv->layers; j++) {
+                    CHECK(fabs(sg->layer[j].level_start - pv->layer[j].level_end)
+                              < 1e-9,
+                          "%s seg %d layer %d: level jumps %.4f -> %.4f",
+                          ps[i].name, s, j, pv->layer[j].level_end,
+                          sg->layer[j].level_start);
+                    CHECK(fabs(sg->layer[j].carrier_hz - pv->layer[j].carrier_hz)
+                              < 1e-9,
+                          "%s seg %d layer %d: carrier moves", ps[i].name, s, j);
+                }
+            }
+        }
+    }
+
+    /* ---- the imported suites, against the numbers they were ported from --- */
+
+    section("imported suites");
+
+    const en_program_t *xp = 0, *st1 = 0;
+    for (int i = 0; i < n; i++) {
+        if (!strcmp(ps[i].name, "Extended Practice"))      xp  = &ps[i];
+        if (!strcmp(ps[i].name, "Stage 1"))                st1 = &ps[i];
+    }
+    CHECK(xp != 0, "Extended Practice is missing");
+    CHECK(st1 != 0, "Stage 1 is missing");
+
+    if (xp) {
+        CHECK(en_program_seconds(xp) == 6000,
+              "extended practice is %u s, the source is 6000",
+              en_program_seconds(xp));
+
+        /* The source's own cue table, checked at every cue. These are the
+           numbers the port exists to reproduce; if one moves, the port is
+           wrong however good the audio sounds. */
+        const struct { double t, beat; } cues[] = {
+            {    0.0, 10.0 }, {  300.0, 10.0 }, {  900.0,  7.0 },
+            { 1800.0,  4.0 }, { 2220.0,  4.0 }, { 2400.0,  7.0 },
+            { 2700.0,  4.0 }, { 4680.0,  4.0 }, { 5100.0,  7.0 },
+            { 5940.0, 12.0 },
+        };
+        for (size_t c = 0; c < sizeof cues / sizeof cues[0]; c++) {
+            double got = en_program_beat_at(xp, cues[c].t);
+            CHECK(fabs(got - cues[c].beat) < 1e-6,
+                  "extended practice at %.0f s: %.4f Hz, source says %.4f",
+                  cues[c].t, got, cues[c].beat);
+        }
+
+        /* Two layers, and the second is 13.7 dB down through the main block —
+           the one relationship in the piece that a listener would notice. */
+        en_layer_t lay[EN_MAX_LAYERS];
+        en_noise_kind_t nk;
+        double nl;
+        uint8_t nlay = en_segs_layers_at(xp->segs, xp->n_segs, 3000.0,
+                                         xp->mode, lay, &nk, &nl);
+        CHECK(nlay == 2, "extended practice has %u layers at 50:00", nlay);
+        CHECK(fabs(lay[0].carrier_hz - 200.0) < 1e-9, "primary is not 200 Hz");
+        CHECK(fabs(lay[1].carrier_hz - 260.0) < 1e-9, "secondary is not 260 Hz");
+        CHECK(fabs(lay[1].beat_hz - 7.0) < 1e-9,
+              "the secondary layer should hold 7 Hz, got %.3f", lay[1].beat_hz);
+        double db = 20.0 * log10(lay[1].level / lay[0].level);
+        CHECK(fabs(db + 13.67) < 0.05,
+              "secondary is %.2f dB down, the source says -13.67", db);
+
+        /* Before Part B the secondary is silent, not merely quiet. */
+        en_segs_layers_at(xp->segs, xp->n_segs, 600.0, xp->mode, lay, &nk, &nl);
+        CHECK(lay[1].level == 0.0,
+              "the secondary layer sounds before 40:00 (level %.4f)",
+              lay[1].level);
+
+        /* End to end: build a segment the way the engine's stream path does and
+           render it, then look for both carriers in the output. Everything
+           above tests the table; this tests that the table reaches the audio.
+           A layer lost between the two would pass every check before this one. */
+        const uint32_t sr = 11025;
+        const uint32_t frames = sr;
+        int16_t *pcm = malloc(frames * 2 * sizeof *pcm);
+
+        en_segment_t seg;
+        memset(&seg, 0, sizeof seg);
+        seg.sample_rate = sr;
+        seg.mode = xp->mode;
+        seg.frames = frames;
+        seg.start.tone_level = 0.8;
+        seg.end.tone_level = 0.8;
+        seg.layers = en_segs_layers_at(xp->segs, xp->n_segs, 3000.0, xp->mode,
+                                       seg.lstart, &seg.noise,
+                                       &seg.start.noise_level);
+        en_segs_layers_at(xp->segs, xp->n_segs, 3001.0, xp->mode, seg.lend,
+                          &nk, &seg.end.noise_level);
+        /* No bed for this one: pink noise across the whole spectrum would sit
+           under both bins and blunt exactly what is being measured. */
+        seg.noise = EN_NOISE_NONE;
+        seg.start.noise_level = seg.end.noise_level = 0.0;
+
+        en_render_t rr;
+        en_render_init(&rr, sr, EN_NOISE_NONE, 1);
+        en_render_segment(&rr, &seg, pcm);
+
+        double m200 = bin_mag(pcm, frames, 0, sr, 200.0);
+        double m260 = bin_mag(pcm, frames, 0, sr, 260.0);
+        printf("  rendered at 50:00 — 200 Hz %.4f, 260 Hz %.4f\n", m200, m260);
+        CHECK(m200 > 0.3, "the primary carrier is not in the rendered audio");
+        CHECK(m260 > 0.05, "the secondary carrier is not in the rendered audio");
+        double rdb = 20.0 * log10(m260 / m200);
+        CHECK(fabs(rdb + 13.67) < 0.6,
+              "rendered layer balance is %.2f dB, the table says -13.67", rdb);
+
+        free(pcm);
+    }
+
+    if (st1) {
+        CHECK(en_program_seconds(st1) == 2160,
+              "stage one is %u s, the source is 2160",
+              en_program_seconds(st1));
+
+        en_layer_t lay[EN_MAX_LAYERS];
+        en_noise_kind_t nk;
+        double nl;
+        uint8_t nlay = en_segs_layers_at(st1->segs, st1->n_segs, 1500.0,
+                                         st1->mode, lay, &nk, &nl);
+        CHECK(nlay == 3, "stage one has %u layers at 25:00", nlay);
+        CHECK(fabs(lay[0].carrier_hz - 300.0) < 1e-9, "main carrier is not 300 Hz");
+        CHECK(fabs(lay[1].carrier_hz - 104.0) < 1e-9, "warm carrier is not 104 Hz");
+        CHECK(fabs(lay[2].carrier_hz - 496.0) < 1e-9, "support is not 496 Hz");
+
+        /* All three share one beat curve, which is how the source builds a
+           stage — the support layers are the same beat at another carrier. */
+        CHECK(fabs(lay[1].beat_hz - lay[0].beat_hz) < 1e-9,
+              "the warm layer carries a different beat");
+        CHECK(fabs(lay[2].beat_hz - lay[0].beat_hz) < 1e-9,
+              "the support layer carries a different beat");
+
+        /* Layer gains are normalised to the main carrier's peak amplitude, so
+           a gain of 1.0 on the warm layer means 0.045/0.070 here. */
+        en_segs_layers_at(st1->segs, st1->n_segs, 1000.0, st1->mode, lay,
+                          &nk, &nl);
+        CHECK(lay[0].level > lay[1].level && lay[1].level > lay[2].level,
+              "stage one layer balance is not main > warm > support "
+              "(%.4f, %.4f, %.4f)", lay[0].level, lay[1].level, lay[2].level);
+
+        /* And the whole mix still fits under full scale once the master gain
+           and the headroom are applied. This is what stops a three-layer sum
+           from living permanently in the soft clipper. */
+        for (int s = 0; s < st1->n_segs; s++) {
+            double sum0 = 0.0, sum1 = 0.0;
+            for (uint8_t j = 0; j < st1->segs[s].layers; j++) {
+                sum0 += st1->segs[s].layer[j].level_start;
+                sum1 += st1->segs[s].layer[j].level_end;
+            }
+            double peak = (sum0 > sum1 ? sum0 : sum1) * 0.8 * EN_HEADROOM;
+            CHECK(peak < 1.0,
+                  "stage one seg %d peaks at %.3f of full scale", s, peak);
+        }
     }
 
     section("user program parser");
@@ -833,6 +1163,7 @@ int main(void)
     test_block_duration();
     test_glide();
     test_levels();
+    test_layers();
     test_wav_header();
     test_programs();
     test_bands();

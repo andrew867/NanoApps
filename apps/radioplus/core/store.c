@@ -249,6 +249,37 @@ bool en_preset_remove(en_presets_t *p, uint32_t khz)
     return true;
 }
 
+uint8_t en_presets_simple(const en_presets_t *p, const en_preset_t **out,
+                          uint8_t cap)
+{
+    if (!p) return 0;
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < p->count && n < cap && n < EN_SIMPLE_MAX; i++) {
+        if (!p->list[i].simple) continue;
+        if (out) out[n] = &p->list[i];
+        n++;
+    }
+    return n;
+}
+
+bool en_preset_set_simple(en_presets_t *p, uint32_t khz, bool on)
+{
+    int at = en_preset_find(p, khz);
+    if (at < 0) return false;
+
+    if (!on) { p->list[at].simple = false; return true; }
+    if (p->list[at].simple) return true;      /* already there, not an error */
+
+    /* Counted rather than assumed: a preset file can be hand-edited, and one
+       that flags ten would otherwise quietly show the first six with no clue
+       why the rest never appear. */
+    uint8_t n = en_presets_simple(p, 0, EN_SIMPLE_MAX);
+    if (n >= EN_SIMPLE_MAX) return false;
+
+    p->list[at].simple = true;
+    return true;
+}
+
 void en_preset_sort(en_presets_t *p)
 {
     if (!p) return;
@@ -281,6 +312,7 @@ uint32_t en_presets_save(const en_presets_t *p, char *buf, uint32_t cap)
         en_json_hex16(&j, "pi", e->pi);
         en_json_uint(&j, "pty", e->pty);
         en_json_bool(&j, "rbds", e->rbds);
+        en_json_bool(&j, "simple", e->simple);
         en_json_obj_close(&j);
     }
     en_json_arr_close(&j);
@@ -337,6 +369,12 @@ bool en_presets_load(en_presets_t *p, const char *json, uint32_t len)
 
         f = find_key(obj, oend, "rbds");
         e.rbds = f && *f == 't';
+
+        /* Absent means false, which is what a file written before the simple
+           screen existed should mean. The struct was zeroed above, so this is
+           only ever setting it true. */
+        f = find_key(obj, oend, "simple");
+        e.simple = f && *f == 't';
 
         if (e.khz) p->list[p->count++] = e;
     }
@@ -410,6 +448,8 @@ uint32_t en_settings_save(const en_settings_t *s, char *buf, uint32_t cap)
     en_json_bool(&j, "rds", s->rds_on);
     en_json_uint(&j, "live_seconds", s->live_seconds);
     en_json_bool(&j, "ta_record", s->ta_record);
+    en_json_bool(&j, "simple_screen", s->simple_screen);
+    en_json_bool(&j, "wide_screen", s->wide_screen);
 
     /* Written as hex bytes rather than a number, because a register payload is
        a byte string of its own length and turning it into an integer would
@@ -463,6 +503,12 @@ bool en_settings_load(en_settings_t *s, const char *json, uint32_t len)
 
     v = find_key(json, end, "ta_record");
     if (v) s->ta_record = (*v == 't');
+
+    v = find_key(json, end, "simple_screen");
+    if (v) s->simple_screen = (*v == 't');
+
+    v = find_key(json, end, "wide_screen");
+    if (v) s->wide_screen = (*v == 't');
 
     const char *arr = find_key(json, end, "registers");
     if (arr && *arr == '[') {

@@ -248,6 +248,29 @@ void rp_act_ta_record(bool on)
     settings_save();
 }
 
+void rp_act_show_simple(bool on)
+{
+    rp_model.simple_screen = on;
+    settings_save();
+}
+
+void rp_act_show_wide(bool on)
+{
+    rp_model.wide_screen = on;
+    settings_save();
+}
+
+bool rp_act_simple_toggle(uint32_t khz)
+{
+    int at = en_preset_find(&rp_model.presets, khz);
+    if (at < 0) return false;
+    if (!en_preset_set_simple(&rp_model.presets, khz,
+                              !rp_model.presets.list[at].simple))
+        return false;
+    presets_save();
+    return true;
+}
+
 /* Audio. Nothing to do without a capture path, and doing nothing quietly is
    correct here: the buttons that would drive these are not shown, because the
    model reports capture and playback unavailable. */

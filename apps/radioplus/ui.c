@@ -71,8 +71,34 @@ static lv_obj_t *s_freq, *s_unit, *s_ps, *s_pty, *s_rt;
 static lv_obj_t *s_seg[14], *s_rssi_lbl, *s_stereo, *s_ta_badge;
 static lv_obj_t *s_live_fill, *s_live_lbl, *s_rec_dot, *s_rec_lbl;
 static lv_obj_t *s_band_lbl, *s_rec_btn_lbl, *s_tl_lbl, *s_tr_lbl;
+static lv_obj_t *s_clock;
+static lv_obj_t *s_keep_btn, *s_keep_lbl;
+
+/* the simple screen */
+static lv_obj_t *s_simple_grid, *s_simple_empty;
+static lv_obj_t *s_set_simple, *s_set_wide;
+static lv_obj_t *s_preset_note;
+
+/* Forward declarations, because a control on one screen now changes another:
+   flagging a preset repaints the simple screen, and turning a screen on
+   repaints the settings row and the page dots. */
+static void refresh_simple(void);
+static void refresh_presets(void);
+static void refresh_settings(void);
+static void refresh_dots(void);
+static void rebuild_order(void);
+
+/* the landscape readout */
+static lv_obj_t *s_w_freq, *s_w_unit, *s_w_clock, *s_w_date;
+static lv_obj_t *s_w_ps, *s_w_pty, *s_w_rt, *s_w_state;
+static lv_obj_t *s_w_seg[20];
 static lv_obj_t *s_live_btn, *s_live_head, *s_bar_row;
-static lv_obj_t *s_dots[RP_SCREEN_COUNT];
+/* One row of dots per swipe screen, because each screen owns its own copy.
+   Indexed [screen][dot]. Held in a table rather than found by walking a
+   screen's children looking for small objects, which is what this used to do:
+   the landscape readout has twenty 12 x 8 signal segments and that heuristic
+   was one layout change away from painting page dots onto a meter. */
+static lv_obj_t *s_dots[RP_SWIPE_MAX][RP_SWIPE_MAX];
 
 /* Dial */
 static lv_obj_t *s_dial_freq, *s_dial_grid, *s_dial_note;
@@ -216,6 +242,21 @@ static void fmt_mhz(char *out, int cap, uint32_t khz)
 }
 
 /* Milliseconds to m:ss, which is how long a recording or a buffer ever is. */
+/* The station's clock as HH:MM, or empty when no 4A group has arrived. Note
+   what is NOT done here: nothing is inferred from the device's own clock. A
+   blank means the station sends no time, and showing the device's time in its
+   place would be a different fact wearing this one's clothes. */
+static void fmt_ct(char *out, int cap, const en_rds_t *r)
+{
+    out[0] = 0;
+    if (!r->ct_valid) return;
+    put_uint(out, r->ct_hour, 2);
+    cat(out, ":", cap);
+    char m[8];
+    put_uint(m, r->ct_minute, 2);
+    cat(out, m, cap);
+}
+
 static void fmt_time(char *out, int cap, uint32_t ms)
 {
     char a[12], b[4];
@@ -230,30 +271,82 @@ static void fmt_time(char *out, int cap, uint32_t ms)
 
 /* ---- navigation ----------------------------------------------------------- */
 
-static void build_dots(lv_obj_t *parent)
-{
-    /* One dot per screen, centred. The advanced screen is not in the swipe
-       order - it is reached from settings - so it gets no dot. */
-    const int n = RP_SWIPE_COUNT;
-    const int gap = 14;
-    int x = (RP_SCREEN_W - (n - 1) * gap) / 2 - 2;
+/*
+ * The swipe order, built at run time because two of its screens are optional.
+ *
+ * Kept as an explicit list rather than as "the enum order, skipping the ones
+ * that are off": the position of a screen in the sequence is what the dots
+ * count and what a gesture steps through, and deriving that twice from two
+ * different rules is how they come to disagree.
+ */
+static rp_screen_t s_order[RP_SWIPE_MAX];
+static int         s_order_n;
 
-    for (int i = 0; i < n; i++) {
-        lv_obj_t *d = panel(parent, x + i * gap, RP_SCREEN_H - 18, 4, 4,
+static void rebuild_order(void)
+{
+    s_order_n = 0;
+    if (rp_model.simple_screen) s_order[s_order_n++] = RP_SCREEN_SIMPLE;
+    s_order[s_order_n++] = RP_SCREEN_NOW;
+    if (rp_model.wide_screen)   s_order[s_order_n++] = RP_SCREEN_WIDE;
+    s_order[s_order_n++] = RP_SCREEN_DIAL;
+    s_order[s_order_n++] = RP_SCREEN_PRESETS;
+    s_order[s_order_n++] = RP_SCREEN_LIBRARY;
+    s_order[s_order_n++] = RP_SCREEN_SETTINGS;
+}
+
+int rp_ui_swipe_count(void) { return s_order_n; }
+
+rp_screen_t rp_ui_swipe_at(int i)
+{
+    if (i < 0 || i >= s_order_n) return RP_SCREEN_NOW;
+    return s_order[i];
+}
+
+/* Where `s` sits in the sequence, or -1 if it is not in it. */
+static int swipe_pos_of(rp_screen_t s)
+{
+    for (int i = 0; i < s_order_n; i++)
+        if (s_order[i] == s) return i;
+    return -1;
+}
+
+static void build_dots(int screen, lv_obj_t *parent)
+{
+    /* RP_SWIPE_MAX of them, always. How many are actually shown depends on
+       settings and can change while the app runs, and creating them lazily
+       would mean creating widgets during a screen change. The extras are
+       hidden in refresh_dots. */
+    const int gap = 14;
+    for (int i = 0; i < RP_SWIPE_MAX; i++) {
+        lv_obj_t *d = panel(parent, i * gap, RP_SCREEN_H - 18, 4, 4,
                             C_TEXT_MUTE);
         lv_obj_set_style_radius(d, 2, 0);
-        s_dots[i] = d;
+        s_dots[screen][i] = d;
     }
 }
 
 static void refresh_dots(void)
 {
-    for (int i = 0; i < RP_SWIPE_COUNT; i++) {
-        if (!s_dots[i]) continue;
-        bool on = (i == (int)s_current);
-        lv_obj_set_style_bg_color(s_dots[i],
+    const int gap = 14;
+    const int n = s_order_n;
+    const int x0 = (RP_SCREEN_W - (n - 1) * gap) / 2 - 2;
+    const int here = swipe_pos_of(s_current);
+
+    if ((int)s_current >= RP_SWIPE_MAX) return;
+    lv_obj_t **row_dots = s_dots[(int)s_current];
+
+    for (int i = 0; i < RP_SWIPE_MAX; i++) {
+        if (!row_dots[i]) continue;
+        if (i >= n) { lv_obj_add_flag(row_dots[i], LV_OBJ_FLAG_HIDDEN); continue; }
+        lv_obj_remove_flag(row_dots[i], LV_OBJ_FLAG_HIDDEN);
+
+        bool on = (i == here);
+        /* Re-centred every time, because the row narrows when a screen is
+           turned off and dots left where they were would sit off to one side. */
+        lv_obj_set_pos(row_dots[i], x0 + i * gap, RP_SCREEN_H - 18);
+        lv_obj_set_style_bg_color(row_dots[i],
                                   lv_color_hex(on ? C_TEXT : C_TEXT_MUTE), 0);
-        lv_obj_set_size(s_dots[i], on ? 6 : 4, on ? 6 : 4);
+        lv_obj_set_size(row_dots[i], on ? 6 : 4, on ? 6 : 4);
     }
 }
 
@@ -261,17 +354,274 @@ static void on_gesture(lv_event_t *e)
 {
     (void)e;
     lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
-    int next = (int)s_current;
 
-    /* Left and right move through the screens; the advanced one is excluded
-       because it belongs to settings rather than to the main sequence. */
-    if (dir == LV_DIR_LEFT)  next++;
-    else if (dir == LV_DIR_RIGHT) next--;
+    int at = swipe_pos_of(s_current);
+    if (at < 0) return;          /* not a swipe screen; it has its own way out */
+
+    /* Left and right move through the sequence; the register screens are
+       excluded because they belong to settings rather than to it. */
+    if (dir == LV_DIR_LEFT)  at++;
+    else if (dir == LV_DIR_RIGHT) at--;
     else return;
 
-    if (next < 0) next = 0;
-    if (next > RP_SWIPE_COUNT - 1) next = RP_SWIPE_COUNT - 1;
-    rp_ui_show((rp_screen_t)next);
+    if (at < 0) at = 0;
+    if (at > s_order_n - 1) at = s_order_n - 1;
+    rp_ui_show(rp_ui_swipe_at(at));
+}
+
+/* ---- the simple screen ---------------------------------------------------
+ *
+ * Six buttons and nothing else. Not a cut-down version of Now Playing - a
+ * different answer to a different question. Everything else in this app is for
+ * finding out what the radio is doing; this is for pressing the station you
+ * always press without reading anything.
+ *
+ * Which six is the user's choice, made on the Presets screen, and it is a
+ * choice rather than "the first six" precisely because the interesting
+ * presets are rarely the lowest frequencies.
+ */
+
+static void on_simple_pick(lv_event_t *e)
+{
+    rp_act_tune((uint32_t)(uintptr_t)lv_event_get_user_data(e));
+}
+
+static void build_simple(void)
+{
+    lv_obj_t *s = s_screen[RP_SCREEN_SIMPLE];
+
+    lv_obj_t *cap = label(s, "PRESETS", F_CAPTION, C_TEXT_MUTE);
+    lv_obj_set_pos(cap, MARGIN, 10);
+    hairline(s, 32);
+
+    s_simple_grid = panel(s, 0, 40, RP_SCREEN_W, RP_SCREEN_H - 66, C_BG);
+
+    s_simple_empty = para(s, "", F_BODY, C_TEXT_MUTE, CONTENT_W);
+    lv_obj_set_pos(s_simple_empty, MARGIN, 150);
+}
+
+static void refresh_simple(void)
+{
+    lv_obj_clean(s_simple_grid);
+
+    const en_preset_t *pick[EN_SIMPLE_MAX];
+    uint8_t n = en_presets_simple(&rp_model.presets, pick, EN_SIMPLE_MAX);
+
+    if (!n) {
+        lv_label_set_text(s_simple_empty,
+            "No stations chosen yet.\n\n"
+            "On the Presets screen, tap the dot beside a station to put it "
+            "here.");
+        return;
+    }
+    lv_label_set_text(s_simple_empty, "");
+
+    /* Two columns of 104, three rows of 100. Every target is far larger than
+       the 44 px minimum, which is the entire point of the screen. */
+    const int bw = 104, bh = 100, gap = 8;
+    char buf[64];
+
+    for (uint8_t i = 0; i < n; i++) {
+        int col = i % 2, rowi = i / 2;
+        int x = MARGIN + col * (bw + gap);
+        int y = 8 + rowi * (bh + gap);
+
+        bool tuned = (pick[i]->khz == rp_model.khz);
+
+        lv_obj_t *b = panel(s_simple_grid, x, y, bw, bh,
+                            tuned ? C_SURFACE_2 : C_SURFACE);
+        lv_obj_set_style_radius(b, 4, 0);
+        lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(b, on_simple_pick, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t)pick[i]->khz);
+
+        /* The tuned one is marked by a bar rather than only by its fill: a
+           slightly lighter panel is not a difference you can see across a
+           room, which is the distance this screen is designed for. */
+        if (tuned) panel(b, 0, 0, bw, 3, C_SIGNAL);
+
+        fmt_mhz(buf, sizeof buf, pick[i]->khz);
+        lv_obj_t *f = label(b, buf, F_STATION, C_TEXT);
+        lv_obj_set_style_text_align(f, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(f, bw);
+        lv_obj_set_pos(f, 0, 22);
+
+        lv_obj_t *nm = label(b, pick[i]->name[0] ? pick[i]->name : "",
+                             F_CAPTION, C_RDS);
+        lv_obj_set_style_text_align(nm, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_size(nm, bw, 20);
+        lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+        lv_obj_set_pos(nm, 0, 58);
+    }
+}
+
+/* ---- the landscape readout -----------------------------------------------
+ *
+ * Turn the device counter-clockwise - home button to the right - and this
+ * reads the long way: the frequency and the station's own clock across the
+ * top, its name under them, and the radio text given the whole width, which
+ * is the one thing a 240 px portrait column can never do well. Sixty-four
+ * characters of radio text is four cramped lines there and two comfortable
+ * ones here.
+ *
+ * The DISPLAY is not rotated. The framebuffer, the touch mapping and every
+ * other screen are exactly as they were; only the items on this screen turn.
+ * That is also the only affordable way to do it - rotating one full-screen
+ * layer would need a 432 x 240 x 4 buffer, 414 KB out of a 640 KB LVGL heap -
+ * and it means the cost is proportional to the text actually shown rather
+ * than to the whole panel.
+ *
+ * Everything below is positioned in LANDSCAPE coordinates: x along the long
+ * edge, y across it, origin at the top-left as you hold it turned. The two
+ * helpers convert. Getting that conversion wrong in one place and right in
+ * another is the whole risk here, so nothing on this screen is positioned by
+ * hand.
+ */
+
+#define WIDE_W RP_SCREEN_H      /* 432 across the long edge */
+#define WIDE_H RP_SCREEN_W      /* 240 across the short one */
+
+/* Landscape rect -> portrait rect. A rectangle turned ninety degrees is still
+   an axis-aligned rectangle with its sides swapped, so panels need no
+   transform at all - only text does. */
+static void wide_box(int lx, int ly, int lw, int lh,
+                     int *px, int *py, int *pw, int *ph)
+{
+    const int lcx = lx + lw / 2, lcy = ly + lh / 2;
+    *pw = lh;
+    *ph = lw;
+    *px = RP_SCREEN_W - lcy - lh / 2;
+    *py = lcx - lw / 2;
+}
+
+static lv_obj_t *wide_panel(lv_obj_t *parent, int lx, int ly, int lw, int lh,
+                            uint32_t colour)
+{
+    int px, py, pw, ph;
+    wide_box(lx, ly, lw, lh, &px, &py, &pw, &ph);
+    return panel(parent, px, py, pw, ph, colour);
+}
+
+/* A label laid out in landscape and drawn turned. The object keeps its natural
+   horizontal box - so wrapping, eliding and alignment all work normally - and
+   only the drawing is rotated, about the box's own centre. */
+static lv_obj_t *wide_label(lv_obj_t *parent, int lx, int ly, int lw, int lh,
+                            const char *txt, const lv_font_t *f, uint32_t col)
+{
+    const int lcx = lx + lw / 2, lcy = ly + lh / 2;
+
+    lv_obj_t *o = label(parent, txt, f, col);
+    lv_obj_set_size(o, lw, lh);
+    lv_obj_set_pos(o, RP_SCREEN_W - lcy - lw / 2, lcx - lh / 2);
+
+    lv_obj_set_style_transform_pivot_x(o, lw / 2, 0);
+    lv_obj_set_style_transform_pivot_y(o, lh / 2, 0);
+    lv_obj_set_style_transform_rotation(o, 900, 0);   /* tenths of a degree */
+    return o;
+}
+
+static void build_wide(void)
+{
+    lv_obj_t *s = s_screen[RP_SCREEN_WIDE];
+
+    /* The frequency, given the height it can only have this way round. */
+    s_w_freq = wide_label(s, 16, 14, 220, 54, "--.-", F_FREQ, C_TEXT);
+    s_w_unit = wide_label(s, 16, 68, 220, 20, "MHz", F_CAPTION, C_TEXT_MUTE);
+
+    /* The station's clock, from group 4A, at the same weight as the
+       frequency - it is the other number you would look across a room to
+       read. Blank when the station sends no time. */
+    s_w_clock = wide_label(s, 250, 14, 166, 54, "", F_FREQ, C_RDS);
+    lv_obj_set_style_text_align(s_w_clock, LV_TEXT_ALIGN_RIGHT, 0);
+
+    s_w_date = wide_label(s, 250, 68, 166, 20, "", F_CAPTION, C_TEXT_MUTE);
+    lv_obj_set_style_text_align(s_w_date, LV_TEXT_ALIGN_RIGHT, 0);
+
+    wide_panel(s, 16, 94, WIDE_W - 32, 1, C_HAIRLINE);
+
+    s_w_ps = wide_label(s, 16, 100, 240, 28, "", F_STATION, C_RDS);
+    s_w_pty = wide_label(s, 260, 106, 156, 20, "", F_CAPTION, C_TEXT_DIM);
+    lv_obj_set_style_text_align(s_w_pty, LV_TEXT_ALIGN_RIGHT, 0);
+
+    /*
+     * Radio text, across the whole long edge and given three lines.
+     *
+     * Two at 16 pt was the first attempt and it clipped: 400 px of this face
+     * holds about thirty-two characters, so a full 64-character message needs
+     * more than two lines and the tail was simply cut off. Three lines of the
+     * caption face hold the longest message the standard allows with room to
+     * spare, which is the point of having the long edge at all.
+     */
+    s_w_rt = wide_label(s, 16, 134, WIDE_W - 32, 58, "", F_CAPTION, C_TEXT_DIM);
+    lv_label_set_long_mode(s_w_rt, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_line_space(s_w_rt, 3, 0);
+
+    /* Signal, as plain rectangles - no transform needed for those. */
+    for (int i = 0; i < 20; i++)
+        s_w_seg[i] = wide_panel(s, 16 + i * 12, 206, 8, 12, C_SURFACE_2);
+
+    s_w_state = wide_label(s, 280, 202, 136, 20, "", F_CAPTION, C_TEXT_MUTE);
+    lv_obj_set_style_text_align(s_w_state, LV_TEXT_ALIGN_RIGHT, 0);
+}
+
+static void refresh_wide(void)
+{
+    char buf[96], n[16];
+
+    fmt_mhz(buf, sizeof buf, rp_model.khz);
+    lv_label_set_text(s_w_freq, rp_model.khz ? buf : "--.-");
+
+    fmt_ct(buf, sizeof buf, &rp_model.rds);
+    lv_label_set_text(s_w_clock, buf);
+
+    /* The date comes from the same group as the time, so it is shown only
+       when that group has arrived - never reconstructed from anything else. */
+    buf[0] = 0;
+    if (rp_model.rds.ct_valid) {
+        put_uint(buf, rp_model.rds.ct_year, 0);
+        cat(buf, "-", sizeof buf);
+        put_uint(n, rp_model.rds.ct_month, 2);
+        cat(buf, n, sizeof buf);
+        cat(buf, "-", sizeof buf);
+        put_uint(n, rp_model.rds.ct_day, 2);
+        cat(buf, n, sizeof buf);
+    }
+    lv_label_set_text(s_w_date, buf);
+
+    lv_label_set_text(s_w_ps, rp_model.rds.ps_valid ? rp_model.rds.ps : "");
+
+    buf[0] = 0;
+    if (rp_model.rds.pi_valid)
+        cat(buf, en_rds_pty_name(rp_model.rds.pty, rp_model.rds.rbds),
+            sizeof buf);
+    lv_label_set_text(s_w_pty, buf);
+
+    if (!rp_model.tuner_ok && rp_model.tuner_note) {
+        lv_label_set_text(s_w_rt, rp_model.tuner_note);
+        lv_obj_set_style_text_color(s_w_rt, lv_color_hex(C_TA), 0);
+    } else {
+        lv_label_set_text(s_w_rt, rp_model.rds.rt_valid ? rp_model.rds.rt : "");
+        lv_obj_set_style_text_color(s_w_rt, lv_color_hex(C_TEXT_DIM), 0);
+    }
+
+    int lit = (int)((rp_model.rssi * 20u) / 96u);
+    if (lit > 20) lit = 20;
+    for (int i = 0; i < 20; i++) {
+        uint32_t c = C_SURFACE_2;
+        if (i < lit) c = (i < 5) ? C_TA : C_SIGNAL;
+        lv_obj_set_style_bg_color(s_w_seg[i], lv_color_hex(c), 0);
+    }
+
+    /* One line for everything that is a state rather than a reading. */
+    buf[0] = 0;
+    if (rp_model.recording) cat(buf, "REC  ", sizeof buf);
+    if (rp_model.rds.ta)    cat(buf, "TRAFFIC  ", sizeof buf);
+    if (rp_model.stereo)    cat(buf, "STEREO", sizeof buf);
+    lv_label_set_text(s_w_state, buf);
+    lv_obj_set_style_text_color(s_w_state,
+                                lv_color_hex(rp_model.recording ? C_REC
+                                                                : C_TEXT_MUTE),
+                                0);
 }
 
 /* ---- Now Playing ---------------------------------------------------------- */
@@ -305,6 +655,19 @@ static void on_middle(lv_event_t *e)
 }
 
 static void on_go_live(lv_event_t *e) { (void)e; rp_act_play_live(); }
+
+/* How long the KEEP button says it saved something, in refresh ticks. The
+   model gains a recording in the library and nothing else changes on this
+   screen, so without a word here the tap looks like it did nothing. */
+static uint8_t s_kept_for;
+
+static void on_keep(lv_event_t *e)
+{
+    (void)e;
+    if (!rp_model.capture_ok || !rp_model.live_ms) return;
+    rp_act_save_live(rp_model.live_ms);
+    s_kept_for = 8;
+}
 
 /* Tapping the buffer bar seeks to that point, which is how every buffered
    radio behaves and saves inventing a control for entering the scrub. */
@@ -342,6 +705,20 @@ static void build_now(void)
        element on it. */
     s_band_lbl = label(s, "FM", F_CAPTION, C_TEXT_MUTE);
     lv_obj_set_pos(s_band_lbl, MARGIN, 10);
+
+    /* The station's own clock, from group 4A. It was being decoded and thrown
+       away. Shown only once a 4A has actually arrived, so an empty space here
+       means the station sends no time rather than that the time is midnight.
+
+       Right-aligned rather than centred: centred put it straight through
+       "Americas RBDS", and the band label is the one thing on this strip whose
+       width depends on data. It shares the slot with the recording readout and
+       yields to it - see refresh_now - because while you are recording, that
+       the recording is running matters more than what time it is. */
+    s_clock = label(s, "", F_CAPTION, C_TEXT_DIM);
+    lv_obj_set_style_text_align(s_clock, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_width(s_clock, 56);
+    lv_obj_set_pos(s_clock, RP_SCREEN_W - MARGIN - 56, 10);
 
     s_rec_dot = panel(s, RP_SCREEN_W - MARGIN - 52, 14, 7, 7, C_REC);
     lv_obj_set_style_radius(s_rec_dot, 4, 0);
@@ -409,10 +786,31 @@ static void build_now(void)
     s_tl_lbl = label(s, "", F_CAPTION, C_LIVE);
     lv_obj_set_pos(s_tl_lbl, MARGIN, 328);
 
+    /* Narrow enough to clear both buttons to its right. It used to stop only
+       at LIVE; KEEP now sits beside LIVE and the readout ran underneath it. */
     s_live_lbl = label(s, "", F_CAPTION, C_TEXT_MUTE);
     lv_obj_set_style_text_align(s_live_lbl, LV_TEXT_ALIGN_RIGHT, 0);
-    lv_obj_set_width(s_live_lbl, CONTENT_W - 52);
+    lv_obj_set_width(s_live_lbl, CONTENT_W - 108);
     lv_obj_set_pos(s_live_lbl, MARGIN, 328);
+
+    /*
+     * Keep the buffer. rp_act_save_live has worked since the capture backend
+     * landed and nothing ever called it, so "record the thing that already
+     * happened" - the one feature a timeshift buffer exists for - was written
+     * and unreachable.
+     *
+     * It saves the whole buffer rather than asking how much. The buffer is
+     * bounded at a few minutes by the setting that allocated it, and a length
+     * picker is a decision to make afterwards, in a file manager, not in the
+     * two seconds before the moment falls off the end.
+     */
+    s_keep_btn = panel(s, RP_SCREEN_W - MARGIN - 100, 322, 50, 26, C_SURFACE_2);
+    lv_obj_set_style_radius(s_keep_btn, 3, 0);
+    lv_obj_add_flag(s_keep_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_keep_btn, on_keep, LV_EVENT_CLICKED, 0);
+    lv_obj_set_ext_click_area(s_keep_btn, 12);
+    s_keep_lbl = label(s_keep_btn, "KEEP", F_CAPTION, C_REC);
+    lv_obj_center(s_keep_lbl);
 
     /* Shown only when it would do something. A LIVE button that is already
        live is a button that teaches you it does nothing. */
@@ -473,6 +871,9 @@ static void refresh_now(void)
     cat(buf, "  ", sizeof buf);
     cat(buf, rp_model.rds.rbds ? "RBDS" : "RDS", sizeof buf);
     lv_label_set_text(s_band_lbl, buf);
+
+    fmt_ct(buf, sizeof buf, &rp_model.rds);
+    lv_label_set_text(s_clock, rp_model.recording ? "" : buf);
 
     lv_label_set_text(s_ps, rp_model.rds.ps_valid ? rp_model.rds.ps : "");
 
@@ -586,6 +987,23 @@ static void refresh_now(void)
         lv_obj_add_flag(s_live_btn, LV_OBJ_FLAG_HIDDEN);
     else
         lv_obj_remove_flag(s_live_btn, LV_OBJ_FLAG_HIDDEN);
+
+    /* KEEP needs something in the buffer to keep, and is pointless while a
+       recording is already running - that is capturing the same audio. */
+    if (rp_model.capture_ok && rp_model.live_ms && !rp_model.recording &&
+        !rp_model.play_file)
+        lv_obj_remove_flag(s_keep_btn, LV_OBJ_FLAG_HIDDEN);
+    else
+        lv_obj_add_flag(s_keep_btn, LV_OBJ_FLAG_HIDDEN);
+
+    if (s_kept_for) {
+        s_kept_for--;
+        lv_label_set_text(s_keep_lbl, "SAVED");
+        lv_obj_set_style_text_color(s_keep_lbl, lv_color_hex(C_LIVE), 0);
+    } else {
+        lv_label_set_text(s_keep_lbl, "KEEP");
+        lv_obj_set_style_text_color(s_keep_lbl, lv_color_hex(C_REC), 0);
+    }
 
     /* No capture means no buffer to scrub and nothing to record. The strip and
        the record button are hidden rather than left as controls that quietly
@@ -743,6 +1161,21 @@ static void on_preset_pick(lv_event_t *e)
     rp_ui_show(RP_SCREEN_NOW);
 }
 
+/* How long the "simple screen is full" note stays up, in refresh ticks. */
+static uint8_t s_simple_full_for;
+
+static void on_preset_simple(lv_event_t *e)
+{
+    uint32_t khz = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+
+    /* A refusal here means the grid is full, and it has to be said: a tick box
+       that silently declines to tick is the most confusing control there is. */
+    if (!rp_act_simple_toggle(khz)) s_simple_full_for = 10;
+
+    refresh_presets();
+    refresh_simple();
+}
+
 static void build_presets(void)
 {
     lv_obj_t *s = s_screen[RP_SCREEN_PRESETS];
@@ -750,10 +1183,16 @@ static void build_presets(void)
     lv_obj_set_pos(cap, MARGIN, 10);
     hairline(s, 32);
 
-    s_preset_list = panel(s, 0, 40, RP_SCREEN_W, RP_SCREEN_H - 66, C_BG);
+    s_preset_list = panel(s, 0, 40, RP_SCREEN_W, RP_SCREEN_H - 84, C_BG);
     lv_obj_add_flag(s_preset_list, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scroll_dir(s_preset_list, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(s_preset_list, LV_SCROLLBAR_MODE_OFF);
+
+    /* A line under the list for the one thing this screen has to say back. */
+    s_preset_note = label(s, "", F_CAPTION, C_TA);
+    lv_obj_set_size(s_preset_note, CONTENT_W, 18);
+    lv_label_set_long_mode(s_preset_note, LV_LABEL_LONG_DOT);
+    lv_obj_set_pos(s_preset_note, MARGIN, RP_SCREEN_H - 40);
 }
 
 static void refresh_presets(void)
@@ -779,21 +1218,46 @@ static void refresh_presets(void)
            right - so the column of numbers scans vertically. */
         fmt_mhz(buf, sizeof buf, p->khz);
         lv_obj_t *f = label(r, buf, F_TITLE, C_TEXT);
-        lv_obj_set_pos(f, MARGIN, 12);
+        lv_obj_set_pos(f, MARGIN + 34, 12);
 
         lv_obj_t *nm = label(r, p->name[0] ? p->name : "", F_BODY, C_RDS);
         lv_obj_set_style_text_align(nm, LV_TEXT_ALIGN_RIGHT, 0);
-        lv_obj_set_width(nm, CONTENT_W - 76);
-        lv_obj_set_pos(nm, MARGIN + 76, 8);
+        lv_obj_set_width(nm, CONTENT_W - 110);
+        lv_obj_set_pos(nm, MARGIN + 110, 8);
 
         lv_obj_t *ty = label(r, en_rds_pty_name(p->pty, p->rbds),
                              F_CAPTION, C_TEXT_MUTE);
         lv_obj_set_style_text_align(ty, LV_TEXT_ALIGN_RIGHT, 0);
-        lv_obj_set_width(ty, CONTENT_W - 76);
-        lv_obj_set_pos(ty, MARGIN + 76, 30);
+        lv_obj_set_width(ty, CONTENT_W - 110);
+        lv_obj_set_pos(ty, MARGIN + 110, 30);
+
+        /*
+         * The simple-screen mark, on its own target at the left of the row.
+         *
+         * A separate object rather than a gesture on the row, because the row
+         * already means "tune to this" and a long press that sometimes means
+         * something else is a control you have to be told about. This one is
+         * visible whether or not it is set, so the affordance is there before
+         * you know what it does.
+         */
+        lv_obj_t *mark = panel(r, 0, 4, 34, 44, C_BG);
+        lv_obj_add_flag(mark, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(mark, on_preset_simple, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t)p->khz);
+        lv_obj_t *dot = panel(mark, 11, 17, 11, 11,
+                              p->simple ? C_SIGNAL : C_SURFACE_2);
+        lv_obj_set_style_radius(dot, 6, 0);
 
         panel(r, MARGIN, 51, CONTENT_W, 1, C_HAIRLINE);
         y += 52;
+    }
+
+    /* Only shown after a refusal, and only for a few seconds. */
+    if (s_simple_full_for) {
+        s_simple_full_for--;
+        lv_label_set_text(s_preset_note, "Simple screen is full - six at most");
+    } else {
+        lv_label_set_text(s_preset_note, "");
     }
 }
 
@@ -853,6 +1317,24 @@ static void on_ta_toggle(lv_event_t *e)
 {
     (void)e;
     rp_act_ta_record(!rp_model.ta_record);
+}
+
+static void on_simple_toggle(lv_event_t *e)
+{
+    (void)e;
+    rp_act_show_simple(!rp_model.simple_screen);
+    rebuild_order();
+    refresh_settings();
+    refresh_dots();
+}
+
+static void on_wide_toggle(lv_event_t *e)
+{
+    (void)e;
+    rp_act_show_wide(!rp_model.wide_screen);
+    rebuild_order();
+    refresh_settings();
+    refresh_dots();
 }
 
 static void on_open_advanced(lv_event_t *e)
@@ -951,6 +1433,19 @@ static void build_settings(void)
     lv_obj_set_pos(s_set_ta, MARGIN, 14);
     y += 48;
 
+    /* The two optional screens. Both add a page to the swipe sequence, which
+       is why they are a setting and not always on: a sequence you have learned
+       should not grow a page because someone shipped a feature. */
+    r = setting_row(s, y, 48, "Simple screen", 0, on_simple_toggle);
+    s_set_simple = row_value(r, C_SIGNAL);
+    lv_obj_set_pos(s_set_simple, MARGIN, 14);
+    y += 48;
+
+    r = setting_row(s, y, 48, "Landscape readout", 0, on_wide_toggle);
+    s_set_wide = row_value(r, C_SIGNAL);
+    lv_obj_set_pos(s_set_wide, MARGIN, 14);
+    y += 48;
+
     r = setting_row(s, y, 48, "Advanced", 0, on_open_advanced);
     lv_obj_t *chev = label(r, LV_SYMBOL_RIGHT, F_CAPTION, C_TEXT_MUTE);
     lv_obj_set_style_text_align(chev, LV_TEXT_ALIGN_RIGHT, 0);
@@ -975,6 +1470,12 @@ static void refresh_settings(void)
                       rp_model.capture_backend ? rp_model.capture_backend
                                                : "not started");
     lv_label_set_text(s_set_ta, rp_model.ta_record ? "On" : "Off");
+    lv_label_set_text(s_set_simple, rp_model.simple_screen ? "On" : "Off");
+    lv_obj_set_style_text_color(s_set_simple,
+        lv_color_hex(rp_model.simple_screen ? C_SIGNAL : C_TEXT_MUTE), 0);
+    lv_label_set_text(s_set_wide, rp_model.wide_screen ? "On" : "Off");
+    lv_obj_set_style_text_color(s_set_wide,
+        lv_color_hex(rp_model.wide_screen ? C_SIGNAL : C_TEXT_MUTE), 0);
     lv_obj_set_style_text_color(s_set_ta,
                                 lv_color_hex(rp_model.ta_record ? C_TA
                                                                 : C_TEXT_MUTE),
@@ -1386,7 +1887,9 @@ void rp_ui_build_all(void)
 {
     for (int i = 0; i < RP_SCREEN_COUNT; i++) build_screen_shell((rp_screen_t)i);
 
+    build_simple();
     build_now();
+    build_wide();
     build_dial();
     build_presets();
     build_library();
@@ -1394,15 +1897,18 @@ void rp_ui_build_all(void)
     build_advanced();
     build_register();
 
-    /* Dots go on the screens that are in the swipe order. */
-    for (int i = 0; i < RP_SWIPE_COUNT; i++) {
-        rp_screen_t save = s_current;
-        s_current = (rp_screen_t)i;
-        build_dots(s_screen[i]);
-        s_current = save;
-    }
+    rebuild_order();
 
+    /* Dots go on every screen that can be in the swipe order, including the
+       optional ones - which are built whether or not they are currently in
+       it, so that turning one on is a settings change and not a construction
+       job in the middle of a gesture. */
+    for (int i = 0; i < RP_SWIPE_MAX; i++)
+        build_dots(i, s_screen[i]);
+
+    refresh_simple();
     refresh_now();
+    refresh_wide();
     refresh_dial();
     refresh_presets();
     refresh_library();
@@ -1429,21 +1935,8 @@ void rp_ui_show(rp_screen_t which)
     if (which >= RP_SCREEN_COUNT || !s_screen[which]) return;
     s_current = which;
 
-    /* Rebuild the dots on the screen being shown, since each screen owns its
-       own copy of them. */
-    if (which < RP_SWIPE_COUNT) {
-        for (int i = 0; i < RP_SWIPE_COUNT; i++) s_dots[i] = 0;
-        /* The dots for this screen were created as its last children; find
-           them by walking backwards rather than caching per screen. */
-        uint32_t n = lv_obj_get_child_count(s_screen[which]);
-        int found = 0;
-        for (uint32_t k = n; k-- > 0 && found < RP_SWIPE_COUNT;) {
-            lv_obj_t *c = lv_obj_get_child(s_screen[which], (int32_t)k);
-            if (lv_obj_get_height(c) <= 6 && lv_obj_get_width(c) <= 6)
-                s_dots[RP_SWIPE_COUNT - 1 - found++] = c;
-        }
-        refresh_dots();
-    }
+    /* Restyle this screen's own row of dots. */
+    if (which < RP_SWIPE_MAX) refresh_dots();
 
     lv_screen_load(s_screen[which]);
 }
@@ -1453,7 +1946,9 @@ rp_screen_t rp_ui_current(void) { return s_current; }
 void rp_ui_tick(void)
 {
     switch (s_current) {
+    case RP_SCREEN_SIMPLE:   refresh_simple();   break;
     case RP_SCREEN_NOW:      refresh_now();      break;
+    case RP_SCREEN_WIDE:     refresh_wide();     break;
     case RP_SCREEN_DIAL:     refresh_dial();     break;
     case RP_SCREEN_PRESETS:  refresh_presets();  break;
     case RP_SCREEN_LIBRARY:  refresh_library();  break;
