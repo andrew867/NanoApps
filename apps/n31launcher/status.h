@@ -20,7 +20,11 @@
 typedef struct {
     bool have_battery;
     int  battery_pct;          /* 0-100 */
-    bool charging;
+    bool charging;             /* current is going into the cell */
+    /* A cable is attached, whether or not it is charging. Separate from
+       `charging` because a full battery on a plugged-in cable reports
+       "Not charging", and the icon is meant to say there is a cable. */
+    bool plugged;
     int  millivolts;           /* 0 when unknown */
 
     /* Present means the controller exists; up means it answered. They differ

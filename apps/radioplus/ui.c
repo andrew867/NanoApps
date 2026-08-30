@@ -1916,6 +1916,81 @@ void rp_ui_build_all(void)
     refresh_advanced();
 }
 
+/* ---- the boot screen ------------------------------------------------------ */
+
+/*
+ * Deliberately built by hand rather than through build_screen_shell and the
+ * rest. It has to exist before anything else does - that is its entire job -
+ * and anything it shared with the real screens would be one more thing that
+ * has to work before the first pixel appears.
+ */
+static lv_obj_t *s_boot, *s_boot_step, *s_boot_fail, *s_boot_dots;
+static uint8_t   s_boot_n;
+
+void rp_ui_boot(const char *step)
+{
+    if (!s_boot) {
+        s_boot = lv_obj_create(NULL);
+        flat(s_boot, C_BG);
+        lv_obj_remove_flag(s_boot, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *name = label(s_boot, "Radio+", F_STATION, C_TEXT);
+        lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(name, CONTENT_W);
+        lv_obj_set_pos(name, MARGIN, 150);
+
+        /* A rule under the name, so the screen reads as a screen rather than
+           as two labels that happen to be there. */
+        panel(s_boot, MARGIN + 60, 190, CONTENT_W - 120, 1, C_HAIRLINE);
+
+        s_boot_step = label(s_boot, "", F_CAPTION, C_TEXT_DIM);
+        lv_obj_set_style_text_align(s_boot_step, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_size(s_boot_step, CONTENT_W, 20);
+        lv_label_set_long_mode(s_boot_step, LV_LABEL_LONG_DOT);
+        lv_obj_set_pos(s_boot_step, MARGIN, 206);
+
+        /* Whatever went wrong first, kept under the running step. */
+        s_boot_fail = label(s_boot, "", F_CAPTION, C_TA);
+        lv_obj_set_style_text_align(s_boot_fail, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_size(s_boot_fail, CONTENT_W, 36);
+        lv_label_set_long_mode(s_boot_fail, LV_LABEL_LONG_WRAP);
+        lv_obj_set_pos(s_boot_fail, MARGIN, 232);
+
+        /* Progress without a percentage. There is no way to know how long the
+           tuner will take, and a bar that lies about it is worse than a row of
+           dots that only claims something is still happening. */
+        s_boot_dots = label(s_boot, "", F_CAPTION, C_SIGNAL);
+        lv_obj_set_style_text_align(s_boot_dots, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(s_boot_dots, CONTENT_W);
+        lv_obj_set_pos(s_boot_dots, MARGIN, 280);
+
+        lv_screen_load(s_boot);
+    }
+
+    if (step) lv_label_set_text(s_boot_step, step);
+
+    if (s_boot_n < 12) s_boot_n++;
+    char dots[16];
+    uint8_t i = 0;
+    for (; i < s_boot_n && i < 12; i++) dots[i] = '.';
+    dots[i] = 0;
+    lv_label_set_text(s_boot_dots, dots);
+
+    /* Synchronous. The caller is about to block for seconds inside a driver,
+       and a frame queued behind that is a frame nobody sees. */
+    lv_refr_now(NULL);
+}
+
+void rp_ui_boot_failed(const char *what)
+{
+    if (!s_boot_fail || !what) return;
+    /* Only the first one. Later failures are usually consequences of it, and
+       the screen has room for the cause rather than the cascade. */
+    if (lv_label_get_text(s_boot_fail)[0]) return;
+    lv_label_set_text(s_boot_fail, what);
+    lv_refr_now(NULL);
+}
+
 void rp_ui_init(void)
 {
     /* Re-theme first. The default theme's blue would look like a different

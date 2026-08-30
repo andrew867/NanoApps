@@ -59,4 +59,22 @@ bool n31_fbcon_reassert(void);
 /* Reattach whatever detach took, if anything. Safe to call unconditionally. */
 void n31_fbcon_restore(void);
 
+/*
+ * Is some other process drawing to the framebuffer?
+ *
+ * The launcher already stops drawing while it has a child, but it is not
+ * always the parent: an app started over ssh has no relationship to it at all,
+ * and then two programs write the same pixels and the launcher shows through
+ * whatever the app is drawing.
+ *
+ * There is no owner to ask, so this looks: /proc/<pid>/fd for a link to the
+ * framebuffer device, skipping our own. Costs a readdir per process and is
+ * polled at a couple of hertz, which is nothing next to painting a frame.
+ *
+ * A false negative just means the old behaviour. A false positive means the
+ * launcher goes quiet for a moment, which is why it only counts a process that
+ * genuinely holds the device open.
+ */
+bool n31_fbcon_foreign_owner(void);
+
 #endif /* N31_LAUNCHER_FBCON_H */

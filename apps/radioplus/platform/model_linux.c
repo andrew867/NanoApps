@@ -177,8 +177,33 @@ static void library_scan(void)
 
 /* ---- startup -------------------------------------------------------------- */
 
+/* Where bring-up reports to. Null until something sets it, and every call is
+   guarded, so nothing here depends on a UI existing. */
+static rp_progress_t s_prog;
+
+void rp_model_set_progress(const rp_progress_t *p)
+{
+    if (p) {
+        s_prog = *p;
+    } else {
+        s_prog.step = 0;
+        s_prog.failed = 0;
+    }
+}
+
+static void step(const char *what)
+{
+    if (s_prog.step) s_prog.step(what);
+}
+
+static void failed(const char *why)
+{
+    if (s_prog.failed) s_prog.failed(why);
+}
+
 static void bring_up(void)
 {
+    step("reading settings");
     paths_init();
 
     settings_load();
@@ -191,6 +216,7 @@ static void bring_up(void)
     rp_model.rds_on = s_settings.rds_on;
     en_rds_init(&rp_model.rds, rp_model.region ? rp_model.region->rbds : true);
 
+    step("tuner init");
     en_tuner_err_t te = en_tuner_init();
     rp_model.backend = en_tuner_backend();
     rp_model.tuner_ok = (te == EN_TUNER_OK);
@@ -223,7 +249,9 @@ static void bring_up(void)
     /* And the other half of the audio path. Capture clocks IIS2; the player
        carries what arrives there to the headphones on IIS0. Without it the
        radio is silent however well it is tuned. */
+    step("audio out");
     rp_model.play_ok = (en_play_start() == EN_PLAY_OK);
+    if (!rp_model.play_ok) failed("no playback device");
     rp_model.ta_record = s_settings.ta_record;
     rp_model.simple_screen = s_settings.simple_screen;
     rp_model.wide_screen = s_settings.wide_screen;

@@ -78,6 +78,21 @@ extern rp_model_t rp_model;
    round trip through a driver and there is nothing to see at 60 Hz. */
 void rp_model_refresh(void);
 
+/*
+ * Called as each stage of bring-up begins, and again with a reason when one
+ * fails. Set before the first rp_model_refresh, which is what does the work.
+ *
+ * A hook rather than a direct call into the UI because core and platform know
+ * nothing about screens - the host preview has no bring-up to report and the
+ * device build should not gain a UI dependency to say what it is doing.
+ */
+typedef struct {
+    void (*step)(const char *what);
+    void (*failed)(const char *why);
+} rp_progress_t;
+
+void rp_model_set_progress(const rp_progress_t *p);
+
 /* Actions the UI invokes. Implemented per platform. */
 void rp_act_tune(uint32_t khz);
 void rp_act_step(bool up);

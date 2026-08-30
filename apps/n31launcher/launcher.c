@@ -88,6 +88,11 @@
    UI for the rest of the session. */
 #define FBCON_MS 2000
 
+/* How often to ask whether another process has the framebuffer. Slower than
+   the console check because it walks /proc, and an app appearing half a second
+   late to the launcher's notice costs nothing. */
+#define FOREIGN_MS 500
+
 /*
  * How long to wait before trying the volume again after a failure, and how far
  * to back off. The helper escalates internally - load, recover, BPB fallback,
@@ -614,6 +619,8 @@ int main(int argc, char **argv)
     uint32_t last_status = millis();
     uint32_t last_tilt = millis();
     uint32_t last_fbcon = millis();
+    uint32_t last_foreign = millis();
+    bool     foreign = false;
 
     while (!s_quit) {
         pump_keys();
@@ -667,6 +674,35 @@ int main(int argc, char **argv)
            There is no compositor here, and two writers would fight over every
            frame. */
         if (s_child) {
+            usleep(FRAME_MS * 1000u);
+            continue;
+        }
+
+        /*
+         * The same rule for an app the launcher did not start.
+         *
+         * Something run over ssh is not our child, so none of the above
+         * applies to it - and the result was both programs drawing the same
+         * pixels, with the launcher showing through whatever the app painted.
+         *
+         * Polled rather than checked every frame: it walks /proc, and the
+         * answer does not change between frames. On the way out of it the
+         * screen is repainted, because whatever was there belongs to the
+         * program that has just let go.
+         */
+        if (millis() - last_foreign >= FOREIGN_MS) {
+            last_foreign = millis();
+            bool now_foreign = n31_fbcon_foreign_owner();
+            if (now_foreign != foreign) {
+                foreign = now_foreign;
+                printf("n31launcher: framebuffer %s\n",
+                       now_foreign ? "taken by another process - going quiet"
+                                   : "released - drawing again");
+                fflush(stdout);
+                if (!foreign) n31_ui_redraw();
+            }
+        }
+        if (foreign) {
             usleep(FRAME_MS * 1000u);
             continue;
         }

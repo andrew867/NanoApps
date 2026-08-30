@@ -114,6 +114,23 @@ static void open_keys(void)
     if (!s_key_fds) printf("radioplus: no key input found\n");
 }
 
+/* One step along the swipe sequence from wherever we are, wrapping, so one
+   button reaches every screen rather than stopping at the end. A screen that
+   is not in the sequence - the register editors - starts from the beginning. */
+static int swipe_step(int delta)
+{
+    const int n = rp_ui_swipe_count();
+    if (n <= 0) return 0;
+
+    int at = 0;
+    for (int i = 0; i < n; i++) {
+        if (rp_ui_swipe_at(i) == rp_ui_current()) { at = i; break; }
+    }
+    at = (at + delta) % n;
+    if (at < 0) at += n;
+    return at;
+}
+
 static void pump_keys(void)
 {
     struct rp_input_event ev;
@@ -123,22 +140,23 @@ static void pump_keys(void)
             if (ev.type != 1 || ev.value != 1) continue;   /* presses only */
 
             switch (ev.code) {
+            /*
+             * Step through the swipe sequence, not through the enum.
+             *
+             * These used to add one to rp_ui_current() and wrap at a fixed
+             * count. That stopped being the same thing when two screens became
+             * optional: the sequence is built at run time now, so walking the
+             * enum would land on a screen that is turned off and skip the
+             * dots' idea of where you are.
+             */
             case KEY_VOLUMEUP:
-            case KEY_NEXTSONG: {
-                /* Wraps, so one button reaches every screen rather than
-                   stopping at the end and needing the other one. */
-                int n = (int)rp_ui_current() + 1;
-                if (n > RP_SWIPE_COUNT - 1) n = 0;
-                rp_ui_show((rp_screen_t)n);
+            case KEY_NEXTSONG:
+                rp_ui_show(rp_ui_swipe_at(swipe_step(+1)));
                 break;
-            }
             case KEY_VOLUMEDOWN:
-            case KEY_PREVIOUSSONG: {
-                int n = (int)rp_ui_current() - 1;
-                if (n < 0) n = RP_SWIPE_COUNT - 1;
-                rp_ui_show((rp_screen_t)n);
+            case KEY_PREVIOUSSONG:
+                rp_ui_show(rp_ui_swipe_at(swipe_step(-1)));
                 break;
-            }
             case KEY_PLAYPAUSE:
                 /* Exactly what the middle transport button does, so the key and
                    the screen never disagree about what it means. */
@@ -241,9 +259,24 @@ int main(int argc, char **argv)
 
     open_keys();
 
-    /* Brings the tuner and the capture up as a side effect of the first
-       refresh, so the screens have something to draw before the first frame. */
+    /*
+     * Something on the screen before the slow part, not after it.
+     *
+     * The first rp_model_refresh brings up the tuner and both halves of the
+     * audio path, which takes seconds - and until this was here, none of the
+     * real screens existed yet, so the panel kept whatever the launcher had
+     * left on it for the whole of that. A device that looks like it did not
+     * start is indistinguishable from one that did not.
+     */
+    rp_ui_boot("starting");
+
+    static const rp_progress_t prog = { rp_ui_boot, rp_ui_boot_failed };
+    rp_model_set_progress(&prog);
+
     rp_model_refresh();
+
+    /* Nothing more to report; the real screens say the rest themselves. */
+    rp_model_set_progress(NULL);
     rp_ui_init();
 
     printf("radioplus: %s\n", rp_model.backend ? rp_model.backend : "?");

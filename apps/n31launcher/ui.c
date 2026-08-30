@@ -363,12 +363,21 @@ void n31_ui_status_bar(const n31_status_t *st)
     show(s_ic_pct, st->have_battery);
     if (st->have_battery) {
         uint32_t c = C_TEXT_DIM;
-        if (st->charging)            c = C_OK;
-        else if (st->battery_pct <= 10) c = C_LOW;
+        /*
+         * Low wins over plugged in. A cable attached to a battery that is not
+         * charging and is nearly flat is the one state you most need to see,
+         * and painting it the reassuring colour because a cable is present is
+         * exactly backwards.
+         */
+        if (st->battery_pct <= 10)      c = C_LOW;
         else if (st->battery_pct <= 25) c = C_WARN;
+        else if (st->charging || st->plugged) c = C_OK;
 
+        /* The bolt means current is going in. A cable that is attached but not
+           charging keeps the level glyph, so the two are not confused. */
         lv_label_set_text(s_ic_batt, st->charging ? LV_SYMBOL_CHARGE
                                                   : battery_glyph(st->battery_pct));
+        if (!st->charging && st->plugged) c = C_OK;
         lv_obj_set_style_text_color(s_ic_batt, lv_color_hex(c), 0);
 
         snprintf(t, sizeof t, "%d%%", st->battery_pct);

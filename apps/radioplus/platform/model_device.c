@@ -296,3 +296,6 @@ void rp_act_reg_write(uint8_t addr, const uint8_t *buf, uint8_t len)
 
 void rp_act_reg_revert(uint8_t addr) { (void)addr; }
 bool rp_act_reg_overridden(uint8_t addr) { (void)addr; return false; }
+
+/* RetailOS brings up through its own path; nothing to report yet. */
+void rp_model_set_progress(const rp_progress_t *p) { (void)p; }

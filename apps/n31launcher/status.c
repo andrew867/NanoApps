@@ -96,6 +96,49 @@ static int smooth_battery(int pct)
 }
 
 /*
+ * Percent from the cell voltage.
+ *
+ * The driver's own `capacity` reads a constant 60 on this device while
+ * RetailOS shows the same battery full, so it is not a gauge - it is a number.
+ * voltage_now is a real measurement from the same supply, and a single-cell
+ * lithium battery has a well known and fairly flat discharge curve, so this
+ * derives the percentage rather than believing the driver.
+ *
+ * The breakpoints are the standard open-circuit curve for one Li-ion cell:
+ * 4.20 V full, a long plateau either side of 3.70 V where most of the charge
+ * lives, and a knee below 3.50 V. Deliberately piecewise-linear and not a fit
+ * to anything - the shape is what matters, and pretending to more precision
+ * than the measurement supports would be its own kind of wrong.
+ *
+ * This is NOT calibrated against this particular cell. It is a great deal
+ * closer than a stuck 60, and it moves when the battery moves, which is the
+ * property the status bar actually needs. Calibrating it properly wants one
+ * reading of voltage_now taken while RetailOS shows full.
+ */
+static int pct_from_millivolts(int mv)
+{
+    static const struct { int mv, pct; } CURVE[] = {
+        { 4200, 100 }, { 4100,  95 }, { 4000,  87 }, { 3900,  76 },
+        { 3800,  62 }, { 3700,  47 }, { 3600,  30 }, { 3500,  16 },
+        { 3400,   7 }, { 3300,   2 }, { 3200,   0 },
+    };
+    const int n = (int)(sizeof CURVE / sizeof CURVE[0]);
+
+    if (mv >= CURVE[0].mv) return 100;
+    if (mv <= CURVE[n - 1].mv) return 0;
+
+    for (int i = 1; i < n; i++) {
+        if (mv < CURVE[i].mv) continue;
+        /* Between CURVE[i] and CURVE[i-1], which is the higher voltage. */
+        int span_mv = CURVE[i - 1].mv - CURVE[i].mv;
+        int span_pc = CURVE[i - 1].pct - CURVE[i].pct;
+        if (span_mv <= 0) return CURVE[i].pct;
+        return CURVE[i].pct + (mv - CURVE[i].mv) * span_pc / span_mv;
+    }
+    return 0;
+}
+
+/*
  * The battery's own `status` reads "Unknown" on this PMIC, so charging comes
  * from the charger supply instead. Both are found by type rather than by name.
  */
@@ -115,18 +158,29 @@ static void read_power(n31_status_t *s)
         if (!read_str(path, v, sizeof v)) continue;
 
         if (!strcmp(v, "Battery")) {
-            int pct;
+            int pct = -1;
             snprintf(path, sizeof path, "%s/capacity", base);
             if (read_int(path, &pct)) {
                 if (pct < 0) pct = 0;
                 if (pct > 100) pct = 100;
-                s->battery_pct = smooth_battery(pct);
-                s->have_battery = true;
             }
 
             int uv;
             snprintf(path, sizeof path, "%s/voltage_now", base);
             if (read_int(path, &uv)) s->millivolts = uv / 1000;
+
+            /* Voltage first when there is one, because the driver's capacity
+               is not a gauge on this device - see pct_from_millivolts. The
+               range test is what makes this safe: a supply that reports a
+               plausible cell voltage is one worth deriving from, and anything
+               else falls back to whatever capacity said. */
+            if (s->millivolts >= 3000 && s->millivolts <= 4400) {
+                s->battery_pct = smooth_battery(pct_from_millivolts(s->millivolts));
+                s->have_battery = true;
+            } else if (pct >= 0) {
+                s->battery_pct = smooth_battery(pct);
+                s->have_battery = true;
+            }
 
             /* The battery's own status, in case a future driver fills it in.
                Today it says Unknown and the charger below is the answer. */
@@ -136,13 +190,58 @@ static void read_power(n31_status_t *s)
             continue;
         }
 
-        /* A supply that is not the battery and has a status is the charger. */
+        /*
+         * Not the battery, so it is a charger or a USB supply. Three ways it
+         * can say power is present, and they are checked in the order of how
+         * definite they are:
+         *
+         *   status=Charging   current is going into the cell
+         *   online=1          a supply is attached, charging or not
+         *   present=1         the hardware sees something on the port
+         *
+         * `online` matters as much as `status` here: a full battery on a
+         * plugged-in cable reports Not charging, and the icon is meant to say
+         * "there is a cable" rather than "electrons are moving".
+         */
         snprintf(path, sizeof path, "%s/status", base);
         if (read_str(path, v, sizeof v) && !strcmp(v, "Charging"))
             s->charging = true;
+
+        int on = 0;
+        snprintf(path, sizeof path, "%s/online", base);
+        if (read_int(path, &on) && on) s->plugged = true;
+
+        snprintf(path, sizeof path, "%s/present", base);
+        if (read_int(path, &on) && on) s->plugged = true;
     }
 
     closedir(d);
+
+    /* Charging implies a cable even where no supply exposed online/present. */
+    if (s->charging) s->plugged = true;
+
+    /*
+     * Failing that, ask the USB gadget whether the link is up. On this device
+     * the PMIC's charger node is not always exposed, but the UDC knows: it
+     * reports "configured" only when a host has enumerated it, which needs a
+     * cable and a port at the other end.
+     */
+    if (!s->plugged) {
+        DIR *u = opendir("/sys/class/udc");
+        if (u) {
+            struct dirent *ue;
+            while ((ue = readdir(u))) {
+                if (ue->d_name[0] == '.') continue;
+                char p[192], st[64];
+                snprintf(p, sizeof p, "/sys/class/udc/%s/state", ue->d_name);
+                if (read_str(p, st, sizeof st) && strcmp(st, "not attached")) {
+                    s->plugged = true;
+                    break;
+                }
+            }
+            closedir(u);
+        }
+    }
 }
 
 /* ---- bluetooth ------------------------------------------------------------ */
