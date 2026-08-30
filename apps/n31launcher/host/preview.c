@@ -104,7 +104,11 @@ int main(int argc, char **argv)
        playing, and no clock - which is the state of the hardware today. */
     n31_status_t st;
     memset(&st, 0, sizeof st);
-    st.have_battery = true; st.battery_pct = 52;
+    /* 100, not a comfortable two-digit number: "100%" is the widest the
+       reading ever gets and is the one that wrapped onto a second line when
+       the label was 34 px. Shooting it here is what makes that a regression
+       the screenshots catch. */
+    st.have_battery = true; st.battery_pct = 100;
     st.bt_present = true;
     st.hours = 0; st.minutes = 38;
     n31_ui_status_bar(&st);

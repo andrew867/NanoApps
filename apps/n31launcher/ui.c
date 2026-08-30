@@ -249,9 +249,13 @@ static void build_status_bar(void)
     /* Fixed width, right-aligned. Digits are not all the same width, so a
        label that shrink-wraps its text drags the battery icon left and right
        as the reading changes - which looks like the icon is twitching. Sized
-       for "100%", which is the widest it ever gets. */
+       for "100%", which is the widest it ever gets, with room to spare: at 34
+       px the full reading was a pixel or two over and wrapped onto a second
+       line. CLIP as well as the width, so the worst case is ever a clipped
+       glyph rather than a two-line status bar. */
     s_ic_pct  = label(s_tray, "", F_CAPTION, C_TEXT_DIM);
-    lv_obj_set_width(s_ic_pct, 34);
+    lv_obj_set_width(s_ic_pct, 42);
+    lv_label_set_long_mode(s_ic_pct, LV_LABEL_LONG_CLIP);
     lv_obj_set_style_text_align(s_ic_pct, LV_TEXT_ALIGN_RIGHT, 0);
 }
 
