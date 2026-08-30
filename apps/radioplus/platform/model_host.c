@@ -149,6 +149,12 @@ void rp_model_refresh(void)
 
 void rp_act_tune(uint32_t khz) { rp_model.khz = khz; }
 
+void rp_act_tune_quiet(uint32_t khz) { rp_act_tune(khz); }
+
+/* Nothing to persist to on the desktop: the preview keeps its presets in
+   memory and is thrown away with the process. */
+void rp_act_presets_save(void) { }
+
 void rp_act_step(bool up)
 {
     rp_model.khz = en_region_step(rp_model.region, rp_model.khz, up);

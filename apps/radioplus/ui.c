@@ -33,6 +33,7 @@
 #include "lvgl/lvgl.h"
 
 #include "core/fmreg.h"
+#include "core/scan.h"
 
 /* ---- palette -------------------------------------------------------------- */
 
@@ -1152,6 +1153,79 @@ static void refresh_dial(void)
     }
 }
 
+/* ---- band scan ------------------------------------------------------------
+ *
+ * The state machine is in core/scan.c and knows nothing about tuners or
+ * screens; this is the part that turns "it wants to be on 90.1" into a tune
+ * and "it is 40% through" into a bar.
+ *
+ * Pumped from rp_ui_tick, which runs whatever screen is showing, so walking
+ * away from the Presets screen mid-scan does not abandon it - which matters,
+ * because the whole point of a scan is that you can stop watching it.
+ */
+
+static en_scan_t s_scan;
+static uint32_t  s_scan_last_ms;
+static uint8_t   s_scan_added;
+static uint8_t   s_scan_note_for;   /* refresh ticks the result stays up */
+
+/* An RSSI a station has to beat. The tuner reports 0..255 and an empty
+   channel on this chip sits in the low teens, so this is well clear of the
+   noise floor without being so high that a weak local is missed. */
+#define RP_SCAN_RSSI 90
+
+static bool scan_running(void)
+{
+    return s_scan.phase == EN_SCAN_SWEEP || s_scan.phase == EN_SCAN_NAMING;
+}
+
+static void scan_pump(void)
+{
+    if (!scan_running()) return;
+
+    uint32_t now = lv_tick_get();
+    uint32_t dt = now - s_scan_last_ms;
+    s_scan_last_ms = now;
+    /* First tick after starting, or a clock that jumped. Charge nothing
+       rather than a garbage interval that would skip a channel. */
+    if (dt > 1000) dt = 0;
+
+    uint32_t khz = 0;
+    if (en_scan_tick(&s_scan, dt, rp_model.rssi, &rp_model.rds, &khz))
+        rp_act_tune_quiet(khz);
+
+    if (s_scan.phase == EN_SCAN_DONE) {
+        s_scan_added = en_scan_commit(&s_scan, &rp_model.presets);
+        rp_act_presets_save();
+        s_scan_note_for = 60;
+        s_scan.phase = EN_SCAN_IDLE;
+        /* Back where the user was, and through the saving path this time so
+           the frequency they are left on is the one that persists. */
+        rp_act_tune(s_scan.resume_khz);
+    }
+}
+
+static void on_scan(lv_event_t *e)
+{
+    (void)e;
+    if (scan_running()) {
+        /* Cancel. Put the tuner back before anything else, so a cancelled
+           scan costs nothing but the time it ran for. */
+        en_scan_stop(&s_scan);
+        rp_act_tune(s_scan.resume_khz);
+        s_scan_added = 0;
+        s_scan_note_for = 0;
+        return;
+    }
+    if (!rp_model.region) return;
+
+    s_scan_last_ms = lv_tick_get();
+    s_scan_added = 0;
+    s_scan_note_for = 0;
+    if (en_scan_start(&s_scan, rp_model.region, rp_model.khz, RP_SCAN_RSSI))
+        rp_act_tune_quiet(s_scan.khz);
+}
+
 /* ---- Presets --------------------------------------------------------------- */
 
 static void on_preset_pick(lv_event_t *e)
@@ -1163,6 +1237,8 @@ static void on_preset_pick(lv_event_t *e)
 
 /* How long the "simple screen is full" note stays up, in refresh ticks. */
 static uint8_t s_simple_full_for;
+
+static lv_obj_t *s_scan_btn, *s_scan_label, *s_scan_fill;
 
 static void on_preset_simple(lv_event_t *e)
 {
@@ -1183,7 +1259,7 @@ static void build_presets(void)
     lv_obj_set_pos(cap, MARGIN, 10);
     hairline(s, 32);
 
-    s_preset_list = panel(s, 0, 40, RP_SCREEN_W, RP_SCREEN_H - 84, C_BG);
+    s_preset_list = panel(s, 0, 40, RP_SCREEN_W, RP_SCREEN_H - 152, C_BG);
     lv_obj_add_flag(s_preset_list, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scroll_dir(s_preset_list, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(s_preset_list, LV_SCROLLBAR_MODE_OFF);
@@ -1192,7 +1268,25 @@ static void build_presets(void)
     s_preset_note = label(s, "", F_CAPTION, C_TA);
     lv_obj_set_size(s_preset_note, CONTENT_W, 18);
     lv_label_set_long_mode(s_preset_note, LV_LABEL_LONG_DOT);
-    lv_obj_set_pos(s_preset_note, MARGIN, RP_SCREEN_H - 40);
+    lv_obj_set_pos(s_preset_note, MARGIN, RP_SCREEN_H - 108);
+
+    /* Scan, across the bottom. Filling this list by hand is tuning to a
+       station, deciding, saving, and doing that twenty times. */
+    s_scan_btn = panel(s, MARGIN, RP_SCREEN_H - 86, CONTENT_W, TAP_MIN,
+                       C_SURFACE);
+    lv_obj_add_flag(s_scan_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_scan_btn, on_scan, LV_EVENT_CLICKED, 0);
+    lv_obj_set_style_bg_color(s_scan_btn, lv_color_hex(C_SURFACE_2),
+                              LV_STATE_PRESSED);
+    s_scan_label = label(s_scan_btn, "Scan band", F_BODY, C_TEXT);
+    lv_obj_center(s_scan_label);
+
+    /* The progress bar is the button's own background growing across it,
+       rather than a separate widget above it. There is no room on this screen
+       for a bar and a button, and a button that fills up as it works says the
+       same thing in the space of one. */
+    s_scan_fill = panel(s_scan_btn, 0, 0, 0, TAP_MIN, C_SIGNAL);
+    lv_obj_move_background(s_scan_fill);
 }
 
 static void refresh_presets(void)
@@ -1252,12 +1346,44 @@ static void refresh_presets(void)
         y += 52;
     }
 
-    /* Only shown after a refusal, and only for a few seconds. */
+    /* The note line, in priority order: a refusal, then a scan in progress,
+       then what a finished scan found. Only one of them at a time - it is one
+       line, and the most recent thing the user did is the one worth saying. */
     if (s_simple_full_for) {
         s_simple_full_for--;
         lv_label_set_text(s_preset_note, "Simple screen is full - six at most");
+    } else if (scan_running()) {
+        char m[16];
+        buf[0] = 0;
+        fmt_mhz(m, sizeof m, s_scan.khz);
+        cat(buf, m, sizeof buf);
+        cat(buf, s_scan.phase == EN_SCAN_SWEEP ? "   scanning   "
+                                               : "   reading names   ",
+            sizeof buf);
+        put_uint(m, s_scan.n_hits, 0);
+        cat(buf, m, sizeof buf);
+        cat(buf, " found", sizeof buf);
+        lv_label_set_text(s_preset_note, buf);
+    } else if (s_scan_note_for) {
+        s_scan_note_for--;
+        buf[0] = 0;
+        put_uint(buf, s_scan_added, 0);
+        cat(buf, s_scan_added == 1 ? " station saved" : " stations saved",
+            sizeof buf);
+        if (s_scan.overflowed)
+            cat(buf, " - list full", sizeof buf);
+        lv_label_set_text(s_preset_note, buf);
     } else {
         lv_label_set_text(s_preset_note, "");
+    }
+
+    if (s_scan_btn) {
+        lv_label_set_text(s_scan_label,
+                          scan_running() ? "Stop" : "Scan band");
+        int w = scan_running()
+                    ? (CONTENT_W * en_scan_percent(&s_scan)) / 100
+                    : 0;
+        lv_obj_set_width(s_scan_fill, w);
     }
 }
 
@@ -2018,8 +2144,14 @@ void rp_ui_show(rp_screen_t which)
 
 rp_screen_t rp_ui_current(void) { return s_current; }
 
+void rp_ui_scan_start_for_preview(void) { on_scan(NULL); }
+
 void rp_ui_tick(void)
 {
+    /* Before the screens, and not inside the Presets case: a scan has to keep
+       running when the user swipes away from the screen that started it. */
+    scan_pump();
+
     switch (s_current) {
     case RP_SCREEN_SIMPLE:   refresh_simple();   break;
     case RP_SCREEN_NOW:      refresh_now();      break;

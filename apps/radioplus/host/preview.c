@@ -68,6 +68,19 @@ static bool write_bmp(const char *path, const uint32_t *px, int w, int h)
     return ok;
 }
 
+/*
+ * A clock the preview controls.
+ *
+ * LVGL needs one, and so does the band scan, which measures its dwell in
+ * milliseconds. Taking it from the wall clock would make the scan's progress
+ * depend on how fast this machine renders - the screenshot would show a
+ * different percentage every run, which is the one thing a screenshot used as
+ * a regression test must not do. Advanced explicitly instead.
+ */
+static uint32_t s_ms;
+
+static uint32_t preview_millis(void) { return s_ms; }
+
 /* Let LVGL settle. One pass is not enough - layout, then draw, and anything
    that resizes to its content needs the round trip. */
 static void settle(void)
@@ -83,6 +96,7 @@ int main(int argc, char **argv)
     const char *out = argc > 1 ? argv[1] : "shots";
 
     lv_init();
+    lv_tick_set_cb(preview_millis);
 
     lv_display_t *d = lv_display_create(RP_SCREEN_W, RP_SCREEN_H);
     lv_display_set_buffers(d, s_fb, NULL, sizeof s_fb,
@@ -185,6 +199,25 @@ int main(int argc, char **argv)
     rp_ui_tick();
     settle();
     snprintf(path, sizeof path, "%s/7-now-recording.bmp", out);
+    if (write_bmp(path, s_fb, RP_SCREEN_W, RP_SCREEN_H)) {
+        printf("  %s\n", path);
+        made++;
+    }
+
+    /* And the Presets screen mid-scan. rp_ui_tick is what pumps the scan, so
+       running it repeatedly is what advances it; the preview has no tuner, so
+       the RSSI the model reports is whatever it was seeded with and the scan
+       treats the whole band as one long station. That is fine for a picture
+       of the bar - what is being checked is that it grows across the button
+       and that the label changes to Stop. */
+    rp_ui_show(RP_SCREEN_PRESETS);
+    rp_ui_scan_start_for_preview();
+    /* Twelve seconds of scanning at the frame rate the device runs at. Far
+       enough in for the bar to be a bar rather than a sliver, and the same
+       twelve seconds on every machine. */
+    for (int i = 0; i < 12000 / 33; i++) { s_ms += 33; rp_ui_tick(); }
+    settle();
+    snprintf(path, sizeof path, "%s/3b-presets-scanning.bmp", out);
     if (write_bmp(path, s_fb, RP_SCREEN_W, RP_SCREEN_H)) {
         printf("  %s\n", path);
         made++;

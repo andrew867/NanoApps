@@ -95,6 +95,15 @@ void rp_model_set_progress(const rp_progress_t *p);
 
 /* Actions the UI invokes. Implemented per platform. */
 void rp_act_tune(uint32_t khz);
+
+/* Tune without persisting the frequency. The band scan moves two hundred
+   times in half a minute and none of those are where the user wants to be
+   left; rp_act_tune would write the settings file for every one of them. */
+void rp_act_tune_quiet(uint32_t khz);
+
+/* Persist the preset list. The scan writes many presets at once, so it does
+   not go through rp_act_preset_toggle and has to ask for the save itself. */
+void rp_act_presets_save(void);
 void rp_act_step(bool up);
 void rp_act_seek(bool up);
 void rp_act_power(bool on);

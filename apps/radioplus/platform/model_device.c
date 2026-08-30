@@ -200,6 +200,14 @@ void rp_act_tune(uint32_t khz)
     settings_save();
 }
 
+void rp_act_tune_quiet(uint32_t khz)
+{
+    rp_model.khz = khz;
+    en_rds_init(&rp_model.rds, rp_model.region ? rp_model.region->rbds : true);
+}
+
+void rp_act_presets_save(void) { presets_save(); }
+
 void rp_act_step(bool up)
 {
     rp_act_tune(en_region_step(rp_model.region, rp_model.khz, up));

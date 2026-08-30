@@ -73,6 +73,11 @@ void rp_ui_show(rp_screen_t s);
 void rp_ui_open_register(uint8_t addr);
 rp_screen_t rp_ui_current(void);
 
+/* Start a band scan, for the screenshot harness. The scan is otherwise
+   started by tapping the button on the Presets screen, and a preview has no
+   fingers. */
+void rp_ui_scan_start_for_preview(void);
+
 /* Build every screen without showing any, for the headless renderer. */
 void rp_ui_build_all(void);
 

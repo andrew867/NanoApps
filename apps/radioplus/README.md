@@ -204,6 +204,43 @@ internally consistent — it is transcribed by hand from a specification, and a
 typo in a bit offset is otherwise invisible until it is a wrong register write
 on real hardware.
 
+## Scanning the band
+
+Filling the preset list by hand means tuning to a station, deciding it is
+worth keeping, saving it, and doing that twenty times. **Scan band**, at the
+bottom of the Presets screen, does it in about a minute.
+
+![Scanning](screenshots/scanning.png)
+
+Two passes, and the split is what makes it a minute rather than eight.
+
+The **sweep** steps every channel in the region and only asks whether anything
+is there. A hundred milliseconds is enough for the signal reading to settle,
+so a European band at 100 kHz spacing — 205 channels — takes twenty seconds.
+
+The **naming** pass goes back to the channels that answered yes and waits for
+RDS on each. That is seconds, not milliseconds: the station name arrives two
+characters at a time, and a weak signal can take several seconds to spell
+eight letters. Doing it on every channel would take eight minutes; doing it on
+the twenty that have something on them takes one. It also stops waiting the
+moment a name is complete, which on a strong station is well under a second.
+
+Committing updates presets that already exist rather than duplicating them, so
+a rescan improves the list instead of doubling it — and it leaves the
+simple-screen choice alone, because a rescan must not rearrange the screen you
+set up.
+
+Cancelling puts the tuner back where it was. So does finishing.
+
+The scan keeps running if you swipe away from the Presets screen. It is
+pumped from the frame callback rather than from that screen's refresh, for
+exactly that reason: the point of a scan is that you can stop watching it.
+
+The state machine is `core/scan.c` and knows nothing about tuners or screens —
+it says which channel it wants to be on and is told what is there. That is
+what lets it run identically on the device and in the host preview, and be
+tested with neither.
+
 ## Known limitations
 
 - **The RDS FIFO framing is not confirmed.** How the BCM part frames its FIFO is
@@ -213,8 +250,9 @@ on real hardware.
   decoding above it is verifiable against the standard and tested with no
   hardware. This is also why the sidecar stores raw groups.
 - **No scheduled or timed recording.** You start it and you stop it.
-- **Presets cannot be renamed or reordered** from the list, and there is no
-  scan-the-band-and-fill. Adding and removing at the tuned frequency works.
+- **Presets cannot be renamed or reordered** from the list. Renaming would
+  need an on-screen keyboard, and RDS fills the name in by itself on any
+  station that broadcasts one, which is most of them.
 - **The landscape screen is unverified on hardware** at the time of writing —
   it is verified in the host preview, which renders at the device's exact
   geometry, but not yet on a panel.

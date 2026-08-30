@@ -20,6 +20,7 @@
 #include "../core/region.h"
 #include "../core/wav.h"
 #include "../core/store.h"
+#include "../core/scan.h"
 
 static int checks, failures;
 
@@ -1099,6 +1100,119 @@ static void test_settings(void)
     CHECK(!en_override_clear(&e.overrides, 0x05), "clearing twice should fail");
 }
 
+/* The regions are a table, not a lookup - one helper here rather than an
+   API nothing else needs. */
+static const en_region_t *find_region(const char *name)
+{
+    for (uint8_t i = 0; i < en_region_count; i++)
+        if (strcmp(en_regions[i].name, name) == 0) return &en_regions[i];
+    return NULL;
+}
+
+/* ---- band scan ------------------------------------------------------------
+ *
+ * Driven the way the UI drives it: tick, observe, tune where it asks. The
+ * fake band has three stations on it, two of which name themselves, so both
+ * passes have something to do and the "took the name early" path is exercised
+ * alongside the "gave up waiting" one.
+ */
+
+static const uint32_t FAKE_STATIONS[] = { 88300, 95800, 104200 };
+
+static uint8_t fake_rssi(uint32_t khz)
+{
+    for (unsigned i = 0; i < sizeof FAKE_STATIONS / sizeof FAKE_STATIONS[0]; i++)
+        if (FAKE_STATIONS[i] == khz) return 200;
+    return 12;
+}
+
+static void test_scan(void)
+{
+    const en_region_t *eu = find_region("Europe");
+    CHECK(eu != NULL, "no Europe region");
+    if (!eu) return;
+
+    en_scan_t s;
+    CHECK(en_scan_start(&s, eu, 98000, 100), "scan refused to start");
+    CHECK(s.phase == EN_SCAN_SWEEP, "should begin sweeping");
+    CHECK(s.resume_khz == 98000, "resume frequency not kept");
+
+    uint32_t khz = s.khz;
+    uint32_t want = 0;
+    en_rds_t rds;
+    en_rds_init(&rds, false);
+
+    /* 40 ms a tick is the UI's refresh rate. A bound on the loop rather than
+       a while(1): a state machine that never reaches DONE should fail the
+       test, not hang it. */
+    int guard = 0;
+    int sweep_ticks = 0;
+    while (s.phase != EN_SCAN_DONE && guard++ < 200000) {
+        uint8_t r = fake_rssi(khz);
+
+        /* RDS only where there is a station, and only on two of the three -
+         * so one hit has to time out. Filled directly rather than through the
+         * decoder: this is testing the scan, not the RDS parser. */
+        en_rds_t *pr = NULL;
+        if (s.phase == EN_SCAN_NAMING && r > 100 && khz != 104200) {
+            rds.ps_valid = true;
+            rds.pi = 0x1234;
+            rds.pty = 3;
+            memcpy(rds.ps, khz == 88300 ? "BBC R1  " : "Kiss    ", 9);
+            pr = &rds;
+        }
+
+        if (s.phase == EN_SCAN_SWEEP) sweep_ticks++;
+        if (en_scan_tick(&s, 40, r, pr, &want)) khz = want;
+    }
+
+    CHECK(s.phase == EN_SCAN_DONE, "scan never finished (%d ticks)", guard);
+    CHECK(khz == 98000, "scan did not tune back to where it started (%u)", khz);
+    CHECK(en_scan_percent(&s) == 100, "percent %u at the end",
+          en_scan_percent(&s));
+
+    CHECK(s.n_hits == 3, "expected 3 stations, found %u", s.n_hits);
+    CHECK(!s.overflowed, "should not have overflowed on three stations");
+    for (uint8_t i = 0; i < s.n_hits && i < 3; i++)
+        CHECK(s.hits[i].khz == FAKE_STATIONS[i],
+              "hit %u was %u, expected %u", i, s.hits[i].khz,
+              FAKE_STATIONS[i]);
+
+    /* Trailing pad from the eight-character RDS field must not survive. */
+    CHECK(strcmp(s.hits[0].name, "BBC R1") == 0,
+          "name 0 was '%s'", s.hits[0].name);
+    CHECK(strcmp(s.hits[1].name, "Kiss") == 0,
+          "name 1 was '%s'", s.hits[1].name);
+    CHECK(!s.hits[2].named, "the silent station should have no name");
+
+    /* The sweep must be the cheap pass. If it ever costs as much per channel
+       as naming does, a full band takes eight minutes and the two-pass split
+       has stopped earning its complexity. */
+    CHECK(sweep_ticks < 1000, "sweep took %d ticks, far too long", sweep_ticks);
+
+    /* Committing: new presets appear, and a rescan updates rather than
+       duplicates - including leaving the simple-screen choice alone. */
+    en_presets_t p;
+    en_presets_init(&p, "Europe");
+    CHECK(en_scan_commit(&s, &p) == 3, "commit added %u", p.count);
+    CHECK(p.count == 3, "preset count %u", p.count);
+
+    CHECK(en_preset_set_simple(&p, 95800, true), "could not flag for simple");
+    en_scan_commit(&s, &p);
+    CHECK(p.count == 3, "a rescan duplicated presets: %u", p.count);
+    int at = en_preset_find(&p, 95800);
+    CHECK(at >= 0 && p.list[at].simple,
+          "a rescan cleared the simple-screen choice");
+
+    /* A region with no channels is refused rather than swept. */
+    en_region_t empty = *eu;
+    empty.high_khz = empty.low_khz;
+    empty.step_khz = 0;
+    en_scan_t bad;
+    CHECK(!en_scan_start(&bad, &empty, 98000, 100),
+          "an empty band should refuse to scan");
+}
+
 int main(void)
 {
     printf("Radio+ core tests\n");
@@ -1119,8 +1233,10 @@ int main(void)
     test_regions();
     test_region_apply();
 
+
     test_wav();
     test_presets();
+    test_scan();
     test_sidecar();
     test_simple_flags();
     test_settings();
