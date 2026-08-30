@@ -559,7 +559,12 @@ static en_prog_seg_t s_fs_segs[EN_FREQSET_MAX_STEPS];
  * missing file.
  */
 
-#define EN_PROG_BUNDLE_MAX 262144u
+/* Thirty-six programmes of eighty segments, several layers each, is around
+   three hundred and fifty kilobytes of text - so a quarter of a megabyte was
+   under the material rather than over it, and the tail would have been cut at
+   the last whole line and silently missing. Half a megabyte, which on this
+   device is a malloc like any other. */
+#define EN_PROG_BUNDLE_MAX 524288u
 
 static char    *s_pf_text;
 static uint32_t s_pf_len;
