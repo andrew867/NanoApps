@@ -65,7 +65,7 @@ LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_n31.h\"
 TA_CFLAGS := -I$(TINYALSA)/include
 
 CORE_SRCS := $(CORE)/osc.c $(CORE)/noise.c $(CORE)/render.c \
-             $(CORE)/program.c $(CORE)/measured.c $(CORE)/wavout.c
+             $(CORE)/program.c $(CORE)/measured.c $(CORE)/progfile.c $(CORE)/wavout.c
 
 APP_SRCS  := main_host.c ../ui.c ../engine.c \
              ../platform/audio_linux.c ../platform/sys_host.c $(CORE_SRCS)
@@ -144,6 +144,12 @@ $(BUILD)/entrain: $(APP_SRCS) $(APP_HDRS) $(BUILD)/liblvgl_n31.a $(BUILD)/libtin
 	$(CC) $(CFLAGS) $(LV_CFLAGS) $(TA_CFLAGS) $(LDFLAGS) -o $@ $(APP_SRCS) \
 	      $(BUILD)/liblvgl_n31.a $(BUILD)/libtinyalsa_n31.a $(LDLIBS)
 	@$(STRIP) $@
+	@# Stage where the image builder looks, every time, so an image packed
+	@# from the other repo can never be older than the last build here. See
+	@# STAGING in the app READMEs.
+	@mkdir -p $(IPOD_ROOT)
+	@cp -f $@ $(IPOD_ROOT)/entrain
+	@echo "  staged -> $(IPOD_ROOT)/entrain"
 	@echo "=== $@ ===" && ls -l $@ && file $@ 2>/dev/null || true
 
 # The key lives on a Windows-mounted path, which shows as 0777 under WSL, and

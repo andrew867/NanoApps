@@ -96,6 +96,12 @@ $(APP): $(SRCS) $(HDRS) $(LVLIB) | $(BUILD)
 	$(CC) $(CFLAGS) $(LV_CFLAGS) -static -Wl,--gc-sections \
 	      -o $@ $(SRCS) $(LVLIB) -lm -lpthread
 	@$(STRIP) $@
+	@# Stage where the image builder looks, every time, so an image packed
+	@# from the other repo can never be older than the last build here. See
+	@# STAGING in the app READMEs.
+	@mkdir -p $(IPOD_ROOT)
+	@cp -f $@ $(IPOD_ROOT)/n31launcher
+	@echo "  staged -> $(IPOD_ROOT)/n31launcher"
 	@ls -l $@
 
 $(BUILD):

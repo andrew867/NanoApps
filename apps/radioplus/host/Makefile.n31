@@ -113,6 +113,12 @@ $(APP): $(APP_SRCS) $(HDRS) $(LVLIB) | $(BUILD)
 	$(CC) $(CFLAGS) $(LV_CFLAGS) -static -Wl,--gc-sections \
 	      -o $@ $(APP_SRCS) $(LVLIB) $(TALIB) -lm -lpthread
 	@$(STRIP) $@
+	@# Stage where the image builder looks, every time, so an image packed
+	@# from the other repo can never be older than the last build here. See
+	@# STAGING in the app READMEs.
+	@mkdir -p $(IPOD_ROOT)
+	@cp -f $@ $(IPOD_ROOT)/radioplus
+	@echo "  staged -> $(IPOD_ROOT)/radioplus"
 	@ls -l $@
 
 objs: $(OBJS)
