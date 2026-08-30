@@ -1,3 +1,263 @@
 36 tracks in 6 folders
 [1/36] Series 1 Part 1
   CD1 - 1 - Orientation.flac  (33.1 min)
+    11 layer(s) survive screening: 60.6 Hz, 60.7 Hz mono, 74.6 Hz mono, 102.6 Hz mono, 106.9 Hz mono, 113.5 Hz mono, 113.6 Hz, 124.6 Hz mono, 138.0 Hz mono, 238.9 Hz mono, 298.6 Hz
+    60.6 Hz REJECTED: screened as a pair, reads -0.000 over the full track
+    60.7 Hz REJECTED: mono but not steady moment to moment (local spread 0.0602 > 0.01)
+    74.6 Hz REJECTED: mono but not steady moment to moment (local spread 0.0503 > 0.01)
+    106.9 Hz REJECTED: mono but not steady moment to moment (local spread 0.0551 > 0.01)
+    113.6 Hz REJECTED: screened as a pair, reads -0.000 over the full track
+    124.6 Hz REJECTED: mono but not steady moment to moment (local spread 0.0367 > 0.01)
+    138.0 Hz REJECTED: mono but not steady moment to moment (local spread 0.0639 > 0.01)
+    L  102.94 Hz  R  102.93 Hz  beat  +0.000  steady 0.0040  (mono)
+    L  113.63 Hz  R  113.55 Hz  beat  -0.000  steady 0.0088  (mono)
+    L  238.86 Hz  R  238.82 Hz  beat  +0.000  steady 0.0080  (mono)
+    L  298.80 Hz  R  302.47 Hz  beat  +3.669  steady 0.0382
+    86 segments
+[2/36] Series 1 Part 2
+  CD1 - 2 - Introduction to Focus 10.flac  (37.2 min)
+    2 layer(s) survive screening: 100.1 Hz, 123.8 Hz mono
+    100.1 Hz REJECTED: beat not steady moment to moment (local spread 0.0532 > 0.05)
+    123.8 Hz REJECTED: mono but not steady moment to moment (local spread 0.0527 > 0.01)
+    nothing survived the full-track pass
+[3/36] Series 1 Part 3
+  CD2 - 3 - Advanced Focus 10.flac  (36.2 min)
+    9 layer(s) survive screening: 114.2 Hz mono, 119.6 Hz mono, 133.8 Hz mono, 138.0 Hz mono, 171.5 Hz mono, 203.2 Hz mono, 226.9 Hz mono, 299.2 Hz, 495.6 Hz
+    114.2 Hz REJECTED: mono but not steady moment to moment (local spread 0.0254 > 0.01)
+    119.6 Hz REJECTED: mono but not steady moment to moment (local spread 0.0505 > 0.01)
+    133.8 Hz REJECTED: mono but not steady moment to moment (local spread 0.0455 > 0.01)
+    138.0 Hz REJECTED: mono but not steady moment to moment (local spread 0.0787 > 0.01)
+    171.5 Hz REJECTED: mono but not steady moment to moment (local spread 0.0467 > 0.01)
+    203.2 Hz REJECTED: mono but not steady moment to moment (local spread 0.1018 > 0.01)
+    226.9 Hz REJECTED: mono but not steady moment to moment (local spread 0.0567 > 0.01)
+    299.2 Hz REJECTED: beat not steady moment to moment (local spread 0.1060 > 0.05)
+    L  497.14 Hz  R  493.89 Hz  beat  -3.387  steady 0.0310
+    84 segments
+[4/36] Series 1 Part 4
+  CD2 - 4 - Release and Recharge.flac  (36.0 min)
+    11 layer(s) survive screening: 103.5 Hz, 127.1 Hz mono, 131.0 Hz mono, 172.4 Hz mono, 192.9 Hz mono, 210.7 Hz mono, 216.0 Hz mono, 239.0 Hz mono, 259.1 Hz mono, 407.0 Hz, 494.0 Hz
+    131.0 Hz REJECTED: mono but not steady moment to moment (local spread 0.0246 > 0.01)
+    172.4 Hz REJECTED: mono but not steady moment to moment (local spread 0.0660 > 0.01)
+    192.9 Hz REJECTED: mono but not steady moment to moment (local spread 0.0235 > 0.01)
+    210.7 Hz REJECTED: mono but not steady moment to moment (local spread 0.0244 > 0.01)
+    216.0 Hz REJECTED: mono but not steady moment to moment (local spread 0.1410 > 0.01)
+    239.0 Hz REJECTED: mono but not steady moment to moment (local spread 0.1125 > 0.01)
+    259.1 Hz REJECTED: mono but not steady moment to moment (local spread 0.0194 > 0.01)
+    407.0 Hz REJECTED: beat not steady moment to moment (local spread 0.0889 > 0.05)
+    494.0 Hz REJECTED: beat not steady moment to moment (local spread 0.0829 > 0.05)
+    L  100.68 Hz  R  103.71 Hz  beat  +3.035  steady 0.0413
+    L  126.99 Hz  R  126.98 Hz  beat  -0.000  steady 0.0014  (mono)
+    92 segments
+[5/36] Series 1 Part 5
+  CD3 - 5 - Exploration, Sleep.flac  (37.1 min)
+    5 layer(s) survive screening: 60.9 Hz, 103.9 Hz, 162.9 Hz mono, 302.0 Hz, 493.5 Hz
+    103.9 Hz REJECTED: beat not steady moment to moment (local spread 0.2089 > 0.05)
+    162.9 Hz REJECTED: mono but not steady moment to moment (local spread 0.0283 > 0.01)
+    L   60.88 Hz  R   59.70 Hz  beat  -1.179  steady 0.0043
+    L  298.32 Hz  R  302.13 Hz  beat  +3.843  steady 0.0030
+    L  496.84 Hz  R  493.33 Hz  beat  -3.678  steady 0.0049
+    94 segments
+[6/36] Series 1 Part 6
+  CD3 - 6 - Free Flow 10.flac  (33.6 min)
+    13 layer(s) survive screening: 59.8 Hz mono, 73.8 Hz mono, 100.0 Hz, 119.5 Hz mono, 134.1 Hz mono, 152.1 Hz mono, 165.7 Hz mono, 171.0 Hz mono, 175.7 Hz mono, 204.6 Hz mono, 239.0 Hz mono, 302.3 Hz, 494.8 Hz
+    73.8 Hz REJECTED: mono but not steady moment to moment (local spread 0.0580 > 0.01)
+    119.5 Hz REJECTED: mono but not steady moment to moment (local spread 0.0926 > 0.01)
+    134.1 Hz REJECTED: mono but not steady moment to moment (local spread 0.0160 > 0.01)
+    171.0 Hz REJECTED: mono but not steady moment to moment (local spread 0.0331 > 0.01)
+    204.6 Hz REJECTED: mono but not steady moment to moment (local spread 0.0570 > 0.01)
+    239.0 Hz REJECTED: mono but not steady moment to moment (local spread 0.0246 > 0.01)
+    L   59.79 Hz  R   59.80 Hz  beat  -0.000  steady 0.0004  (mono)
+    L  100.03 Hz  R  104.01 Hz  beat  +4.036  steady 0.0016
+    L  152.12 Hz  R  152.12 Hz  beat  -0.000  steady 0.0079  (mono)
+    L  165.67 Hz  R  165.65 Hz  beat  +0.000  steady 0.0009  (mono)
+    L  175.73 Hz  R  175.72 Hz  beat  -0.000  steady 0.0059  (mono)
+    L  298.60 Hz  R  302.40 Hz  beat  +3.843  steady 0.0021
+    L  496.71 Hz  R  493.03 Hz  beat  -3.684  steady 0.0026
+    62 segments
+[7/36] Series 2 Part 1
+  CD1 - 1 - Introduction to Focus 12.flac  (35.1 min)
+    1 layer(s) survive screening: 99.2 Hz
+    L   99.25 Hz  R  100.75 Hz  beat  +1.497  steady 0.0054
+    50 segments
+[8/36] Series 2 Part 2
+  CD1 - 2 - Problem Solving.flac  (37.0 min)
+    1 layer(s) survive screening: 100.8 Hz
+    L   99.31 Hz  R  100.75 Hz  beat  +1.436  steady 0.0219
+    50 segments
+[9/36] Series 2 Part 3
+  CD2 - 3 - One-Month Patterning.flac  (38.5 min)
+    1 layer(s) survive screening: 100.8 Hz
+    L   99.32 Hz  R  100.75 Hz  beat  +1.433  steady 0.0032
+    79 segments
+[10/36] Series 2 Part 4
+  CD2 - 4 - Color Breathing.flac  (30.0 min)
+    1 layer(s) survive screening: 100.8 Hz
+    100.8 Hz REJECTED: beat not steady moment to moment (local spread 0.1384 > 0.05)
+    nothing survived the full-track pass
+[11/36] Series 2 Part 5
+  CD3 - 5 - Energy Bar Tool.flac  (35.2 min)
+    1 layer(s) survive screening: 100.8 Hz
+    L  100.75 Hz  R   99.25 Hz  beat  -1.498  steady 0.0056
+    44 segments
+[12/36] Series 2 Part 6
+  CD3 - 6 - Living Body Map.flac  (36.9 min)
+    1 layer(s) survive screening: 99.2 Hz
+    L  100.75 Hz  R   99.25 Hz  beat  -1.499  steady 0.0023
+    29 segments
+[13/36] Series 3 Part 1
+  CD1 - 1 - Lift Off.flac  (29.8 min)
+    3 layer(s) survive screening: 101.1 Hz, 398.8 Hz, 498.6 Hz
+    101.1 Hz REJECTED: beat not steady moment to moment (local spread 0.0848 > 0.05)
+    498.6 Hz REJECTED: beat not steady moment to moment (local spread 0.0708 > 0.05)
+    L  400.88 Hz  R  396.71 Hz  beat  -4.128  steady 0.0251
+    69 segments
+[14/36] Series 3 Part 2
+  CD1 - 2 - Remote Viewing.flac  (35.3 min)
+    1 layer(s) survive screening: 497.2 Hz mono
+    497.2 Hz REJECTED: mono but not steady moment to moment (local spread 0.0242 > 0.01)
+    nothing survived the full-track pass
+[15/36] Series 3 Part 3
+  CD2 - 3 - Vectors.flac  (32.7 min)
+    11 layer(s) survive screening: 132.5 Hz mono, 137.3 Hz mono, 146.0 Hz mono, 151.4 Hz mono, 167.5 Hz mono, 186.6 Hz mono, 194.0 Hz mono, 206.5 Hz mono, 217.0 Hz mono, 400.2 Hz, 500.0 Hz
+    137.3 Hz REJECTED: mono but not steady moment to moment (local spread 0.0385 > 0.01)
+    146.0 Hz REJECTED: mono but not steady moment to moment (local spread 0.0247 > 0.01)
+    167.5 Hz REJECTED: mono but not steady moment to moment (local spread 0.0257 > 0.01)
+    186.6 Hz REJECTED: mono but not steady moment to moment (local spread 0.0486 > 0.01)
+    206.5 Hz REJECTED: mono but not steady moment to moment (local spread 0.0410 > 0.01)
+    217.0 Hz REJECTED: mono but not steady moment to moment (local spread 0.0707 > 0.01)
+    500.0 Hz REJECTED: beat not steady moment to moment (local spread 0.0685 > 0.05)
+    L  132.55 Hz  R  132.53 Hz  beat  -0.000  steady 0.0083  (mono)
+    L  151.32 Hz  R  151.33 Hz  beat  +0.000  steady 0.0029  (mono)
+    L  193.94 Hz  R  193.93 Hz  beat  -0.000  steady 0.0050  (mono)
+    L  400.23 Hz  R  397.20 Hz  beat  -2.376  steady 0.0169
+    92 segments
+[16/36] Series 3 Part 4
+  CD2 - 4 - Five Questions.flac  (36.0 min)
+    7 layer(s) survive screening: 146.3 Hz mono, 161.3 Hz mono, 239.4 Hz mono, 264.7 Hz mono, 283.8 Hz mono, 348.5 Hz, 594.6 Hz
+    146.3 Hz REJECTED: mono but not steady moment to moment (local spread 0.0662 > 0.01)
+    161.3 Hz REJECTED: mono but not steady moment to moment (local spread 0.0190 > 0.01)
+    239.4 Hz REJECTED: mono but not steady moment to moment (local spread 0.0405 > 0.01)
+    264.7 Hz REJECTED: mono but not steady moment to moment (local spread 0.0763 > 0.01)
+    283.8 Hz REJECTED: mono but not steady moment to moment (local spread 0.0779 > 0.01)
+    348.5 Hz REJECTED: screened as a pair, reads -0.186 over the full track
+    L  596.53 Hz  R  593.15 Hz  beat  -3.506  steady 0.0181
+    76 segments
+[17/36] Series 3 Part 5
+  CD3 - 5 - Energy Food.flac  (32.9 min)
+    4 layer(s) survive screening: 91.7 Hz mono, 96.6 Hz, 399.3 Hz, 500.6 Hz
+    96.6 Hz REJECTED: screened as a pair, reads +0.206 over the full track
+    399.3 Hz REJECTED: screened as a pair, reads -0.170 over the full track
+    500.6 Hz REJECTED: beat not steady moment to moment (local spread 0.1869 > 0.05)
+    L   91.80 Hz  R   91.80 Hz  beat  -0.000  steady 0.0021  (mono)
+    62 segments
+[18/36] Series 3 Part 6
+  CD3 - 6 - First Stage Separation.flac  (35.3 min)
+    no steady layer found
+[19/36] Series 4 Part 1
+  CD1 - 1 - One Year Patterning.flac  (34.5 min)
+    2 layer(s) survive screening: 400.5 Hz, 503.0 Hz
+    400.5 Hz REJECTED: screened as a pair, reads +0.107 over the full track
+    503.0 Hz REJECTED: beat not steady moment to moment (local spread 0.1725 > 0.05)
+    nothing survived the full-track pass
+[20/36] Series 4 Part 2
+  CD1 - 2 - Five Messages.flac  (35.5 min)
+    3 layer(s) survive screening: 397.0 Hz, 494.4 Hz, 592.7 Hz
+    397.0 Hz REJECTED: beat not steady moment to moment (local spread 0.1678 > 0.05)
+    494.4 Hz REJECTED: beat not steady moment to moment (local spread 0.2686 > 0.05)
+    592.7 Hz REJECTED: beat not steady moment to moment (local spread 0.1522 > 0.05)
+    nothing survived the full-track pass
+[21/36] Series 4 Part 3
+  CD2 - 3 - Free Flow 12.flac  (35.2 min)
+    1 layer(s) survive screening: 100.8 Hz
+    L  100.76 Hz  R   99.26 Hz  beat  -1.497  steady 0.0040
+    73 segments
+[22/36] Series 4 Part 4
+  CD2 - 4 - NVC I.flac  (36.8 min)
+    no steady layer found
+[23/36] Series 4 Part 5
+  CD3 - 5 - NVC II.flac  (45.7 min)
+    7 layer(s) survive screening: 36.3 Hz mono, 59.0 Hz mono, 100.3 Hz, 112.3 Hz mono, 121.4 Hz mono, 150.8 Hz, 180.8 Hz
+    36.3 Hz REJECTED: mono but not steady moment to moment (local spread 0.0161 > 0.01)
+    59.0 Hz REJECTED: mono but not steady moment to moment (local spread 0.0471 > 0.01)
+    100.3 Hz REJECTED: screened as a pair, reads +0.001 over the full track
+    112.3 Hz REJECTED: mono but not steady moment to moment (local spread 0.0577 > 0.01)
+    121.4 Hz REJECTED: mono but not steady moment to moment (local spread 0.0590 > 0.01)
+    180.8 Hz REJECTED: beat not steady moment to moment (local spread 0.1805 > 0.05)
+    L  150.84 Hz  R  146.94 Hz  beat  -3.953  steady 0.0016
+    61 segments
+[24/36] Series 4 Part 6
+  CD3 - 6 - Compoint.flac  (26.9 min)
+    2 layer(s) survive screening: 103.6 Hz, 208.4 Hz
+    103.6 Hz REJECTED: beat not steady moment to moment (local spread 0.1812 > 0.05)
+    208.4 Hz REJECTED: screened as a pair, reads +0.243 over the full track
+    nothing survived the full-track pass
+[25/36] Series 5 Part 1
+  CD1 - 1 - Advanced Focus 12.flac  (35.0 min)
+    no steady layer found
+[26/36] Series 5 Part 2
+  CD1 - 2 - Discovering Intuition.flac  (35.0 min)
+    2 layer(s) survive screening: 396.2 Hz mono, 403.7 Hz mono
+    L  396.25 Hz  R  396.25 Hz  beat  +0.001  steady 0.0029  (mono)
+    L  403.75 Hz  R  403.75 Hz  beat  +0.001  steady 0.0033  (mono)
+    81 segments
+[27/36] Series 5 Part 3
+  CD2 - 3 - Exploring Intuition.flac  (35.0 min)
+    no steady layer found
+[28/36] Series 5 Part 4
+  CD2 - 4 - Intro to Focus 15.flac  (35.0 min)
+    no steady layer found
+[29/36] Series 5 Part 5
+  CD3 - 5 - Mission 15 Creation and Manifestation.flac  (35.0 min)
+    no steady layer found
+[30/36] Series 5 Part 6
+  CD3 - 6 - Exploring Focus 15.flac  (38.8 min)
+    no steady layer found
+[31/36] Series 6 Part 1
+  CD1 - 1 - Sensing Locale 1.flac  (34.9 min)
+    1 layer(s) survive screening: 100.8 Hz
+    L   99.39 Hz  R  100.75 Hz  beat  +1.357  steady 0.0046
+    75 segments
+[32/36] Series 6 Part 2
+  CD1 - 2 - Expansion in Locale 1.flac  (34.3 min)
+    3 layer(s) survive screening: 100.8 Hz, 595.0 Hz, 605.0 Hz
+    595.0 Hz REJECTED: beat not steady moment to moment (local spread 0.2747 > 0.05)
+    605.0 Hz REJECTED: beat not steady moment to moment (local spread 0.3318 > 0.05)
+    L   99.26 Hz  R  100.75 Hz  beat  +1.481  steady 0.0032
+    62 segments
+[33/36] Series 6 Part 3
+  CD2 - 3 - Point of Departure.flac  (34.8 min)
+    1 layer(s) survive screening: 100.8 Hz
+    L   99.44 Hz  R  100.75 Hz  beat  +1.295  steady 0.0065
+    72 segments
+[34/36] Series 6 Part 4
+  CD2 - 4 - Nonphysical friends.flac  (36.0 min)
+    2 layer(s) survive screening: 100.8 Hz, 605.0 Hz
+    605.0 Hz REJECTED: beat not steady moment to moment (local spread 0.4246 > 0.05)
+    L   99.48 Hz  R  100.75 Hz  beat  +1.235  steady 0.0035
+    78 segments
+[35/36] Series 6 Part 5
+  CD3 - 5 - Movement to Locale 2 - Intro Focus 21.flac  (33.6 min)
+    1 layer(s) survive screening: 98.6 Hz
+    L   99.25 Hz  R   99.45 Hz  beat  +0.918  steady 0.0028
+    74 segments
+[36/36] Series 6 Part 6
+  CD3 - 6 - Free Flow Journey in Focus 21.flac  (40.1 min)
+    1 layer(s) survive screening: 100.8 Hz
+    L  100.08 Hz  R  100.74 Hz  beat  +0.380  steady 0.0375
+    98 segments
+
+23 measured, 13 not, in 132.8 min
+  Series 1 Part 2: CD1 - 2 - Introduction to Focus 10.flac - no layer survived
+  Series 2 Part 4: CD2 - 4 - Color Breathing.flac - no layer survived
+  Series 3 Part 2: CD1 - 2 - Remote Viewing.flac - no layer survived
+  Series 3 Part 6: CD3 - 6 - First Stage Separation.flac - no layer survived
+  Series 4 Part 1: CD1 - 1 - One Year Patterning.flac - no layer survived
+  Series 4 Part 2: CD1 - 2 - Five Messages.flac - no layer survived
+  Series 4 Part 4: CD2 - 4 - NVC I.flac - no layer survived
+  Series 4 Part 6: CD3 - 6 - Compoint.flac - no layer survived
+  Series 5 Part 1: CD1 - 1 - Advanced Focus 12.flac - no layer survived
+  Series 5 Part 3: CD2 - 3 - Exploring Intuition.flac - no layer survived
+  Series 5 Part 4: CD2 - 4 - Intro to Focus 15.flac - no layer survived
+  Series 5 Part 5: CD3 - 5 - Mission 15 Creation and Manifestation.flac - no layer survived
+  Series 5 Part 6: CD3 - 6 - Exploring Focus 15.flac - no layer survived
+wrote ../../../data/Entrain/measured.prog

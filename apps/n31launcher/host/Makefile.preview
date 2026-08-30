@@ -44,7 +44,12 @@ LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_host.h\
              -I$(LVGL) -I$(LVGL)/src -I$(LVGL)/include -I$(LVGL)/.. -I..
 
 CFLAGS := -O1 -g -std=gnu99 -Wall -Wextra -Wno-unused-parameter
-SRCS := preview.c ../ui.c ../apps.c ../status.c
+SRCS := preview.c ../ui.c ../apps.c ../status.c ../../build_stamp.c
+
+# ---- build stamp -----------------------------------------------------------
+BUILD_STAMP := $(shell date -u +%Y%m%d.%H%M)
+BUILD_GIT   := $(shell git rev-parse --short=7 HEAD 2>/dev/null || echo nogit)
+CFLAGS += -DEN_BUILD_STAMP='"$(BUILD_STAMP)"' -DEN_BUILD_GIT='"$(BUILD_GIT)"'
 
 # The app scan, against a real directory tree. Needs no LVGL and no
 # device, and it is what caught the flat-copy fallback listing every folder

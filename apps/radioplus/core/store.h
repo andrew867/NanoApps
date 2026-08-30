@@ -167,6 +167,12 @@ typedef struct {
        weak station you want it every time. */
     uint8_t  stereo_mode;
 
+    /* Follow the station onto another transmitter when this one fades. Off by
+       default and deliberately so: the only thing that makes a candidate "the
+       same station" is a matching PI, and PI is sixteen bits sent by whoever
+       is transmitting. */
+    bool     af_follow;
+
     /* Which optional screens are in the swipe order. Both default off: the
        swipe sequence a user learns should not grow a page because they
        upgraded. */

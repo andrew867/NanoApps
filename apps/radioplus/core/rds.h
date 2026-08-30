@@ -51,6 +51,7 @@
 #define EN_RDS_CH_ECC   0x0400u
 #define EN_RDS_CH_PIN   0x0800u
 #define EN_RDS_CH_DI    0x1000u
+#define EN_RDS_CH_RTPLUS 0x2000u
 
 #define EN_RDS_PS_LEN   8
 #define EN_RDS_RT_LEN   64
@@ -93,6 +94,25 @@ typedef struct {
     uint8_t  ptyn_seen;
     bool     ptyn_valid;
 
+    /*
+     * RadioText+ - the station saying which part of the radio text is the
+     * title and which is the artist.
+     *
+     * `rtplus_group` is where to look for the markers, learnt from the
+     * open-data announcement in group 3A. Most stations use 11A and some use
+     * 12A, so it is not a constant: a decoder that hard-codes one shows
+     * nothing at all on a station that picked the other.
+     */
+    uint8_t  rtplus_group;    /* group type << 1 | version; 0 = not announced */
+    bool     rtplus_known;
+    char     rt_title[EN_RDS_RT_LEN + 1];
+    char     rt_artist[EN_RDS_RT_LEN + 1];
+    bool     rt_title_valid;
+    bool     rt_artist_valid;
+    bool     rtplus_running;  /* the item is currently on air */
+    bool     rtplus_toggle;   /* flips when the item changes */
+    bool     rtplus_toggle_known;
+
     /* Alternate frequencies, in kHz. */
     uint32_t af[EN_RDS_AF_MAX];
     uint8_t  af_count;
@@ -118,6 +138,14 @@ typedef struct {
 
     bool     rbds;         /* interpret programme types as RBDS */
 } en_rds_t;
+
+/* RadioText+ content types worth naming. The full list runs to sixty-odd
+   codes; these are the ones a now-playing display uses. */
+#define EN_RTP_TITLE     1u
+#define EN_RTP_ALBUM     2u
+#define EN_RTP_ARTIST    4u
+#define EN_RTP_BAND      9u
+#define EN_RTP_PROG_NOW 33u
 
 /* Reset to nothing received. Call on tune, and on any PI change. */
 void en_rds_init(en_rds_t *r, bool rbds);

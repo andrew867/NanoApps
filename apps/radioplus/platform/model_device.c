@@ -198,6 +198,9 @@ void rp_model_refresh(void)
 
 void rp_act_tune(uint32_t khz)
 {
+    /* Whatever round was in progress is void: the listener has chosen a
+       station, and that station is home now. */
+    en_af_retuned(&rp_model.af, khz);
     rp_model.khz = khz;
     en_rds_init(&rp_model.rds, rp_model.region ? rp_model.region->rbds : true);
     settings_save();
@@ -234,6 +237,42 @@ void rp_act_stereo_mode(uint8_t mode)
 {
     rp_model.stereo_mode = mode;
     settings_save();
+}
+
+void rp_act_af_follow(bool on)
+{
+    uint32_t back = 0;
+    if (en_af_enable(&rp_model.af, on, &back) == EN_AF_GOTO)
+        rp_act_tune(back);
+    settings_save();
+}
+
+uint8_t rp_act_af_to_presets(void)
+{
+    /* Whatever the station is advertising right now. The PI and programme
+       type come from what is being received, so the presets arrive named as
+       far as RDS has got - and the frequency is the point regardless. */
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < rp_model.rds.af_count; i++) {
+        uint32_t khz = rp_model.rds.af[i];
+        if (!khz) continue;
+        if (en_preset_find(&rp_model.presets, khz) >= 0) continue;
+
+        en_preset_t e;
+        memset(&e, 0, sizeof e);
+        e.khz = khz;
+        e.pi = rp_model.rds.pi;
+        e.pty = rp_model.rds.pty;
+        e.rbds = rp_model.rds.rbds;
+        if (rp_model.rds.ps_valid)
+            copy_str(e.name, sizeof e.name, rp_model.rds.ps);
+        if (en_preset_add(&rp_model.presets, &e)) n++;
+    }
+    if (n) {
+        en_preset_sort(&rp_model.presets);
+        presets_save();
+    }
+    return n;
 }
 
 void rp_act_step(bool up)

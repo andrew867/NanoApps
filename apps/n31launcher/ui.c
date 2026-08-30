@@ -20,6 +20,7 @@
  * of them looking slightly plain.
  */
 
+#include "../build_stamp.h"
 #include "ui.h"
 #include "apps.h"
 #include "status.h"
@@ -292,6 +293,22 @@ static void build_home(void)
     lv_obj_set_style_text_align(s_home_note, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_pos(s_home_note, MARGIN, TILE_TOP + 3 * TILE_H + 6);
     lv_obj_add_flag(s_home_note, LV_OBJ_FLAG_HIDDEN);
+
+    /*
+     * The build, along the bottom.
+     *
+     * Not decoration. An app sitting on the device that is months old looks
+     * exactly like the one just compiled, and the only way to tell without
+     * this is to reproduce a bug that was fixed weeks ago. One glance at the
+     * home screen now says which build is actually running.
+     */
+    {
+        lv_obj_t *v = label(s_home, en_build_version(), F_TINY, C_TEXT_MUTE);
+        lv_obj_set_size(v, CONTENT_W, 14);
+        lv_label_set_long_mode(v, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_align(v, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_pos(v, MARGIN, N31_SCREEN_H - 16);
+    }
 
     /* Different amounts, so tilting reads as depth rather than as the whole
        screen sliding. */

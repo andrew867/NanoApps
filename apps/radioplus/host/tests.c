@@ -22,6 +22,7 @@
 #include "../core/store.h"
 #include "../core/scan.h"
 #include "../core/timer.h"
+#include "../core/affollow.h"
 
 static int checks, failures;
 
@@ -1481,6 +1482,276 @@ static void test_reg_coverage(void)
           "the FM control register the stereo tap writes is not described");
 }
 
+/* ---- RadioText+ -----------------------------------------------------------
+ *
+ * Groups built by hand from the specification, because there is no tuner to
+ * capture one from and the bit layout is the entire feature. Two fields with
+ * DIFFERENT length widths - six bits and five - packed across three blocks is
+ * exactly the shape that produces a title that is right and an artist that is
+ * one character short.
+ */
+
+/* Feed a 2A radio-text group: four characters at segment `seg`. */
+static void feed_rt(en_rds_t *r, uint16_t pi, uint8_t seg, const char *four)
+{
+    uint16_t blk[4];
+    blk[0] = pi;
+    blk[1] = (uint16_t)((2u << 12) | (0u << 11) | (0u << 10) | (5u << 5) | seg);
+    blk[2] = (uint16_t)(((uint8_t)four[0] << 8) | (uint8_t)four[1]);
+    blk[3] = (uint16_t)(((uint8_t)four[2] << 8) | (uint8_t)four[3]);
+    en_rds_group(r, blk, EN_RDS_ALL);
+}
+
+/* Group 3A: "application `aid` will use group `type`/`ver`". */
+static void feed_3a(en_rds_t *r, uint16_t pi, uint8_t type, uint8_t ver,
+                    uint16_t aid)
+{
+    uint16_t blk[4];
+    blk[0] = pi;
+    blk[1] = (uint16_t)((3u << 12) | (0u << 11) | (0u << 10) | (5u << 5) |
+                        ((type << 1) | ver));
+    blk[2] = 0;
+    blk[3] = aid;
+    en_rds_group(r, blk, EN_RDS_ALL);
+}
+
+/* An RT+ marker group in whatever group type the station announced. */
+static void feed_rtp(en_rds_t *r, uint16_t pi, uint8_t type, int toggle,
+                     int running, uint8_t c1, uint8_t s1, uint8_t len1,
+                     uint8_t c2, uint8_t s2, uint8_t len2)
+{
+    uint16_t blk[4];
+    uint8_t l1 = (uint8_t)(len1 - 1), l2 = (uint8_t)(len2 - 1);
+
+    blk[0] = pi;
+    blk[1] = (uint16_t)((type << 12) | (0u << 11) | (0u << 10) | (5u << 5) |
+                        ((toggle ? 0x10u : 0u) | (running ? 0x08u : 0u) |
+                         ((c1 >> 3) & 0x07u)));
+    blk[2] = (uint16_t)(((c1 & 0x07u) << 13) | ((s1 & 0x3Fu) << 7) |
+                        ((l1 & 0x3Fu) << 1) | ((c2 >> 5) & 0x01u));
+    blk[3] = (uint16_t)(((c2 & 0x1Fu) << 11) | ((s2 & 0x3Fu) << 5) |
+                        (l2 & 0x1Fu));
+    en_rds_group(r, blk, EN_RDS_ALL);
+}
+
+static void test_rtplus(void)
+{
+    en_rds_t r;
+    en_rds_init(&r, false);
+
+    /* 64 characters of radio text. The title sits at 0..12 and the artist at
+       16..25, which is the shape a real station sends: a separator between
+       them that belongs to neither. */
+    const char *text =
+        "Harvest Moon - Neil Young                                       ";
+    for (uint8_t seg = 0; seg < 16; seg++)
+        feed_rt(&r, 0xC2B5, seg, text + seg * 4);
+    CHECK(r.rt_valid, "the radio text did not complete");
+
+    /* Nothing yet: without the announcement there is nowhere to look. */
+    CHECK(!r.rtplus_known, "RT+ known before it was announced");
+    feed_rtp(&r, 0xC2B5, 11, 0, 1, EN_RTP_TITLE, 0, 12, EN_RTP_ARTIST, 15, 10);
+    CHECK(!r.rt_title_valid,
+          "took markers from a group that was never announced");
+
+    /* An announcement for something else must not be mistaken for ours. */
+    feed_3a(&r, 0xC2B5, 8, 0, 0xCD46);        /* TMC, not RT+ */
+    CHECK(!r.rtplus_known, "a TMC announcement was taken for RT+");
+
+    /* The real one. 11A here; the point of decoding 3A at all is that it
+       could just as well be 12A. */
+    feed_3a(&r, 0xC2B5, 11, 0, 0x4BD7);
+    CHECK(r.rtplus_known && r.rtplus_group == ((11u << 1) | 0u),
+          "RT+ group came out as %u", r.rtplus_group);
+
+    feed_rtp(&r, 0xC2B5, 11, 0, 1, EN_RTP_TITLE, 0, 12, EN_RTP_ARTIST, 15, 10);
+    CHECK(r.rtplus_running, "the item should be running");
+    CHECK(r.rt_title_valid, "no title");
+    CHECK(strcmp(r.rt_title, "Harvest Moon") == 0,
+          "title was '%s'", r.rt_title);
+    CHECK(r.rt_artist_valid, "no artist");
+    CHECK(strcmp(r.rt_artist, "Neil Young") == 0,
+          "artist was '%s'", r.rt_artist);
+
+    /* The toggle flipping means a new item. What was there described the last
+       one and must go, or the previous artist sits under the new title. */
+    feed_rtp(&r, 0xC2B5, 11, 1, 1, EN_RTP_TITLE, 0, 12, 0, 0, 1);
+    CHECK(strcmp(r.rt_title, "Harvest Moon") == 0,
+          "the title was lost across a toggle: '%s'", r.rt_title);
+    CHECK(!r.rt_artist_valid,
+          "the previous artist survived a new item: '%s'", r.rt_artist);
+
+    /* A marker running past the end of the radio text is dropped, not
+       clamped. Half a title is worse than none: nothing would say it is half. */
+    en_rds_init(&r, false);
+    for (uint8_t seg = 0; seg < 16; seg++)
+        feed_rt(&r, 0xC2B5, seg, text + seg * 4);
+    feed_3a(&r, 0xC2B5, 11, 0, 0x4BD7);
+    feed_rtp(&r, 0xC2B5, 11, 0, 1, EN_RTP_TITLE, 60, 20, 0, 0, 1);
+    CHECK(!r.rt_title_valid,
+          "a marker past the end of the text was accepted: '%s'", r.rt_title);
+
+    /* And a marker into text that has not arrived yet is not guessed at. */
+    en_rds_init(&r, false);
+    feed_rt(&r, 0xC2B5, 0, "Harv");
+    feed_3a(&r, 0xC2B5, 11, 0, 0x4BD7);
+    feed_rtp(&r, 0xC2B5, 11, 0, 1, EN_RTP_TITLE, 0, 12, 0, 0, 1);
+    CHECK(!r.rt_title_valid,
+          "a marker into unreceived text was accepted: '%s'", r.rt_title);
+
+    /* A station on 12A instead of 11A works identically - which is the whole
+       reason the group is learnt rather than hard-coded. */
+    en_rds_init(&r, false);
+    for (uint8_t seg = 0; seg < 16; seg++)
+        feed_rt(&r, 0xC2B5, seg, text + seg * 4);
+    feed_3a(&r, 0xC2B5, 12, 0, 0x4BD7);
+    feed_rtp(&r, 0xC2B5, 12, 0, 1, EN_RTP_TITLE, 0, 12, EN_RTP_ARTIST, 15, 10);
+    CHECK(r.rt_title_valid && strcmp(r.rt_title, "Harvest Moon") == 0,
+          "12A station: title was '%s'", r.rt_title);
+    CHECK(r.rt_artist_valid && strcmp(r.rt_artist, "Neil Young") == 0,
+          "12A station: artist was '%s'", r.rt_artist);
+
+    /* The five-bit length field is the one that bites: a 32-character artist
+       is the longest it can express, and it must come out whole. */
+    CHECK(EN_RDS_RT_LEN >= 32, "radio text is too short to test this");
+}
+
+/* ---- following a station across transmitters ------------------------------
+ *
+ * The interesting cases are all refusals. Moving to a stronger transmitter of
+ * the same station is the easy half; not moving to a stranger, not moving to
+ * something worse, and not hopping for ever between two equal signals are
+ * what make it usable, and what a radio you cannot test on the road has to
+ * get right by construction.
+ */
+
+static en_rds_t af_rds(uint16_t pi, const uint32_t *list, uint8_t n)
+{
+    en_rds_t r;
+    en_rds_init(&r, false);
+    r.pi = pi;
+    r.pi_valid = true;
+    for (uint8_t i = 0; i < n && i < EN_RDS_AF_MAX; i++) r.af[r.af_count++] = list[i];
+    return r;
+}
+
+/* Tick until it asks to move, or until `ms` has gone by with nothing. */
+static uint32_t af_run(en_affollow_t *a, uint32_t ms, uint32_t khz,
+                       uint8_t rssi, const en_rds_t *rds)
+{
+    uint32_t out = 0;
+    for (uint32_t t = 0; t < ms; t += 100)
+        if (en_af_tick(a, 100, khz, rssi, rds, &out) == EN_AF_GOTO)
+            return out;
+    return 0;
+}
+
+static void test_affollow(void)
+{
+    static const uint32_t LIST[] = { 89100, 96700 };
+    en_rds_t home = af_rds(0xC2B5, LIST, 2);
+    en_affollow_t a;
+
+    /* Off by default, and off means off: a dead signal changes nothing. */
+    en_af_init(&a);
+    CHECK(!a.enabled, "AF following should be off until asked for");
+    CHECK(af_run(&a, 60000, 98500, 0, &home) == 0,
+          "a disabled follower retuned the radio");
+
+    /* On, and healthy: it sits still. */
+    en_af_enable(&a, true, NULL);
+    CHECK(af_run(&a, 60000, 98500, 200, &home) == 0,
+          "moved away from a strong signal");
+
+    /* A brief dip is not a reason to move - RSSI drops under a bridge. */
+    en_af_init(&a);
+    en_af_enable(&a, true, NULL);
+    af_run(&a, 2000, 98500, 200, &home);
+    CHECK(af_run(&a, 2000, 98500, 5, &home) == 0,
+          "moved on a two-second dip");
+    CHECK(af_run(&a, 2000, 98500, 200, &home) == 0, "moved after recovering");
+
+    /* Sustained weakness: it tries the first alternate. */
+    en_af_init(&a);
+    en_af_enable(&a, true, NULL);
+    af_run(&a, 2000, 98500, 200, &home);
+    uint32_t to = af_run(&a, 20000, 98500, 5, &home);
+    CHECK(to == 89100, "tried %u, expected the first alternate", to);
+    CHECK(a.home_khz == 98500, "home was not remembered: %u", a.home_khz);
+
+    /* A candidate whose PI does NOT match is a different station, however
+       strong it is, and must be refused. This is the whole safety property:
+       stand next to something misconfigured and the radio stays put. */
+    en_rds_t stranger = af_rds(0x1234, LIST, 2);
+    to = af_run(&a, 5000, 89100, 255, &stranger);
+    CHECK(to == 96700, "a mismatched PI was accepted (went to %u)", to);
+    CHECK(a.rejects >= 1, "the refusal was not counted");
+
+    /* Nothing else works either, so it goes back exactly where it started. */
+    to = af_run(&a, 5000, 96700, 255, &stranger);
+    CHECK(to == 98500, "a failed round left the radio on %u", to);
+    CHECK(a.phase == EN_AF_COOLDOWN, "no cooldown after a failed round");
+    CHECK(a.moves == 0, "it counted a move it did not make");
+
+    /* And it does not immediately start again. */
+    CHECK(af_run(&a, 10000, 98500, 5, &home) == 0,
+          "started another round during the cooldown");
+
+    /* The same station, but weaker, is not worth moving to. Accepting equal
+       or worse is how a radio ends up swapping between two transmitters for
+       ever at the point where they cross. */
+    en_af_init(&a);
+    en_af_enable(&a, true, NULL);
+    af_run(&a, 2000, 98500, 45, &home);     /* home at 45 */
+    to = af_run(&a, 20000, 98500, 30, &home);
+    CHECK(to == 89100, "did not try an alternate");
+    to = af_run(&a, 5000, 89100, 35, &home);   /* barely better than 30 */
+    CHECK(to != 0 && to != 89100, "accepted a candidate inside the margin");
+    CHECK(a.moves == 0, "moved to something not meaningfully better");
+
+    /* A genuinely better transmitter of the same station: it moves, and stays. */
+    en_af_init(&a);
+    en_af_enable(&a, true, NULL);
+    af_run(&a, 2000, 98500, 30, &home);
+    to = af_run(&a, 20000, 98500, 20, &home);
+    CHECK(to == 89100, "did not try the alternate");
+    CHECK(af_run(&a, 5000, 89100, 200, &home) == 0,
+          "refused a strong match of the same station");
+    CHECK(a.moves == 1, "the move was not counted (%u)", a.moves);
+    CHECK(a.home_khz == 89100, "home did not follow the move: %u", a.home_khz);
+
+    /* Turning it off mid-attempt puts the radio back. The control that exists
+       to be a way out must not strand you on a frequency you never chose. */
+    en_af_init(&a);
+    en_af_enable(&a, true, NULL);
+    af_run(&a, 2000, 98500, 200, &home);
+    af_run(&a, 20000, 98500, 5, &home);
+    CHECK(a.phase == EN_AF_TRYING, "expected to be mid-attempt");
+    uint32_t back = 0;
+    CHECK(en_af_enable(&a, false, &back) == EN_AF_GOTO && back == 98500,
+          "switching off mid-attempt did not restore %u (got %u)",
+          98500u, back);
+    CHECK(!a.enabled, "still enabled after being switched off");
+
+    /* A station with no alternates does not thrash - one look, then a wait. */
+    en_rds_t alone = af_rds(0xC2B5, NULL, 0);
+    en_af_init(&a);
+    en_af_enable(&a, true, NULL);
+    af_run(&a, 2000, 98500, 200, &alone);
+    CHECK(af_run(&a, 20000, 98500, 5, &alone) == 0,
+          "retuned with an empty alternate list");
+    CHECK(a.phase == EN_AF_COOLDOWN, "did not back off with nothing to try");
+
+    /* Somebody else retuning - a preset, the scan, the dial - voids the round
+       and makes the new frequency home. */
+    en_af_init(&a);
+    en_af_enable(&a, true, NULL);
+    af_run(&a, 2000, 98500, 200, &home);
+    en_af_retuned(&a, 91300);
+    CHECK(a.home_khz == 91300, "a manual retune did not become home");
+    CHECK(a.phase == EN_AF_WATCH, "a manual retune left it mid-round");
+}
+
 int main(void)
 {
     printf("Radio+ core tests\n");
@@ -1507,6 +1778,8 @@ int main(void)
     test_scan();
     test_stereo_mode();
     test_reg_coverage();
+    test_rtplus();
+    test_affollow();
     test_rectimer();
     test_sidecar();
     test_simple_flags();

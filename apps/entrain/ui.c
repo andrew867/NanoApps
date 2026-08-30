@@ -23,6 +23,7 @@
  */
 
 #include "ui.h"
+#include "../build_stamp.h"
 #include "engine.h"
 #include "core/program.h"
 #include "core/freqset.h"
@@ -1869,7 +1870,11 @@ static void build_settings(void)
      * blob that gets staged hashes identical to the one that was built, so the
      * doubt is all downstream of that - and it is not something a listener can
      * resolve by ear. Reading it off the screen settles it in a second. */
-    lv_obj_t *stamp = make_label(s, "build " __DATE__ " " __TIME__,
+    /* The real build stamp, not __DATE__: that expands when THIS file is
+       compiled, so a binary relinked after a change elsewhere carries a date
+       older than itself. This one comes from the makefile, is the same string
+       in every app, and names the commit it was built from. */
+    lv_obj_t *stamp = make_label(s, en_build_version(),
                                  F_CAPTION, C_TEXT_MUTE);
     lv_obj_set_pos(stamp, MARGIN, y);
 

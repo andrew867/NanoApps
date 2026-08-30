@@ -345,6 +345,157 @@ static uint16_t group10(en_rds_t *r, const uint16_t blk[4], uint8_t valid,
     return ch;
 }
 
+/* ---- RadioText+ ----------------------------------------------------------
+ *
+ * Group 3A announces which group carries an open-data application:
+ *
+ *   block B, bits 4..0   the group it will use - type in 4..1, version in 0
+ *   block D              the application identifier
+ *
+ * 0x4BD7 is RadioText+. Nothing else is acted on; other applications are
+ * announced by plenty of stations and none of them mean anything here.
+ */
+#define EN_RTP_AID 0x4BD7u
+
+static uint16_t group3(en_rds_t *r, const uint16_t blk[4], uint8_t valid,
+                       bool version_b)
+{
+    if (version_b) return 0;
+    if (!(valid & EN_RDS_B) || !(valid & EN_RDS_D)) return 0;
+    if (blk[3] != EN_RTP_AID) return 0;
+
+    uint8_t g = (uint8_t)(blk[1] & 0x1Fu);
+    /* Group 0 would mean "carried in group 0A", which is the basic tuning
+       group and cannot also carry markers. A station announcing that is
+       announcing nothing. */
+    if (g == 0) return 0;
+
+    if (!r->rtplus_known || r->rtplus_group != g) {
+        r->rtplus_group = g;
+        r->rtplus_known = true;
+        return EN_RDS_CH_RTPLUS;
+    }
+    return 0;
+}
+
+/*
+ * One RT+ tag: a content type, and where in the radio text it starts and how
+ * long it is.
+ *
+ * The markers point into the RT buffer, so a tag is only usable once the text
+ * it describes has actually arrived. A marker running past what we have is
+ * dropped rather than clamped - half a title is worse than no title, because
+ * nothing on screen would say it was half.
+ */
+static bool rtp_take(en_rds_t *r, uint8_t content, uint8_t start, uint8_t len,
+                     char *out, bool *valid_out)
+{
+    if (!len) return false;
+    (void)content;
+
+    uint16_t end = (uint16_t)start + len;
+    if (end > EN_RDS_RT_LEN) return false;
+
+    /* Every character it covers has to have been received. rt_seen is a bit
+       per four-character segment, which is the granularity RT arrives in. */
+    for (uint16_t i = start; i < end; i++)
+        if (!(r->rt_seen & (uint16_t)(1u << (i / 4u)))) return false;
+
+    char buf[EN_RDS_RT_LEN + 1];
+    uint8_t n = 0;
+    for (uint16_t i = start; i < end; i++) buf[n++] = r->rt[i];
+    buf[n] = 0;
+
+    /* Trailing spaces are how stations pad a marker to a tidy length. */
+    while (n && (buf[n - 1] == ' ' || buf[n - 1] == '\r')) buf[--n] = 0;
+    if (!n) return false;
+
+    bool changed = !*valid_out;
+    for (uint8_t i = 0; i <= n; i++) {
+        if (out[i] != buf[i]) changed = true;
+        out[i] = buf[i];
+    }
+    *valid_out = true;
+    return changed;
+}
+
+/*
+ * The markers themselves, in whichever group 3A named.
+ *
+ *   block B  b4     item toggle
+ *            b3     item running
+ *            b2..b0 content type 1, high three bits
+ *   block C  b15..b13 content type 1, low three bits
+ *            b12..b7  start marker 1
+ *            b6..b1   length marker 1
+ *            b0       content type 2, high bit
+ *   block D  b15..b11 content type 2, low five bits
+ *            b10..b5  start marker 2
+ *            b4..b0   length marker 2
+ *
+ * The two length fields are different widths - six bits and five - which is
+ * not a typo in this comment and is the kind of thing that produces a title
+ * that is right and an artist that is one character short.
+ */
+static uint16_t group_rtplus(en_rds_t *r, const uint16_t blk[4], uint8_t valid)
+{
+    if (!(valid & EN_RDS_B) || !(valid & EN_RDS_C) || !(valid & EN_RDS_D))
+        return 0;
+
+    uint16_t ch = 0;
+
+    bool toggle  = (blk[1] & 0x0010u) != 0;
+    bool running = (blk[1] & 0x0008u) != 0;
+
+    /* The toggle flipping means a different item is playing, so what we had
+       describes the previous one and has to go. Without this the artist of
+       the last track sits under the title of the next. */
+    if (r->rtplus_toggle_known && toggle != r->rtplus_toggle) {
+        r->rt_title[0] = 0;
+        r->rt_artist[0] = 0;
+        r->rt_title_valid = false;
+        r->rt_artist_valid = false;
+        ch |= EN_RDS_CH_RTPLUS;
+    }
+    r->rtplus_toggle = toggle;
+    r->rtplus_toggle_known = true;
+
+    if (running != r->rtplus_running) {
+        r->rtplus_running = running;
+        ch |= EN_RDS_CH_RTPLUS;
+    }
+
+    uint8_t c1 = (uint8_t)(((blk[1] & 0x0007u) << 3) | (blk[2] >> 13));
+    uint8_t s1 = (uint8_t)((blk[2] >> 7) & 0x3Fu);
+    uint8_t l1 = (uint8_t)(((blk[2] >> 1) & 0x3Fu) + 1u);
+
+    uint8_t c2 = (uint8_t)(((blk[2] & 0x0001u) << 5) | (blk[3] >> 11));
+    uint8_t s2 = (uint8_t)((blk[3] >> 5) & 0x3Fu);
+    uint8_t l2 = (uint8_t)((blk[3] & 0x1Fu) + 1u);
+
+    struct { uint8_t c, s, l; } tag[2] = { { c1, s1, l1 }, { c2, s2, l2 } };
+
+    for (int i = 0; i < 2; i++) {
+        switch (tag[i].c) {
+        case EN_RTP_TITLE:
+        case EN_RTP_PROG_NOW:
+            if (rtp_take(r, tag[i].c, tag[i].s, tag[i].l, r->rt_title,
+                         &r->rt_title_valid))
+                ch |= EN_RDS_CH_RTPLUS;
+            break;
+        case EN_RTP_ARTIST:
+        case EN_RTP_BAND:
+            if (rtp_take(r, tag[i].c, tag[i].s, tag[i].l, r->rt_artist,
+                         &r->rt_artist_valid))
+                ch |= EN_RDS_CH_RTPLUS;
+            break;
+        default:
+            break;
+        }
+    }
+    return ch;
+}
+
 /* ---- the entry point ----------------------------------------------------- */
 
 uint16_t en_rds_group(en_rds_t *r, const uint16_t blk[4], uint8_t valid)
@@ -396,10 +547,17 @@ uint16_t en_rds_group(en_rds_t *r, const uint16_t blk[4], uint8_t valid)
     case 0:  ch |= group0(r, blk, valid, version_b);  break;
     case 1:  ch |= group1(r, blk, valid, version_b);  break;
     case 2:  ch |= group2(r, blk, valid, version_b);  break;
+    case 3:  ch |= group3(r, blk, valid, version_b); break;
     case 4:  if (!version_b) ch |= group4(r, blk, valid); break;
     case 10: ch |= group10(r, blk, valid, version_b); break;
-    default: break;   /* counted above; ODA, TMC and EON are not decoded yet */
+    default: break;   /* counted above; TMC and EON are not decoded yet */
     }
+
+    /* And whichever group 3A named for RadioText+, which is a different group
+       on different stations and so cannot be a case label. */
+    if (r->rtplus_known &&
+        r->rtplus_group == (uint8_t)((type << 1) | (version_b ? 1u : 0u)))
+        ch |= group_rtplus(r, blk, valid);
     return ch;
 }
 

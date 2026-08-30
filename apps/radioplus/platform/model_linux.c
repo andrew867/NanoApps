@@ -415,6 +415,9 @@ void rp_model_refresh(void)
 
 void rp_act_tune(uint32_t khz)
 {
+    /* Whatever round was in progress is void: the listener has chosen a
+       station, and that station is home now. */
+    en_af_retuned(&rp_model.af, khz);
     rp_model.khz = khz;
     if (rp_model.tuner_ok) en_tuner_tune(khz);
     settings_save();
@@ -424,7 +427,18 @@ void rp_act_tune(uint32_t khz)
     en_rds_init(&rp_model.rds, rp_model.region ? rp_model.region->rbds : true);
 }
 
-void rp_act_tune_quiet(uint32_t khz) { rp_act_tune(khz); }
+void rp_act_tune_quiet(uint32_t khz)
+{
+    /* Deliberately not rp_act_tune: this is a retune made ON the listener's
+       behalf - by the band scan, or by the station follower - so it must not
+       write the settings file two hundred times in a sweep, and it must not
+       tell the follower that the listener has chosen a new home. The follower
+       retunes through here, and treating its own move as a manual retune
+       would cancel the round it had just started. */
+    rp_model.khz = khz;
+    if (rp_model.tuner_ok) en_tuner_tune(khz);
+    en_rds_init(&rp_model.rds, rp_model.region ? rp_model.region->rbds : true);
+}
 
 void rp_act_presets_save(void) { presets_save(); }
 
@@ -464,6 +478,42 @@ void rp_act_stereo_mode(uint8_t mode)
     if (en_tuner_reg_read(EN_FM_CTRL_ADDR, &ctrl, 1) != EN_TUNER_OK) return;
     ctrl = en_fm_ctrl_set_stereo(ctrl, (en_fm_stereo_t)mode);
     en_tuner_reg_write(EN_FM_CTRL_ADDR, &ctrl, 1);
+}
+
+void rp_act_af_follow(bool on)
+{
+    uint32_t back = 0;
+    if (en_af_enable(&rp_model.af, on, &back) == EN_AF_GOTO)
+        rp_act_tune(back);
+    settings_save();
+}
+
+uint8_t rp_act_af_to_presets(void)
+{
+    /* Whatever the station is advertising right now. The PI and programme
+       type come from what is being received, so the presets arrive named as
+       far as RDS has got - and the frequency is the point regardless. */
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < rp_model.rds.af_count; i++) {
+        uint32_t khz = rp_model.rds.af[i];
+        if (!khz) continue;
+        if (en_preset_find(&rp_model.presets, khz) >= 0) continue;
+
+        en_preset_t e;
+        memset(&e, 0, sizeof e);
+        e.khz = khz;
+        e.pi = rp_model.rds.pi;
+        e.pty = rp_model.rds.pty;
+        e.rbds = rp_model.rds.rbds;
+        if (rp_model.rds.ps_valid)
+            snprintf(e.name, sizeof e.name, "%s", rp_model.rds.ps);
+        if (en_preset_add(&rp_model.presets, &e)) n++;
+    }
+    if (n) {
+        en_preset_sort(&rp_model.presets);
+        presets_save();
+    }
+    return n;
 }
 
 void rp_act_step(bool up)

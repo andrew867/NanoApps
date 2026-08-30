@@ -28,10 +28,12 @@
  */
 
 #include "ui.h"
+#include "../build_stamp.h"
 #include "model.h"
 
 #include "lvgl/lvgl.h"
 
+#include "core/affollow.h"
 #include "core/fmreg.h"
 #include "core/scan.h"
 #include "core/timer.h"
@@ -71,6 +73,22 @@ static rp_screen_t s_current = RP_SCREEN_NOW;
 /* Now Playing */
 static lv_obj_t *s_freq, *s_unit, *s_ps, *s_pty, *s_rt;
 static lv_obj_t *s_seg[14], *s_rssi_lbl, *s_stereo, *s_ta_badge;
+static lv_obj_t *s_af_badge;
+
+/* The band scan's state. Up here with the other cross-screen state rather
+   than beside the scan code: the dial draws the band profile it collects, and
+   the dial is built earlier in this file. */
+static en_scan_t s_scan;
+static lv_obj_t *s_w_title, *s_w_artist;
+
+/* Show or hide, in one call. There is no such helper in this file yet and
+   three of these read better than six flag calls. */
+static void show(lv_obj_t *o, bool on)
+{
+    if (!o) return;
+    if (on) lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
+    else    lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+}
 static lv_obj_t *s_live_fill, *s_live_lbl, *s_rec_dot, *s_rec_lbl;
 static lv_obj_t *s_band_lbl, *s_rec_btn_lbl, *s_tl_lbl, *s_tr_lbl;
 static lv_obj_t *s_clock;
@@ -107,6 +125,7 @@ static lv_obj_t *s_dial_freq, *s_dial_grid, *s_dial_note;
 
 /* Presets, library, settings */
 static lv_obj_t *s_preset_list, *s_library_list;
+static lv_obj_t *s_set_af, *s_set_af_note, *s_set_af_save;
 static lv_obj_t *s_set_region, *s_set_std, *s_set_backend, *s_set_capture,
                 *s_set_ta;
 static lv_obj_t *s_adv_list;
@@ -558,6 +577,21 @@ static void build_wide(void)
     lv_label_set_long_mode(s_w_rt, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_line_space(s_w_rt, 3, 0);
 
+    /*
+     * RadioText+, when the station sends it: the title and the artist pulled
+     * out of that same text as separate fields.
+     *
+     * Laid over the radio text rather than beside it. The two are the same
+     * characters - RT+ is markers INTO the RT buffer, not a second message -
+     * so showing both would be showing the same words twice, and the tidy
+     * version is the one worth the long edge. The raw text comes back the
+     * moment RT+ stops arriving.
+     */
+    s_w_title = wide_label(s, 16, 134, WIDE_W - 32, 30, "", F_STATION, C_TEXT);
+    lv_label_set_long_mode(s_w_title, LV_LABEL_LONG_DOT);
+    s_w_artist = wide_label(s, 16, 166, WIDE_W - 32, 24, "", F_BODY, C_RDS);
+    lv_label_set_long_mode(s_w_artist, LV_LABEL_LONG_DOT);
+
     /* Signal, as plain rectangles - no transform needed for those. */
     for (int i = 0; i < 20; i++)
         s_w_seg[i] = wide_panel(s, 16 + i * 12, 206, 8, 12, C_SURFACE_2);
@@ -591,6 +625,21 @@ static void refresh_wide(void)
     lv_label_set_text(s_w_date, buf);
 
     lv_label_set_text(s_w_ps, rp_model.rds.ps_valid ? rp_model.rds.ps : "");
+
+    /* Tidy or raw, never both: RT+ is markers into the radio text, so showing
+       the two together would be showing the same words twice. */
+    bool tidy = rp_model.rds.rt_title_valid || rp_model.rds.rt_artist_valid;
+    show(s_w_title, tidy);
+    show(s_w_artist, tidy);
+    show(s_w_rt, !tidy);
+    if (tidy) {
+        lv_label_set_text(s_w_title,
+                          rp_model.rds.rt_title_valid ? rp_model.rds.rt_title
+                                                      : "");
+        lv_label_set_text(s_w_artist,
+                          rp_model.rds.rt_artist_valid ? rp_model.rds.rt_artist
+                                                       : "");
+    }
 
     buf[0] = 0;
     if (rp_model.rds.pi_valid)
@@ -712,6 +761,43 @@ static void on_bar_tap(lv_event_t *e)
  * sequence, so being able to ask for mono and see the pill stay lit is how
  * that gets found out - immediately, and by looking.
  */
+/* ---- following the station ------------------------------------------------
+ *
+ * Pumped from the frame callback like the scan and the recording timer, so it
+ * keeps working while the user is on another screen - which is the entire
+ * point of a feature for driving out of range.
+ */
+static void af_pump(void)
+{
+    static uint32_t last_ms;
+    if (!rp_model.af.enabled) { last_ms = lv_tick_get(); return; }
+
+    uint32_t now = lv_tick_get();
+    uint32_t dt = now - last_ms;
+    last_ms = now;
+    if (dt > 1000) dt = 0;      /* first tick, or a clock that jumped */
+
+    uint32_t khz = 0;
+    if (en_af_tick(&rp_model.af, dt, rp_model.khz, rp_model.rssi,
+                   &rp_model.rds, &khz) == EN_AF_GOTO)
+        rp_act_tune_quiet(khz);
+}
+
+/*
+ * Tapping the badge turns following off.
+ *
+ * The badge is the control on purpose. The situation this feature can get
+ * wrong is standing near a transmitter advertising frequencies that are not
+ * what it says they are, and in that situation the thing showing you it is
+ * happening should be the thing that stops it - not a switch three screens
+ * away in a settings list.
+ */
+static void on_af_tap(lv_event_t *e)
+{
+    (void)e;
+    rp_act_af_follow(!rp_model.af.enabled);
+}
+
 static void on_stereo_tap(lv_event_t *e)
 {
     (void)e;
@@ -799,6 +885,12 @@ static void build_now(void)
     /* Pills first, on their own row. They were beside the meter and overlapped
        it - the meter is 176 px wide and TRAFFIC ran off the right edge - which
        is the sort of thing only a rendered screen shows you. */
+    s_af_badge = pill(s, MARGIN + 150, 258, "AF", C_RDS);
+    lv_obj_add_flag(s_af_badge, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_af_badge, on_af_tap, LV_EVENT_CLICKED, 0);
+    lv_obj_set_style_bg_color(s_af_badge, lv_color_hex(C_SURFACE_2),
+                              LV_STATE_PRESSED);
+
     s_stereo = pill(s, MARGIN, 258, "STEREO", C_SIGNAL);
     /* A pill is normally a readout. This one is also a control, so it gets a
        target the size of the chip rather than the size of the text. */
@@ -969,6 +1061,16 @@ static void refresh_now(void)
         if (sl) lv_label_set_text(sl, stereo_mode_text(rp_model.stereo_mode));
         pill_set(s_stereo, rp_model.stereo,
                  rp_model.stereo_mode == EN_FM_STEREO_AUTO ? C_SIGNAL : C_TA);
+    }
+
+    if (s_af_badge) {
+        /* The label says what it is doing - watching, weak, trying, waiting -
+           so a retune the listener did not ask for has something on screen
+           that already explained itself. */
+        lv_obj_t *al = lv_obj_get_child(s_af_badge, 0);
+        if (al) lv_label_set_text(al, en_af_state_text(&rp_model.af));
+        pill_set(s_af_badge, rp_model.af.enabled,
+                 rp_model.af.phase == EN_AF_TRYING ? C_TA : C_RDS);
     }
     pill_set(s_ta_badge, rp_model.rds.ta, C_TA);
 
@@ -1170,6 +1272,13 @@ static void refresh_dial(void)
         put_uint(n, rp_model.region->step_khz, 0);
         cat(buf, n, sizeof buf);
         cat(buf, " kHz", sizeof buf);
+
+        /* Said once, where the picture is: a sweep that jumped between
+           stations knows nothing about the space between them, and a strip
+           that looked continuous would be claiming otherwise. */
+        if (s_scan.profile_n && s_scan.phase != EN_SCAN_SWEEP)
+            cat(buf, s_scan.profile_sparse ? "   stations only" : "   scanned",
+                sizeof buf);
     }
     lv_label_set_text(s_dial_note, buf);
 
@@ -1180,6 +1289,37 @@ static void refresh_dial(void)
 
     uint32_t lo = rp_model.region->low_khz, hi = rp_model.region->high_khz;
     if (hi <= lo) return;
+
+    /*
+     * The band profile, if a scan has been run: one bar per channel, as tall
+     * as the signal there was.
+     *
+     * Drawn under everything else and in the surface colour, so it reads as
+     * ground rather than as data competing with the preset ticks. The bars
+     * are one pixel wide and drawn only where the profile has something,
+     * which after a seeking sweep is only at the stations - joining those up
+     * would draw valleys nobody measured.
+     */
+    if (s_scan.profile_n) {
+        /* Standing on the hairline at y = 22 and growing upward, so the
+           landscape and the preset ticks share one baseline and read as one
+           strip rather than two things at different heights. */
+        const int base = 22, max_h = 18;
+        for (uint16_t i = 0; i < s_scan.profile_n; i++) {
+            uint8_t v = s_scan.profile[i];
+            if (!v) continue;
+            int h = (v * max_h) / 255;
+            if (h < 1) h = 1;
+            int x = MARGIN + (int)((uint32_t)i * (uint32_t)CONTENT_W /
+                                   s_scan.profile_n);
+            /* As wide as a channel is on screen, so the floor reads as a
+               floor rather than as a dotted line with gaps in it. */
+            int w = CONTENT_W / (int)s_scan.profile_n;
+            if (w < 1) w = 1;
+            panel(s_dial_grid, x, base - h, w, h,
+                  s_scan.profile_sparse ? C_RDS : C_TEXT_MUTE);
+        }
+    }
 
     panel(s_dial_grid, MARGIN, 22, CONTENT_W, 1, C_HAIRLINE);
 
@@ -1208,7 +1348,6 @@ static void refresh_dial(void)
  * because the whole point of a scan is that you can stop watching it.
  */
 
-static en_scan_t s_scan;
 static uint32_t  s_scan_last_ms;
 static uint8_t   s_scan_added;
 static uint8_t   s_scan_note_for;   /* refresh ticks the result stays up */
@@ -1678,6 +1817,31 @@ static void on_ta_toggle(lv_event_t *e)
     rp_act_ta_record(!rp_model.ta_record);
 }
 
+static void on_af_toggle(lv_event_t *e)
+{
+    (void)e;
+    rp_act_af_follow(!rp_model.af.enabled);
+}
+
+/* How long the AF-to-presets result stays on the row, in refresh ticks. */
+static uint8_t s_af_saved_for;
+static uint8_t s_af_saved_n;
+
+/*
+ * Turn the station's own alternate-frequency list into presets.
+ *
+ * A neat trick rather than a workaround: the station has just told us every
+ * frequency it can be heard on, which is a better preset list for a journey
+ * than anything built by turning a dial - and unlike a band scan it costs
+ * nothing and takes no time, because the list already arrived.
+ */
+static void on_af_presets(lv_event_t *e)
+{
+    (void)e;
+    s_af_saved_n = rp_act_af_to_presets();
+    s_af_saved_for = 40;
+}
+
 static void on_simple_toggle(lv_event_t *e)
 {
     (void)e;
@@ -1792,6 +1956,24 @@ static void build_settings(void)
     lv_obj_set_pos(s_set_ta, MARGIN, 14);
     y += 48;
 
+    /* Following the station across transmitters. Off by default, and the
+       badge on Now Playing is the other way to turn it off - which is the one
+       that matters, because the moment you want it off is the moment you are
+       watching it do something wrong. */
+    r = setting_row(s, y, 62, "Follow station (AF)", 0, on_af_toggle);
+    s_set_af = row_value(r, C_RDS);
+    lv_obj_set_pos(s_set_af, MARGIN, 14);
+    s_set_af_note = para(r, "Only moves to a matching station ID, and only if "
+                            "it is stronger.", F_CAPTION, C_TEXT_MUTE,
+                         CONTENT_W);
+    lv_obj_set_pos(s_set_af_note, MARGIN, 32);
+    y += 62;
+
+    r = setting_row(s, y, 48, "Save alternates as presets", 0, on_af_presets);
+    s_set_af_save = row_value(r, C_SIGNAL);
+    lv_obj_set_pos(s_set_af_save, MARGIN, 14);
+    y += 48;
+
     /* The two optional screens. Both add a page to the swipe sequence, which
        is why they are a setting and not always on: a sequence you have learned
        should not grow a page because someone shipped a feature. */
@@ -1813,8 +1995,11 @@ static void build_settings(void)
 
     /* Last item in the scroll rather than pinned to the bottom, so it cannot
        land on top of whatever the last row happens to be. */
-    lv_obj_t *stamp = label(s, "build " __DATE__ " " __TIME__,
-                            F_CAPTION, C_TEXT_MUTE);
+    /* The real build stamp, not __DATE__: that expands when THIS file is
+       compiled, so a binary relinked after a change elsewhere would carry a
+       date older than itself. This one comes from the makefile and is the
+       same string in every app, alongside the commit it was built from. */
+    lv_obj_t *stamp = label(s, en_build_version(), F_CAPTION, C_TEXT_MUTE);
     lv_obj_set_pos(stamp, MARGIN, y + 60);
 }
 
@@ -1829,6 +2014,30 @@ static void refresh_settings(void)
                       rp_model.capture_backend ? rp_model.capture_backend
                                                : "not started");
     lv_label_set_text(s_set_ta, rp_model.ta_record ? "On" : "Off");
+
+    /* The state text, not just on/off: "AF TRY" on a settings row is how you
+       find out the radio is mid-attempt while you are looking at settings. */
+    lv_label_set_text(s_set_af, rp_model.af.enabled
+                                    ? en_af_state_text(&rp_model.af) : "Off");
+    lv_obj_set_style_text_color(s_set_af,
+        lv_color_hex(rp_model.af.enabled ? C_RDS : C_TEXT_MUTE), 0);
+
+    if (s_af_saved_for) {
+        char b[48];
+        b[0] = 0;
+        put_uint(b, s_af_saved_n, 0);
+        cat(b, s_af_saved_n == 1 ? " added" : " added", sizeof b);
+        lv_label_set_text(s_set_af_save, b);
+        s_af_saved_for--;
+    } else {
+        char b[48];
+        b[0] = 0;
+        put_uint(b, rp_model.rds.af_count, 0);
+        cat(b, rp_model.rds.af_count == 1 ? " on offer" : " on offer",
+            sizeof b);
+        lv_label_set_text(s_set_af_save,
+                          rp_model.rds.af_count ? b : "none advertised");
+    }
     lv_label_set_text(s_set_simple, rp_model.simple_screen ? "On" : "Off");
     lv_obj_set_style_text_color(s_set_simple,
         lv_color_hex(rp_model.simple_screen ? C_SIGNAL : C_TEXT_MUTE), 0);
@@ -2386,6 +2595,7 @@ void rp_ui_tick(void)
        screen that set them going. */
     scan_pump();
     rectimer_pump();
+    af_pump();
 
     switch (s_current) {
     case RP_SCREEN_SIMPLE:   refresh_simple();   break;

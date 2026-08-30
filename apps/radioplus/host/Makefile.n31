@@ -74,7 +74,7 @@ LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_n31.h\"
              -I$(LVGL_SRC) -I$(LVGL_SRC)/src -I$(LVGL_SRC)/include -I$(LVGL_SRC)/.. -I..
 
 CORE_SRCS := $(CORE)/fmcmd.c $(CORE)/fmreg.c $(CORE)/rds.c $(CORE)/region.c \
-             $(CORE)/wav.c $(CORE)/store.c $(CORE)/scan.c $(CORE)/timer.c
+             $(CORE)/wav.c $(CORE)/store.c $(CORE)/scan.c $(CORE)/timer.c $(CORE)/affollow.c ../../build_stamp.c
 
 PLAT_SRCS := $(PLAT)/tuner_linux.c $(PLAT)/capture_linux.c \
              $(PLAT)/player_linux.c $(PLAT)/model_linux.c
@@ -84,6 +84,16 @@ APP_SRCS := main_n31.c ../ui.c $(CORE_SRCS) $(PLAT_SRCS)
 
 OBJS := $(patsubst %.c,$(BUILD)/%.o,$(notdir $(CORE_SRCS) $(PLAT_SRCS)))
 HDRS := $(wildcard $(CORE)/*.h $(PLAT)/*.h ../*.h)
+
+
+# ---- build stamp -----------------------------------------------------------
+#
+# Which build is this. An app sitting on the device that is months old looks
+# exactly like the one just compiled, right up until an afternoon goes into
+# debugging something that was fixed in April.
+BUILD_STAMP := $(shell date -u +%Y%m%d.%H%M)
+BUILD_GIT   := $(shell git rev-parse --short=7 HEAD 2>/dev/null || echo nogit)
+CFLAGS += -DEN_BUILD_STAMP='"$(BUILD_STAMP)"' -DEN_BUILD_GIT='"$(BUILD_GIT)"'
 
 .PHONY: all app objs push run log stop clean clean-lvgl toolchain-check
 

@@ -234,6 +234,27 @@ int main(int argc, char **argv)
         made++;
     }
 
+    /* Let the scan run to the end, then re-shoot the dial. The band
+       profile only exists once a sweep has been over the band, and a
+       dial with an empty strip is a picture of the feature not
+       working rather than of the feature. */
+    /* On the dial while it runs, not the preset list: every tick of the
+       list rebuilds its rows, and forty seconds of that is most of the
+       preview's runtime for a screen nobody is looking at. */
+    rp_ui_show(RP_SCREEN_DIAL);
+    for (int i = 0; i < 45000 / 33; i++) {
+        s_ms += 33;
+        rp_model_refresh();
+        rp_ui_tick();
+    }
+    rp_ui_tick();
+    settle();
+    snprintf(path, sizeof path, "%s/2b-dial-scanned.bmp", out);
+    if (write_bmp(path, s_fb, RP_SCREEN_W, RP_SCREEN_H)) {
+        printf("  %s\n", path);
+        made++;
+    }
+
     printf("%d screens\n", made);
     return made ? 0 : 1;
 }

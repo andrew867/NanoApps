@@ -52,6 +52,12 @@
    first forty and dropped the rest would look like a complete scan. */
 #define EN_SCAN_MAX_HITS 40
 
+/* One byte per channel of the widest band we support. Japan's 76-95 MHz at
+   100 kHz is 191; Europe's 87.5-108 is 206; the Americas at 200 kHz is 101.
+   Sized above all of them, and a band longer than this simply records the
+   part that fits rather than refusing to scan. */
+#define EN_SCAN_PROFILE_MAX 256
+
 typedef struct {
     uint32_t khz;
     uint8_t  rssi;                        /* the best seen while dwelling */
@@ -107,6 +113,23 @@ typedef struct {
        that leaves you on a different station than you started on has taken
        something away as well as given something. */
     uint32_t resume_khz;
+
+    /*
+     * What the band looked like: one signal reading per channel, kept from
+     * the sweep so the dial can draw the landscape instead of a bare line.
+     *
+     * Nearly free - the sweep measured every one of these anyway and then
+     * threw all but the peaks away.
+     *
+     * Only the SOFTWARE sweep visits every channel; a seeking sweep jumps
+     * between stations and never looks at what is in between. So the profile
+     * is marked as sparse in that case and the dial draws spikes at the
+     * stations rather than a continuous floor - which is honest, and better
+     * than a landscape with invented valleys in it.
+     */
+    uint8_t  profile[EN_SCAN_PROFILE_MAX];
+    uint16_t profile_n;
+    bool     profile_sparse;
 } en_scan_t;
 
 /*

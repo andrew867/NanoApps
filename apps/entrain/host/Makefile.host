@@ -27,11 +27,21 @@ include ../../lvgl-mirror.mk
 BUILD   := build
 
 CORE_SRCS := $(CORE)/osc.c $(CORE)/noise.c $(CORE)/render.c \
-             $(CORE)/program.c $(CORE)/measured.c $(CORE)/progfile.c $(CORE)/freqset.c $(CORE)/wavout.c
+             $(CORE)/program.c $(CORE)/measured.c $(CORE)/progfile.c $(CORE)/freqset.c ../../build_stamp.c $(CORE)/wavout.c
 
 WARN    := -Wall -Wextra -Wshadow -Wpointer-arith
 CFLAGS  ?= -O2 -g -std=c99 $(WARN)
 LDLIBS  := -lm
+
+
+# ---- build stamp -----------------------------------------------------------
+#
+# Which build is this. An app sitting on the device that is months old looks
+# exactly like the one just compiled, right up until an afternoon goes into
+# debugging something that was fixed in April.
+BUILD_STAMP := $(shell date -u +%Y%m%d.%H%M)
+BUILD_GIT   := $(shell git rev-parse --short=7 HEAD 2>/dev/null || echo nogit)
+CFLAGS += -DEN_BUILD_STAMP='"$(BUILD_STAMP)"' -DEN_BUILD_GIT='"$(BUILD_GIT)"'
 
 .PHONY: all test glyphs wav host run shots clean clean-lvgl
 

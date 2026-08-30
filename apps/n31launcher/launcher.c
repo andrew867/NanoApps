@@ -135,6 +135,17 @@ static pid_t s_child;             /* a running app */
 static bool  s_child_console;     /* it draws through the console, not fb0 */
 static screen_t s_child_from;     /* the screen to come back to */
 static uint32_t s_launched_at;
+static char     s_launched_prog[32];
+
+/* Defined below with the other reporting; declared here because the reaper
+   above it is where a child's exit is noticed. */
+static void report_exit(int status, uint32_t ran_for);
+
+/* An app that goes away sooner than this did not start, it failed. Long
+   enough to cover a slow mount and the autostart script's own setup, short
+   enough that nobody would have opened and closed something on purpose
+   inside it. */
+#define STARTED_MS 3000
 
 static n31_status_t s_status;
 
@@ -260,6 +271,16 @@ static bool launch(const n31_app_t *a)
     setpgid(pid, pid);            /* also here: whichever wins, it is set */
     s_child = pid;
     s_launched_at = millis();
+
+    /* Kept so a failure note can name the app rather than saying "it". */
+    {
+        size_t i = 0;
+        while (a->prog[i] && i < sizeof s_launched_prog - 1) {
+            s_launched_prog[i] = a->prog[i];
+            i++;
+        }
+        s_launched_prog[i] = 0;
+    }
     return true;
 }
 
@@ -354,12 +375,73 @@ static bool app_gone(void)
 {
     if (!s_child) return false;
 
-    pid_t r = waitpid(s_child, NULL, WNOHANG);
+    int status = 0;
+    pid_t r = waitpid(s_child, &status, WNOHANG);
     if (r != s_child && !(r < 0 && errno == ECHILD)) return false;
 
+    uint32_t ran_for = millis() - s_launched_at;
     s_child = 0;
     after_app();
+    report_exit(status, ran_for);
     return true;
+}
+
+/*
+ * What just happened to the app, on the home screen.
+ *
+ * Only when something went wrong: an app that ran for a while and left with
+ * nothing to say is somebody pressing HOME, and a launcher that commented on
+ * that would be noise. Quick or unhappy is the interesting case, and it is
+ * the one that used to be silent.
+ */
+static void report_exit(int status, uint32_t ran_for)
+{
+    bool exited = WIFEXITED(status);
+    int  code = exited ? WEXITSTATUS(status) : 0;
+    bool killed = WIFSIGNALED(status);
+
+    if (!killed && exited && code == 0 && ran_for >= STARTED_MS) return;
+
+    char note[192];
+    int n = 0;
+
+    n += snprintf(note + n, sizeof note - (size_t)n, "%s ",
+                  s_launched_prog[0] ? s_launched_prog : "app");
+
+    if (killed)
+        n += snprintf(note + n, sizeof note - (size_t)n, "was killed (signal %d)",
+                      WTERMSIG(status));
+    else if (code == 127)
+        /* The exec chain in launch() ends in _exit(127), and so does the
+           shell's "not found" - either way nothing ran. */
+        n += snprintf(note + n, sizeof note - (size_t)n, "was not found");
+    else if (code)
+        n += snprintf(note + n, sizeof note - (size_t)n, "exited (code %d)",
+                      code);
+    else
+        n += snprintf(note + n, sizeof note - (size_t)n,
+                      "closed straight away");
+
+    /* And what autostart said it was going to run, which is the difference
+       between "started" and "started the build I just made". */
+    FILE *f = fopen("/tmp/n31-autostart.log", "r");
+    if (f) {
+        char line[160], last[160];
+        last[0] = 0;
+        while (fgets(line, sizeof line, f)) {
+            size_t l = strlen(line);
+            while (l && (line[l - 1] == '\n' || line[l - 1] == '\r'))
+                line[--l] = 0;
+            if (l) snprintf(last, sizeof last, "%s", line);
+        }
+        fclose(f);
+        if (last[0])
+            snprintf(note + n, sizeof note - (size_t)n, " - %s", last);
+    }
+
+    printf("n31launcher: %s\n", note);
+    fflush(stdout);
+    n31_ui_home_note(note);
 }
 
 /* ---- the list ------------------------------------------------------------- */

@@ -60,6 +60,12 @@ bool en_scan_start(en_scan_t *s, const en_region_t *rg, uint32_t from_khz,
     s->n_hits = 0;
     s->overflowed = false;
     s->resume_khz = from_khz;
+
+    s->profile_n = (uint16_t)(n > EN_SCAN_PROFILE_MAX ? EN_SCAN_PROFILE_MAX : n);
+    for (uint16_t i = 0; i < s->profile_n; i++) s->profile[i] = 0;
+    /* A seeking sweep never looks at the empty channels, so what it produces
+       is spikes rather than a landscape, and the dial has to know which. */
+    s->profile_sparse = use_seek;
     return true;
 }
 
@@ -86,6 +92,15 @@ void en_scan_seek_failed(en_scan_t *s)
 static void observe(en_scan_t *s, uint8_t rssi)
 {
     if (rssi > s->peak) s->peak = rssi;
+}
+
+/* Note this channel's reading in the band profile, wherever it falls. */
+static void profile_put(en_scan_t *s, uint32_t khz, uint8_t rssi)
+{
+    if (!s->region || !s->region->step_khz || khz < s->region->low_khz) return;
+    uint32_t i = (khz - s->region->low_khz) / s->region->step_khz;
+    if (i >= s->profile_n) return;
+    if (rssi > s->profile[i]) s->profile[i] = rssi;
 }
 
 static void record(en_scan_t *s, uint32_t khz, uint8_t rssi)
@@ -124,6 +139,7 @@ static en_scan_req_t start_naming(en_scan_t *s, uint32_t *tune_khz)
 /* One channel at a time, in software. */
 static en_scan_req_t sweep_step(en_scan_t *s, uint32_t *tune_khz)
 {
+    profile_put(s, s->khz, s->peak);
     if (s->peak >= s->threshold) record(s, s->khz, s->peak);
 
     s->done++;
@@ -191,6 +207,7 @@ static en_scan_req_t sweep_seek(en_scan_t *s, uint32_t khz, uint32_t *tune_khz)
     if ((s->region && s->khz <= s->region->low_khz) || s->khz < s->from_khz)
         return start_naming(s, tune_khz);
 
+    profile_put(s, s->khz, s->peak);
     if (s->peak >= s->threshold) record(s, s->khz, s->peak);
 
     /* Progress is where in the band we are, which is the only honest measure

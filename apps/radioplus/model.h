@@ -15,6 +15,7 @@
 
 #include "core/rds.h"
 #include "core/region.h"
+#include "core/affollow.h"
 #include "core/store.h"
 
 typedef struct {
@@ -61,6 +62,10 @@ typedef struct {
        rather than private to the UI because it persists, and persistence is
        the platform's job. */
     en_rectimer_t rectimer;
+
+    /* Following the station across transmitters. The whole state, not just
+       the on/off, because the badge shows what it is doing. */
+    en_affollow_t af;
     bool     ta_recording;       /* one is being recorded right now */
 
     /* Which optional screens are in the swipe order. Here rather than private
@@ -131,6 +136,17 @@ void rp_act_power(bool on);
 /* Auto, forced mono, or forced stereo. Forced mono is the useful one: a weak
    station is steadier in mono than blending in and out of it. */
 void rp_act_stereo_mode(uint8_t mode);
+
+/* Turn station-following on or off. Off is the default and has to stay one
+   tap away: a misconfigured transmitter nearby is exactly the case where you
+   want out immediately. */
+void rp_act_af_follow(bool on);
+
+/* Save every alternate frequency this station advertises as a preset. The
+   station has just told us where else it can be heard; that is a better
+   preset list than one built by turning a dial. Returns how many were added
+   or updated. */
+uint8_t rp_act_af_to_presets(void);
 void rp_act_record_toggle(void);
 void rp_act_save_live(uint32_t ms);
 void rp_act_preset_toggle(void);

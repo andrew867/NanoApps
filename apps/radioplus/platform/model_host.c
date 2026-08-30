@@ -107,6 +107,37 @@ static void seed_presets(void)
     }
 }
 
+/*
+ * A plausible band, for the preview only.
+ *
+ * A fixed reading at every frequency makes a scan of the desktop build come
+ * out perfectly flat, which is a picture of the drawing code working and of
+ * nothing else. Six stations of different strengths over a noise floor is
+ * what the dial's band strip exists to show.
+ */
+static uint8_t fake_band_rssi(uint32_t khz)
+{
+    static const struct { uint32_t khz; uint8_t rssi; } ON_AIR[] = {
+        {  88100, 210 }, {  93500, 150 }, {  97500, 235 },
+        {  99100,  96 }, { 102900, 180 }, { 106900, 120 },
+    };
+    for (unsigned i = 0; i < sizeof ON_AIR / sizeof ON_AIR[0]; i++) {
+        uint32_t d = khz > ON_AIR[i].khz ? khz - ON_AIR[i].khz
+                                         : ON_AIR[i].khz - khz;
+        /* A transmitter is not a spike: it spreads over a few channels, which
+           is what makes the strip look like a band rather than a barcode. */
+        if (d <= 400) {
+            uint32_t v = ON_AIR[i].rssi;
+            v = v - (v * d) / 600u;
+            return (uint8_t)v;
+        }
+    }
+    /* The floor wanders a little with frequency, so the empty parts of the
+       band are not a ruled line. Derived from the frequency rather than from
+       a random number, so every run draws the same picture. */
+    return (uint8_t)(14 + (khz / 300u) % 9u);
+}
+
 void rp_model_refresh(void)
 {
     static bool seeded;
@@ -143,13 +174,27 @@ void rp_model_refresh(void)
     rp_model.recording = s_recording;
     rp_model.rec_ms = s_rec_ms;
     if (s_recording) s_rec_ms += 100;
+    /* Follows the dial, so a scan of the preview sees a band. */
+    rp_model.rssi = fake_band_rssi(rp_model.khz);
+
 }
 
 /* ---- actions ------------------------------------------------------------- */
 
-void rp_act_tune(uint32_t khz) { rp_model.khz = khz; }
+void rp_act_tune(uint32_t khz)
+{
+    /* A station the listener chose is the follower's new home. */
+    en_af_retuned(&rp_model.af, khz);
+    rp_model.khz = khz;
+}
 
-void rp_act_tune_quiet(uint32_t khz) { rp_act_tune(khz); }
+void rp_act_tune_quiet(uint32_t khz)
+{
+    /* See the note in model_linux.c: a retune made on the listener's behalf
+       is not the listener choosing a station, and the follower must not treat
+       its own move as one. */
+    rp_model.khz = khz;
+}
 
 /* Nothing to persist to on the desktop: the preview keeps its presets in
    memory and is thrown away with the process. */
@@ -176,6 +221,42 @@ bool rp_act_seek_quiet(bool up) { (void)up; return false; }
 /* No tuner: the preview remembers the choice so the control can be seen
    working, and nothing else happens. */
 void rp_act_stereo_mode(uint8_t mode) { rp_model.stereo_mode = mode; }
+
+void rp_act_af_follow(bool on)
+{
+    uint32_t back = 0;
+    if (en_af_enable(&rp_model.af, on, &back) == EN_AF_GOTO)
+        rp_act_tune(back);
+    
+}
+
+uint8_t rp_act_af_to_presets(void)
+{
+    /* Whatever the station is advertising right now. The PI and programme
+       type come from what is being received, so the presets arrive named as
+       far as RDS has got - and the frequency is the point regardless. */
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < rp_model.rds.af_count; i++) {
+        uint32_t khz = rp_model.rds.af[i];
+        if (!khz) continue;
+        if (en_preset_find(&rp_model.presets, khz) >= 0) continue;
+
+        en_preset_t e;
+        memset(&e, 0, sizeof e);
+        e.khz = khz;
+        e.pi = rp_model.rds.pi;
+        e.pty = rp_model.rds.pty;
+        e.rbds = rp_model.rds.rbds;
+        if (rp_model.rds.ps_valid)
+            snprintf(e.name, sizeof e.name, "%s", rp_model.rds.ps);
+        if (en_preset_add(&rp_model.presets, &e)) n++;
+    }
+    if (n) {
+        en_preset_sort(&rp_model.presets);
+        
+    }
+    return n;
+}
 
 void rp_act_step(bool up)
 {

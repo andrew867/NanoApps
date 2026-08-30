@@ -59,7 +59,17 @@ LVLIB   := $(LV_CACHE)/liblvgl_preview.a
 
 SRCS := preview.c ../ui.c $(PLAT)/model_host.c \
         $(CORE)/fmcmd.c $(CORE)/fmreg.c $(CORE)/rds.c $(CORE)/region.c \
-        $(CORE)/wav.c $(CORE)/store.c $(CORE)/scan.c $(CORE)/timer.c
+        $(CORE)/wav.c $(CORE)/store.c $(CORE)/scan.c $(CORE)/timer.c $(CORE)/affollow.c ../../build_stamp.c
+
+
+# ---- build stamp -----------------------------------------------------------
+#
+# Which build is this. An app sitting on the device that is months old looks
+# exactly like the one just compiled, right up until an afternoon goes into
+# debugging something that was fixed in April.
+BUILD_STAMP := $(shell date -u +%Y%m%d.%H%M)
+BUILD_GIT   := $(shell git rev-parse --short=7 HEAD 2>/dev/null || echo nogit)
+CFLAGS += -DEN_BUILD_STAMP='"$(BUILD_STAMP)"' -DEN_BUILD_GIT='"$(BUILD_GIT)"'
 
 .PHONY: shots clean clean-lvgl
 
