@@ -453,11 +453,29 @@ int main(int argc, char **argv)
             if (write_bmp(path)) printf("  %s\n", path);
         }
 
-        /* And a second Library shot on the Programs tab, which is the view
-           most of the app's content actually lives in. */
-        en_ui_goto(EN_SCREEN_LIBRARY, false);
-        pump(5);
-        lv_refr_now(disp);
+        /* And one shot per Library shelf. The shot above is the root list;
+           these are what is on the shelves, which is where the app's content
+           actually lives. This block used to render a second Library view and
+           then never write it out, so it produced nothing at all. */
+        static const struct { int tab; const char *name; } SHELVES[] = {
+            { 0, "library-presets" },
+            { 1, "library-programs" },
+            { 3, "library-suites" },
+        };
+        for (unsigned i = 0; i < sizeof SHELVES / sizeof SHELVES[0]; i++) {
+            en_ui_goto(EN_SCREEN_LIBRARY, false);
+            en_ui_set_tab(SHELVES[i].tab);
+            pump(20);
+            lv_refr_now(disp);
+
+            char path[512];
+            snprintf(path, sizeof path, "%s/%s.bmp", shot_dir, SHELVES[i].name);
+            if (write_bmp(path)) printf("  %s\n", path);
+        }
+
+        /* Leave it on the root, so the library shot above is what a rerun
+           reproduces rather than whichever shelf happened to be last. */
+        en_ui_set_tab(-1);
 
         en_ui_shutdown();
         return 0;

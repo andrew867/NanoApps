@@ -12,13 +12,15 @@ nothing else. See [No claims](#no-claims).
 
 | | | |
 | --- | --- | --- |
-| ![Library](screenshots/library.png) | ![Now Playing](screenshots/now-playing.png) | ![Live Tune](screenshots/live-tune.png) |
-| Library | Now Playing | Live Tune |
+| ![Library](screenshots/library.png) | ![Presets](screenshots/library-presets.png) | ![Suites](screenshots/library-suites.png) |
+| Library — four shelves | Presets | Suites |
+| ![Now Playing](screenshots/now-playing.png) | ![Live Tune](screenshots/live-tune.png) | ![Programs](screenshots/library-programs.png) |
+| Now Playing | Live Tune | Programs |
 | ![Sleep Timer](screenshots/timer.png) | ![Settings](screenshots/settings.png) | ![First run](screenshots/first-run.png) |
 | Sleep Timer | Settings | First run |
 
 These are rendered from the host build at the device's exact 240x432, with
-`make -f Makefile.host shots` — no display or window manager required.
+`cd host && make -f Makefile.host shots` — no display or window manager required.
 
 ## What it does
 
@@ -30,6 +32,10 @@ These are rendered from the host build at the device's exact 240x432, with
   a 7.83 Hz Schumann preset. Every one realises its requested beat exactly —
   see the table below.
 - **Six programs**: timelines that ramp the beat over 15 to 60 minutes.
+- **Four suites**: longer sessions that sound two or three carriers at once,
+  each layer with its own beat and gain envelope.
+- **A library you can browse.** Four shelves — Presets, Programs, Suites,
+  Custom — rather than three tabs across the top, which had run out of room.
 - **Noise beds**: white, pink (Kellett 3-pole) or brown, mixable under the
   tones with their own level.
 - **Live Tune**: drag to move the beat and carrier while the current loop keeps
@@ -103,6 +109,55 @@ did not move at all.
 
 A program is a chain of segments rendered through one renderer, so its
 oscillator phases carry across every join and the beat never jumps.
+
+These six glide linearly between their breakpoints, which is what they were
+written against. The suites below use smoothstep instead, per segment.
+
+## Suites
+
+Four longer sessions that sound **more than one carrier at once**. A segment
+can carry up to four layers, each with its own mode, beat and gain envelope,
+mixed over one shared noise bed.
+
+Listed in the app as **Extended Practice**, **Stage 1**, **Stage 2** and
+**Stage 3**; the descriptions below are what each one's detail line says.
+
+| Suite | Length | Layers | Shape |
+| --- | --- | --- | --- |
+| Extended Practice | 100 min | 200 Hz + 260 Hz | 10-7-4 Hz descent, a layered 4 Hz block with a steady 7 Hz above it, then a return to 12 Hz |
+| Stage 1 (Orientation) | 36 min | 300 / 104 / 496 Hz | Settle at 10 Hz, ease to 7 Hz, hold, return to 12 Hz |
+| Stage 2 (Body Still) | 38 min | 300 / 104 / 496 Hz | 10 Hz down to a sustained 4 Hz, then out |
+| Stage 3 (Field Practice) | 38 min | 300 / 104 / 496 Hz | As stage 2, then rise and settle three times |
+
+### Where they come from
+
+The **schedule** is ported — beat breakpoints, layer carriers, per-phase gains
+— read out of the generators' own metadata in a research archive of original
+synthesised practice audio. No recording was decoded, sampled or reproduced,
+and no third-party audio is involved. The stage names are the archive's own,
+chosen there to be neutral, and they are used here unchanged. As everywhere
+else in this app, no effect of any kind is claimed. See
+[No claims](#no-claims) and [Trademark](#trademark).
+
+### Two conventions the port keeps
+
+**Levels are normalised to the main carrier.** The archive works in absolute
+peak amplitude — 0.070 for a main carrier, 0.045 and 0.018 for the others,
+about -23 dBFS — which is right for a mastered hundred-minute file and twenty
+decibels below everything else in this library. Normalising preserves the
+balance between layers exactly while letting the segment's master gain put the
+mix where the rest of the app sits. The one relationship a listener would
+notice, the 13.7 dB between the two layers of Extended Practice, is asserted by
+a test against the rendered PCM.
+
+**Glides are smoothstep.** These are chains of holds and glides, and a linear
+glide arriving at a hold has a corner in it — over a forty-minute descent that
+corner is the moment you notice.
+
+Layer gains are absolute and **sum**; nothing normalises them at render time,
+because normalising a mix whose balance is the point of it would silently
+rescale exactly what was ported. A test checks every segment of every suite
+stays under full scale once the master gain and headroom are applied.
 
 ## User programs
 

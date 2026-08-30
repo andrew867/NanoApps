@@ -24,13 +24,32 @@ SSH_KEY   ?= $(IPOD_ROOT)/n31_id
 DEVICE    ?= root@192.168.7.2
 
 CROSS   := $(TOOLCHAIN)/bin/arm-linux-musleabi-
-CC      := $(CROSS)gcc
+CCACHE  := $(shell command -v ccache 2>/dev/null)
+CC      := $(CCACHE) $(CROSS)gcc
 AR      := $(CROSS)ar
 STRIP   := $(CROSS)strip
 
 CORE    := ../core
 LVGL    ?= ../../../lvgl
+
+# Compile LVGL from a native mirror rather than across the Windows mount,
+# which is nineteen times faster - see apps/lvgl-mirror.mk.
+include ../../lvgl-mirror.mk
+
 BUILD   := build-n31
+
+# LVGL objects live on the native filesystem, not the Windows drive.
+#
+# A full pass measured twelve minutes wall for four and a half of CPU. The rest
+# was drvfs: four hundred and sixty-six object files written across the mount.
+#
+# The directory is named after the hash of the config that produced the
+# objects, so switching branch - which rewrites lv_conf and moves its mtime
+# without changing a byte - reuses what is already there instead of rebuilding
+# it, and flipping a config option back finds its old objects still present.
+LV_CONF    := lv_conf_n31.h
+LV_CONF_ID := $(shell md5sum $(LV_CONF) 2>/dev/null | cut -c1-12)
+LV_CACHE   ?= $(HOME)/.cache/n31-lvgl/entrain-n31-$(LV_CONF_ID)
 
 # Cortex-A8, Thumb-2, hardware FP but soft-float ABI, and no NEON.
 ARCH_FLAGS := -mcpu=cortex-a8 -mthumb -mfpu=vfpv3-d16 -mfloat-abi=softfp
@@ -42,7 +61,7 @@ LDFLAGS := -static -Wl,--gc-sections
 LDLIBS  := -lm -lpthread
 
 LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_n31.h\" \
-             -I$(LVGL) -I$(LVGL)/src -I$(LVGL)/include -I$(LVGL)/..
+             -I$(LVGL_SRC) -I$(LVGL_SRC)/src -I$(LVGL_SRC)/include -I$(LVGL_SRC)/..
 TA_CFLAGS := -I$(TINYALSA)/include
 
 CORE_SRCS := $(CORE)/osc.c $(CORE)/noise.c $(CORE)/render.c \
@@ -64,7 +83,7 @@ TA_SRCS   := $(TINYALSA)/src/pcm.c $(TINYALSA)/src/pcm_hw.c \
              $(TINYALSA)/src/snd_card_plugin.c $(TINYALSA)/src/limits.c
 
 # LVGL, minus every platform this target will never be.
-LV_SRCS := $(shell find $(LVGL)/src -name '*.c' \
+LV_SRCS := $(shell find $(LVGL_SRC)/src -name '*.c' \
              -not -name 'lv_freertos.c' -not -name 'lv_cmsis_rtos2.c' \
              -not -name 'lv_mqx.c'      -not -name 'lv_rtthread.c' \
              -not -name 'lv_windows.c'  -not -name 'lv_sdl2.c' \
@@ -75,10 +94,15 @@ LV_SRCS := $(shell find $(LVGL)/src -name '*.c' \
              -not -path '*/drivers/sdl/*'      -not -path '*/drivers/display/drm/*' \
              2>/dev/null)
 
-LV_OBJS := $(patsubst $(LVGL)/%.c,$(BUILD)/lvgl/%.o,$(LV_SRCS))
+LV_OBJS := $(patsubst $(LVGL_SRC)/%.c,$(LV_CACHE)/%.o,$(LV_SRCS))
 TA_OBJS := $(patsubst $(TINYALSA)/%.c,$(BUILD)/tinyalsa/%.o,$(TA_SRCS))
 
-.PHONY: all push push-programs run run-bg log stop fbcon-off fbcon-on clean clean-app toolchain-check
+.PHONY: all push push-programs run run-bg log stop fbcon-off fbcon-on clean clean-app clean-lvgl toolchain-check
+
+# Stated rather than implied. Adding a rule above `all` silently makes THAT
+# what a bare `make` builds, and the failure mode is a build that reports
+# success having done nothing.
+.DEFAULT_GOAL := all
 
 all: $(BUILD)/entrain
 
@@ -90,7 +114,10 @@ toolchain-check:
 $(BUILD):
 	@mkdir -p $(BUILD)
 
-$(BUILD)/lvgl/%.o: $(LVGL)/%.c lv_conf_n31.h
+# No lv_conf prerequisite: the cache directory name already carries that
+# file's hash, so a config change selects different objects rather than
+# invalidating these by timestamp.
+$(LV_CACHE)/%.o: $(LVGL_SRC)/%.c
 	@mkdir -p $(dir $@)
 	@$(CC) $(CFLAGS) -w $(LV_CFLAGS) -c -o $@ $<
 
@@ -98,9 +125,16 @@ $(BUILD)/tinyalsa/%.o: $(TINYALSA)/%.c
 	@mkdir -p $(dir $@)
 	@$(CC) $(CFLAGS) -w $(TA_CFLAGS) -c -o $@ $<
 
-$(BUILD)/liblvgl_n31.a: $(LV_OBJS)
+$(LV_CACHE)/liblvgl_n31.a: $(LV_OBJS)
 	@echo "  AR  $@"
 	@$(AR) crs $@ $^
+
+# Radio+ links this path directly, so the archive stays where it has always
+# been and only the objects behind it moved. Copying ten megabytes is nothing
+# against the twelve minutes it replaces, and it keeps that build working
+# without it having to know where this one caches.
+$(BUILD)/liblvgl_n31.a: $(LV_CACHE)/liblvgl_n31.a | $(BUILD)
+	@cp -f $< $@
 
 $(BUILD)/libtinyalsa_n31.a: $(TA_OBJS)
 	@echo "  AR  $@"
@@ -180,5 +214,10 @@ stop: $(KEY)
 clean-app:
 	rm -f $(BUILD)/entrain
 
+# Leaves the LVGL cache alone, which is the point of it: `clean` should cost
+# seconds, not twelve minutes. Use clean-lvgl to drop that too.
 clean:
 	rm -rf $(BUILD)
+
+clean-lvgl:
+	rm -rf $(LV_CACHE)

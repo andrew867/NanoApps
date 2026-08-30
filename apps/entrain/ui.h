@@ -61,9 +61,13 @@ const char *en_ui_screen_name(en_screen_t screen);
 /* Force the first-run headphone notice on or off, for screenshots and tests. */
 void en_ui_set_first_run(bool first_run);
 
-/* Select the Library's segmented tab: 0 Presets, 1 Programs, 2 Custom. Exists
-   because the N31 Linux port has no touchscreen yet, so there is otherwise no
-   way to reach a tab to look at it. */
+/* Open one of the Library's shelves: 0 Presets, 1 Programs, 2 Custom,
+   3 Suites, or -1 for the root list. The first three numbers are what they
+   were when these were tabs, which is why Suites is 3 rather than 2.
+
+   Exists because the N31 Linux port has no working touchscreen yet, so there
+   is otherwise no way to reach a shelf to look at it - and because the
+   screenshot mode has to walk them. */
 void en_ui_set_tab(int tab);
 
 /* Suppress the blank-while-playing timer. Useful while bringing a device up:

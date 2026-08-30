@@ -9,9 +9,11 @@ void en_render_init(en_render_t *r, uint32_t sample_rate,
 {
     en_osc_init();
     r->sample_rate = sample_rate;
-    r->osc_l.phase = 0; r->osc_l.step = 0;
-    r->osc_r.phase = 0; r->osc_r.step = 0;
-    r->osc_gate.phase = 0; r->osc_gate.step = 0;
+    for (int j = 0; j < EN_MAX_LAYERS; j++) {
+        r->lay[j].l.phase = 0;    r->lay[j].l.step = 0;
+        r->lay[j].r.phase = 0;    r->lay[j].r.step = 0;
+        r->lay[j].gate.phase = 0; r->lay[j].gate.step = 0;
+    }
     en_noise_init(&r->noise, noise, seed);
 }
 
@@ -54,6 +56,35 @@ static double gate_value(uint32_t phase)
     return 0.5 - 0.5 * c;
 }
 
+uint8_t en_segment_layers(const en_segment_t *seg,
+                          en_layer_t *start, en_layer_t *end)
+{
+    if (seg->layers) {
+        uint8_t n = seg->layers;
+        if (n > EN_MAX_LAYERS) n = EN_MAX_LAYERS;
+        for (uint8_t j = 0; j < n; j++) {
+            start[j] = seg->lstart[j];
+            end[j]   = seg->lend[j];
+        }
+        return n;
+    }
+
+    /* Single-layer: the legacy fields describe layer zero at unity gain. The
+       tone level is NOT folded in here — it stays the master gain applied to
+       the whole mix below, which is what makes the two forms exactly
+       equivalent for one layer and keeps tone_level meaningful for many. */
+    start[0].mode       = seg->mode;
+    start[0].carrier_hz = seg->start.carrier_hz;
+    start[0].beat_hz    = seg->start.beat_hz;
+    start[0].level      = 1.0;
+
+    end[0].mode       = seg->mode;
+    end[0].carrier_hz = seg->end.carrier_hz;
+    end[0].beat_hz    = seg->end.beat_hz;
+    end[0].level      = 1.0;
+    return 1;
+}
+
 static void render_inner(en_render_t *r, const en_segment_t *seg, int16_t *out,
                          int apply_fades)
 {
@@ -65,7 +96,11 @@ static void render_inner(en_render_t *r, const en_segment_t *seg, int16_t *out,
     const double fade_out_frames = apply_fades ? seg->fade_out_s * (double)sr : 0.0;
     const double inv_n = 1.0 / (double)n;
 
-    double tone_level = seg->start.tone_level;
+    en_layer_t ls[EN_MAX_LAYERS], le[EN_MAX_LAYERS];
+    const uint8_t nlay = en_segment_layers(seg, ls, le);
+
+    double level[EN_MAX_LAYERS];
+    double master = seg->start.tone_level;
     double noise_level = seg->start.noise_level;
 
     /* The segment decides the noise kind, not whoever called en_render_init.
@@ -83,21 +118,25 @@ static void render_inner(en_render_t *r, const en_segment_t *seg, int16_t *out,
         /* Control rate: recompute the ramped parameters and the phase steps
            once per block, then run the block with fixed steps. */
         double t = (double)i * inv_n;
-        double carrier = lerp(seg->start.carrier_hz, seg->end.carrier_hz, t);
-        double beat    = lerp(seg->start.beat_hz,    seg->end.beat_hz,    t);
-        tone_level     = lerp(seg->start.tone_level, seg->end.tone_level, t);
-        noise_level    = lerp(seg->start.noise_level, seg->end.noise_level, t);
+        master      = lerp(seg->start.tone_level,  seg->end.tone_level,  t);
+        noise_level = lerp(seg->start.noise_level, seg->end.noise_level, t);
 
-        switch (seg->mode) {
-        case EN_MODE_BINAURAL:
-        case EN_MODE_MONAURAL:
-            en_osc_set_freq(&r->osc_l, carrier, sr);
-            en_osc_set_freq(&r->osc_r, carrier + beat, sr);
-            break;
-        case EN_MODE_ISOCHRONIC:
-            en_osc_set_freq(&r->osc_l, carrier, sr);
-            en_osc_set_freq(&r->osc_gate, beat, sr);
-            break;
+        for (uint8_t j = 0; j < nlay; j++) {
+            double carrier = lerp(ls[j].carrier_hz, le[j].carrier_hz, t);
+            double beat    = lerp(ls[j].beat_hz,    le[j].beat_hz,    t);
+            level[j]       = lerp(ls[j].level,      le[j].level,      t);
+
+            switch (ls[j].mode) {
+            case EN_MODE_BINAURAL:
+            case EN_MODE_MONAURAL:
+                en_osc_set_freq(&r->lay[j].l, carrier, sr);
+                en_osc_set_freq(&r->lay[j].r, carrier + beat, sr);
+                break;
+            case EN_MODE_ISOCHRONIC:
+                en_osc_set_freq(&r->lay[j].l, carrier, sr);
+                en_osc_set_freq(&r->lay[j].gate, beat, sr);
+                break;
+            }
         }
 
         for (uint32_t k = 0; k < block; k++) {
@@ -116,36 +155,51 @@ static void render_inner(en_render_t *r, const en_segment_t *seg, int16_t *out,
                 }
             }
 
-            double l, rr;
-            switch (seg->mode) {
-            case EN_MODE_BINAURAL: {
-                l  = (double)en_osc_next(&r->osc_l) / 32767.0;
-                rr = (double)en_osc_next(&r->osc_r) / 32767.0;
-                break;
-            }
-            case EN_MODE_MONAURAL: {
-                double a = (double)en_osc_next(&r->osc_l) / 32767.0;
-                double b = (double)en_osc_next(&r->osc_r) / 32767.0;
-                l = rr = 0.5 * (a + b);
-                break;
-            }
-            case EN_MODE_ISOCHRONIC:
-            default: {
-                double a = (double)en_osc_next(&r->osc_l) / 32767.0;
-                double g = gate_value(r->osc_gate.phase);
-                r->osc_gate.phase += r->osc_gate.step;
-                l = rr = a * g;
-                break;
-            }
+            /* Every layer is advanced every frame, including one whose gain has
+               ramped to zero. Skipping a silent layer would stall its phase, and
+               it would then re-enter at whatever phase it stopped at instead of
+               where it would have been — a click at exactly the moment a layer
+               fades back in, which is the join this renderer exists to avoid. */
+            double l = 0.0, rr = 0.0;
+            for (uint8_t j = 0; j < nlay; j++) {
+                double a, b;
+                switch (ls[j].mode) {
+                case EN_MODE_BINAURAL:
+                    a = (double)en_osc_next(&r->lay[j].l) / 32767.0;
+                    b = (double)en_osc_next(&r->lay[j].r) / 32767.0;
+                    l  += a * level[j];
+                    rr += b * level[j];
+                    break;
+                case EN_MODE_MONAURAL: {
+                    a = (double)en_osc_next(&r->lay[j].l) / 32767.0;
+                    b = (double)en_osc_next(&r->lay[j].r) / 32767.0;
+                    double m = 0.5 * (a + b) * level[j];
+                    l  += m;
+                    rr += m;
+                    break;
+                }
+                case EN_MODE_ISOCHRONIC:
+                default: {
+                    a = (double)en_osc_next(&r->lay[j].l) / 32767.0;
+                    double g = gate_value(r->lay[j].gate.phase);
+                    r->lay[j].gate.phase += r->lay[j].gate.step;
+                    double m = a * g * level[j];
+                    l  += m;
+                    rr += m;
+                    break;
+                }
+                }
             }
 
-            l  *= tone_level * env;
-            rr *= tone_level * env;
+            l  *= master * env;
+            rr *= master * env;
 
             if (seg->noise != EN_NOISE_NONE && noise_level > 0.0) {
                 /* One noise stream, same in both ears. Decorrelated noise would
                    widen the image and fight the binaural cue we are trying to
-                   present cleanly. */
+                   present cleanly. One bed for the whole mix, too, rather than
+                   one per layer: three uncorrelated beds would be three times
+                   the hiss for no added information. */
                 double nz = en_noise_next(&r->noise) * noise_level * env;
                 l  += nz;
                 rr += nz;
@@ -170,14 +224,21 @@ void en_render_segment(en_render_t *r, const en_segment_t *seg, int16_t *out)
    — long enough to hide the join, short enough that the buffer is 1 KB. */
 #define EN_LOOP_XFADE 256
 
+static void zero_phases(en_render_t *r)
+{
+    for (int j = 0; j < EN_MAX_LAYERS; j++) {
+        r->lay[j].l.phase = 0;
+        r->lay[j].r.phase = 0;
+        r->lay[j].gate.phase = 0;
+    }
+}
+
 void en_render_loop(en_render_t *r, const en_segment_t *seg, int16_t *out)
 {
     /* A loop must render identically every time and must wrap onto itself, so
        it starts from a known phase rather than wherever the last segment left
        off. The caller guarantees whole cycle counts; see en_plan_loop. */
-    r->osc_l.phase = 0;
-    r->osc_r.phase = 0;
-    r->osc_gate.phase = 0;
+    zero_phases(r);
     en_noise_init(&r->noise, seg->noise, EN_LOOP_SEED);
     render_inner(r, seg, out, 0);
 
@@ -200,11 +261,19 @@ void en_render_loop(en_render_t *r, const en_segment_t *seg, int16_t *out)
         en_noise_init(&head, seg->noise, EN_LOOP_SEED);
 
         const uint32_t sr = seg->sample_rate ? seg->sample_rate : r->sample_rate;
-        const double lvl = seg->start.tone_level;
         const double nlvl = seg->start.noise_level;
-        uint32_t step_l = en_osc_step(seg->start.carrier_hz, sr);
-        uint32_t step_r = en_osc_step(seg->start.carrier_hz + seg->start.beat_hz, sr);
-        uint32_t step_g = en_osc_step(seg->start.beat_hz, sr);
+        const double master = seg->start.tone_level;
+
+        en_layer_t ls[EN_MAX_LAYERS], le[EN_MAX_LAYERS];
+        const uint8_t nlay = en_segment_layers(seg, ls, le);
+
+        uint32_t step_l[EN_MAX_LAYERS], step_r[EN_MAX_LAYERS];
+        uint32_t step_g[EN_MAX_LAYERS];
+        for (uint8_t j = 0; j < nlay; j++) {
+            step_l[j] = en_osc_step(ls[j].carrier_hz, sr);
+            step_r[j] = en_osc_step(ls[j].carrier_hz + ls[j].beat_hz, sr);
+            step_g[j] = en_osc_step(ls[j].beat_hz, sr);
+        }
 
         for (int k = 0; k < EN_LOOP_XFADE; k++) {
             double w = (double)k / (double)EN_LOOP_XFADE;   /* 0 -> 1 */
@@ -213,34 +282,41 @@ void en_render_loop(en_render_t *r, const en_segment_t *seg, int16_t *out)
 
             /* Recompute this frame's tone. A loop is steady, so the phase at
                frame k is exactly k * step and no ramp state is needed. */
-            double l, rr;
-            switch (seg->mode) {
-            case EN_MODE_BINAURAL:
-                l  = (double)en_sine_lookup((uint32_t)k * step_l) / 32767.0;
-                rr = (double)en_sine_lookup((uint32_t)k * step_r) / 32767.0;
-                break;
-            case EN_MODE_MONAURAL: {
-                double a = (double)en_sine_lookup((uint32_t)k * step_l) / 32767.0;
-                double b = (double)en_sine_lookup((uint32_t)k * step_r) / 32767.0;
-                l = rr = 0.5 * (a + b);
-                break;
-            }
-            case EN_MODE_ISOCHRONIC:
-            default: {
-                double a = (double)en_sine_lookup((uint32_t)k * step_l) / 32767.0;
-                l = rr = a * gate_value((uint32_t)k * step_g);
-                break;
-            }
+            double l = 0.0, rr = 0.0;
+            for (uint8_t j = 0; j < nlay; j++) {
+                double a, b;
+                switch (ls[j].mode) {
+                case EN_MODE_BINAURAL:
+                    a = (double)en_sine_lookup((uint32_t)k * step_l[j]) / 32767.0;
+                    b = (double)en_sine_lookup((uint32_t)k * step_r[j]) / 32767.0;
+                    l  += a * ls[j].level;
+                    rr += b * ls[j].level;
+                    break;
+                case EN_MODE_MONAURAL: {
+                    a = (double)en_sine_lookup((uint32_t)k * step_l[j]) / 32767.0;
+                    b = (double)en_sine_lookup((uint32_t)k * step_r[j]) / 32767.0;
+                    double m = 0.5 * (a + b) * ls[j].level;
+                    l  += m;
+                    rr += m;
+                    break;
+                }
+                case EN_MODE_ISOCHRONIC:
+                default: {
+                    a = (double)en_sine_lookup((uint32_t)k * step_l[j]) / 32767.0;
+                    double m = a * gate_value((uint32_t)k * step_g[j]) * ls[j].level;
+                    l  += m;
+                    rr += m;
+                    break;
+                }
+                }
             }
 
-            out[2 * k + 0] = to_s16((l  * lvl + nz) * EN_HEADROOM);
-            out[2 * k + 1] = to_s16((rr * lvl + nz) * EN_HEADROOM);
+            out[2 * k + 0] = to_s16((l  * master + nz) * EN_HEADROOM);
+            out[2 * k + 1] = to_s16((rr * master + nz) * EN_HEADROOM);
         }
     }
 
-    r->osc_l.phase = 0;
-    r->osc_r.phase = 0;
-    r->osc_gate.phase = 0;
+    zero_phases(r);
 }
 
 const char *en_mode_name(en_mode_t mode)

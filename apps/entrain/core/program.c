@@ -187,58 +187,225 @@ const en_preset_t *en_presets(int *count)
 
 /* ---- programs ----------------------------------------------------------- */
 
+/* A plain one-carrier segment, which is what every hand-written program is.
+   Designated, so that adding a field to en_prog_seg_t does not warn on every
+   row here — and so a row that omits one gets the documented default rather
+   than whatever the next field along happens to be. */
+#define SEG(beat0, beat1, carrier, secs, noise_kind, nlevel)                  \
+    { .beat_start = (beat0), .beat_end = (beat1), .carrier_hz = (carrier),    \
+      .seconds = (secs), .noise = (noise_kind), .noise_level = (nlevel) }
+
 static const en_prog_seg_t s_wind_down[] = {
-    { 10.0, 6.0, 200.0, 1500, EN_NOISE_NONE, 0.0 },   /* 25 min alpha -> theta */
-    {  6.0, 2.0, 150.0, 1200, EN_NOISE_NONE, 0.0 },   /* 20 min theta -> delta */
+    SEG(10.0, 6.0, 200.0, 1500, EN_NOISE_NONE, 0.0),  /* 25 min alpha -> theta */
+    SEG( 6.0, 2.0, 150.0, 1200, EN_NOISE_NONE, 0.0),  /* 20 min theta -> delta */
 };
 
 static const en_prog_seg_t s_power_nap[] = {
-    {  8.0, 4.0, 180.0,  240, EN_NOISE_NONE, 0.0 },   /*  4 min descent  */
-    {  4.0, 3.0, 150.0,  840, EN_NOISE_NONE, 0.0 },   /* 14 min low hold */
-    {  3.0,12.0, 220.0,  120, EN_NOISE_NONE, 0.0 },   /*  2 min wake ramp */
+    SEG( 8.0, 4.0, 180.0,  240, EN_NOISE_NONE, 0.0),  /*  4 min descent  */
+    SEG( 4.0, 3.0, 150.0,  840, EN_NOISE_NONE, 0.0),  /* 14 min low hold */
+    SEG( 3.0,12.0, 220.0,  120, EN_NOISE_NONE, 0.0),  /*  2 min wake ramp */
 };
 
 static const en_prog_seg_t s_deep_focus[] = {
-    { 14.0,18.0, 250.0, 1800, EN_NOISE_PINK, 0.16 },  /* 30 min rise  */
-    { 18.0,14.0, 250.0, 1800, EN_NOISE_PINK, 0.16 },  /* 30 min back  */
+    SEG(14.0,18.0, 250.0, 1800, EN_NOISE_PINK, 0.16), /* 30 min rise  */
+    SEG(18.0,14.0, 250.0, 1800, EN_NOISE_PINK, 0.16), /* 30 min back  */
 };
 
 static const en_prog_seg_t s_creative_drift[] = {
-    {  7.5, 7.5, 180.0, 1800, EN_NOISE_NONE, 0.0 },   /* 30 min steady */
+    SEG( 7.5, 7.5, 180.0, 1800, EN_NOISE_NONE, 0.0),  /* 30 min steady */
 };
 
 static const en_prog_seg_t s_morning_lift[] = {
-    {  6.0,10.0, 200.0,  450, EN_NOISE_NONE, 0.0 },   /* 7.5 min theta -> alpha */
-    { 10.0,18.0, 260.0,  450, EN_NOISE_NONE, 0.0 },   /* 7.5 min alpha -> beta  */
+    SEG( 6.0,10.0, 200.0,  450, EN_NOISE_NONE, 0.0),  /* 7.5 min theta -> alpha */
+    SEG(10.0,18.0, 260.0,  450, EN_NOISE_NONE, 0.0),  /* 7.5 min alpha -> beta  */
 };
 
 static const en_prog_seg_t s_meditation[] = {
-    { 11.0, 8.0, 190.0,  900, EN_NOISE_NONE, 0.0 },   /* 15 min slow alpha */
-    {  8.0, 5.5, 160.0,  900, EN_NOISE_NONE, 0.0 },   /* 15 min into theta */
+    SEG(11.0, 8.0, 190.0,  900, EN_NOISE_NONE, 0.0),  /* 15 min slow alpha */
+    SEG( 8.0, 5.5, 160.0,  900, EN_NOISE_NONE, 0.0),  /* 15 min into theta */
 };
 
-#define PROG(arr) arr, (int)(sizeof arr / sizeof arr[0])
+/* ---- imported suites -----------------------------------------------------
+ *
+ * Two multi-layer suites ported from a research archive of original synthesised
+ * practice audio. What is ported is the SCHEDULE — beat breakpoints, layer
+ * carriers, per-phase gains — read out of the generators' own metadata. No
+ * recording was decoded and no third-party audio is involved. The stage names
+ * are the archive's own deliberately neutral ones, and as everywhere else in
+ * this app no effect of any kind is claimed; see README.md.
+ *
+ * Three conventions carry through from the source:
+ *
+ *  - Levels are normalised so the main carrier is 1.0. The archive works in
+ *    absolute peak amplitude — 0.070 for the main carrier, 0.045 and 0.018 for
+ *    the others, about -23 dBFS — which is right for a mastered hundred-minute
+ *    file and twenty decibels below everything else in this library.
+ *    Normalising keeps the balance between layers exactly while letting the
+ *    segment's master level put the mix where the rest of the app sits.
+ *
+ *  - Glides are smoothstep, because these are chains of holds and glides and a
+ *    linear glide arriving at a hold has a corner in it.
+ *
+ *  - Every layer of a stage shares one beat curve, which is how the source
+ *    builds them: the quiet support layers carry the same beat as the main one
+ *    at a different carrier. The hundred-minute piece is the exception and its
+ *    second layer holds its own steady beat.
+ *
+ * The beds are specified as an RMS of 0.005 against that 0.070 primary, so 7.1%
+ * of the tone. en_noise_next is roughly unit PEAK and pink has a crest factor
+ * near 3.5, which is why these say 0.20 and not 0.071.
+ */
+
+#define LV_A(g) ((g) * (0.045 / 0.070))   /* low warm carrier, 104 Hz */
+#define LV_B(g) ((g) * 1.0)               /* main training carrier, 300 Hz */
+#define LV_C(g) ((g) * (0.018 / 0.070))   /* quiet upper support, 496 Hz */
+
+/* One three-carrier stage segment: duration, the beat all three share, then a
+   start and end gain for each layer in the source's own A/B/C order. */
+#define STAGE_SEG(secs, beat0, beat1, ga0, ga1, gb0, gb1, gc0, gc1)           \
+    { .beat_start = (beat0), .beat_end = (beat1), .carrier_hz = 300.0,        \
+      .seconds = (secs), .noise = EN_NOISE_PINK, .noise_level = 0.20,         \
+      .interp = EN_INTERP_SMOOTH, .layers = 3, .layer = {                     \
+          { 300.0, (beat0), (beat1), LV_B(gb0), LV_B(gb1) },                  \
+          { 104.0, (beat0), (beat1), LV_A(ga0), LV_A(ga1) },                  \
+          { 496.0, (beat0), (beat1), LV_C(gc0), LV_C(gc1) } } }
+
+static const en_prog_seg_t s_stage_one[] = {
+    STAGE_SEG(270, 10.0, 10.0, 0.00, 0.00, 0.60, 0.60, 0.00, 0.00),
+    STAGE_SEG(120, 10.0, 10.0, 0.00, 0.00, 0.60, 0.50, 0.00, 0.00),
+    STAGE_SEG( 90, 10.0, 10.0, 0.00, 0.00, 0.50, 0.50, 0.00, 0.00),
+    STAGE_SEG(270, 10.0,  8.5, 0.00, 0.30, 0.50, 1.00, 0.00, 0.00),
+    STAGE_SEG(480,  8.5,  7.0, 0.30, 0.55, 1.00, 0.90, 0.00, 0.00),
+    STAGE_SEG( 72,  7.0,  7.0, 0.55, 0.55, 0.90, 0.90, 0.00, 0.00),
+    STAGE_SEG(408,  7.0,  7.0, 0.55, 0.40, 0.90, 1.00, 0.00, 0.15),
+    STAGE_SEG( 67,  7.0,  7.0, 0.40, 0.40, 1.00, 1.00, 0.15, 0.15),
+    STAGE_SEG(383,  7.0, 12.0, 0.40, 0.00, 1.00, 0.85, 0.15, 0.05),
+};
+
+static const en_prog_seg_t s_stage_two[] = {
+    STAGE_SEG(240, 10.0, 10.0, 0.00, 0.00, 0.70, 0.70, 0.00, 0.00),
+    STAGE_SEG( 60, 10.0, 10.0, 0.00, 0.00, 0.70, 0.70, 0.00, 0.00),
+    STAGE_SEG(240, 10.0,  8.0, 0.00, 0.30, 0.70, 1.00, 0.00, 0.00),
+    STAGE_SEG(360,  8.0,  7.0, 0.30, 0.55, 1.00, 0.90, 0.00, 0.00),
+    STAGE_SEG(420,  7.0,  4.0, 0.55, 0.50, 0.90, 1.00, 0.00, 0.00),
+    STAGE_SEG( 60,  4.0,  4.0, 0.50, 0.50, 1.00, 1.00, 0.00, 0.00),
+    STAGE_SEG(540,  4.0,  4.0, 0.50, 0.45, 1.00, 1.00, 0.00, 0.12),
+    STAGE_SEG( 36,  4.0,  4.0, 0.45, 0.45, 1.00, 1.00, 0.12, 0.12),
+    STAGE_SEG(324,  4.0, 12.0, 0.45, 0.00, 1.00, 0.85, 0.12, 0.05),
+};
+
+/* Stage three repeats a rise and a settle three times: the transition itself is
+   what it exists to practise, so the repeats are the content and not padding. */
+static const en_prog_seg_t s_stage_three[] = {
+    STAGE_SEG(180, 10.0, 10.0, 0.00, 0.00, 0.70, 0.70, 0.00, 0.00),
+    STAGE_SEG( 48, 10.0, 10.0, 0.00, 0.00, 0.70, 0.70, 0.00, 0.00),
+    STAGE_SEG(192, 10.0,  8.0, 0.00, 0.30, 0.70, 1.00, 0.00, 0.00),
+    STAGE_SEG(300,  8.0,  7.0, 0.30, 0.55, 1.00, 0.90, 0.00, 0.00),
+    STAGE_SEG(300,  7.0,  4.0, 0.55, 0.50, 0.90, 1.00, 0.00, 0.00),
+    STAGE_SEG( 42,  4.0,  4.0, 0.50, 0.50, 1.00, 1.00, 0.00, 0.00),
+    STAGE_SEG(378,  4.0,  4.0, 0.50, 0.55, 1.00, 1.00, 0.00, 0.22),
+    STAGE_SEG( 72,  4.0,  8.5, 0.55, 0.35, 1.00, 1.00, 0.22, 0.10),
+    STAGE_SEG( 78,  8.5,  4.0, 0.35, 0.55, 1.00, 1.00, 0.10, 0.18),
+    STAGE_SEG( 72,  4.0,  8.5, 0.55, 0.35, 1.00, 1.00, 0.18, 0.10),
+    STAGE_SEG( 78,  8.5,  4.0, 0.35, 0.55, 1.00, 1.00, 0.10, 0.18),
+    STAGE_SEG( 72,  4.0,  8.5, 0.55, 0.35, 1.00, 1.00, 0.18, 0.10),
+    STAGE_SEG( 32,  8.5,  8.5, 0.35, 0.35, 1.00, 1.00, 0.10, 0.10),
+    STAGE_SEG( 76,  8.5,  4.0, 0.35, 0.55, 1.00, 1.00, 0.10, 0.18),
+    STAGE_SEG( 36,  4.0,  4.0, 0.55, 0.55, 1.00, 1.00, 0.18, 0.18),
+    STAGE_SEG(324,  4.0, 12.0, 0.55, 0.00, 1.00, 0.85, 0.18, 0.05),
+};
+
+/*
+ * The hundred-minute piece. Two layers: a 200 Hz primary carrying the whole
+ * beat schedule, and a 260 Hz secondary holding a steady 7 Hz through the
+ * middle third. The secondary is what makes the layered block a layered block
+ * — two beats at once rather than one — so it is a second layer and not a
+ * second program.
+ */
+#define XP_SEC_MAIN (0.0145 / 0.070)   /* 13.7 dB below the primary */
+#define XP_SEC_EMPH (0.031  / 0.070)   /* emphasised during the return prep */
+#define XP_PRI_DIP  0.62               /* primary reduced while it is */
+
+#define XP_SEG(secs, pb0, pb1, pl0, pl1, sl0, sl1)                            \
+    { .beat_start = (pb0), .beat_end = (pb1), .carrier_hz = 200.0,            \
+      .seconds = (secs), .noise = EN_NOISE_PINK, .noise_level = 0.20,         \
+      .interp = EN_INTERP_SMOOTH, .layers = 2, .layer = {                     \
+          { 200.0, (pb0), (pb1), (pl0), (pl1) },                              \
+          { 260.0,   7.0,   7.0, (sl0), (sl1) } } }
+
+static const en_prog_seg_t s_extended[] = {
+    XP_SEG( 300, 10.0, 10.0,       1.0,        1.0, 0.0,         0.0),
+    XP_SEG( 600, 10.0,  7.0,       1.0,        1.0, 0.0,         0.0),
+    XP_SEG( 900,  7.0,  4.0,       1.0,        1.0, 0.0,         0.0),
+    XP_SEG( 420,  4.0,  4.0,       1.0,        1.0, 0.0,         0.0),
+    XP_SEG( 180,  4.0,  7.0,       1.0,        1.0, 0.0,         0.0),
+    XP_SEG( 300,  7.0,  4.0,       1.0,        1.0, 0.0, XP_SEC_MAIN),
+    XP_SEG(1980,  4.0,  4.0,       1.0,        1.0, XP_SEC_MAIN, XP_SEC_MAIN),
+    XP_SEG( 420,  4.0,  7.0,       1.0, XP_PRI_DIP, XP_SEC_MAIN, XP_SEC_EMPH),
+    /* 85:00 to 87:30. The source curve has amplitude breakpoints here that the
+       beat schedule does not, so this splits a glide the source runs whole:
+       7 Hz to 10 Hz over 85:00-95:00. 7.469 is that curve's real value at the
+       split, so the two halves land where the one span would have. Each half
+       is smoothstepped in its own right, which flattens the join by a hair —
+       under a tenth of a hertz across two and a half minutes. */
+    XP_SEG( 150,  7.0, 7.469, XP_PRI_DIP,      1.0, XP_SEC_EMPH, 0.0),
+    XP_SEG( 450, 7.469, 10.0,      1.0,        1.0, 0.0,         0.0),
+    XP_SEG( 240, 10.0, 12.0,       1.0,        1.0, 0.0,         0.0),
+    XP_SEG(  60, 12.0, 12.0,       1.0,        1.0, 0.0,         0.0),
+};
+
+#define ROW(nm, det, md, arr, grp)                                            \
+    { .name = (nm), .detail = (det), .mode = (md), .segs = (arr),             \
+      .n_segs = (int)(sizeof arr / sizeof arr[0]), .group = (grp) }
+
+#define PROGRAM(nm, det, md, arr) ROW(nm, det, md, arr, EN_GROUP_PROGRAM)
+#define SUITE(nm, det, md, arr)   ROW(nm, det, md, arr, EN_GROUP_SUITE)
 
 static const en_program_t s_programs[] = {
-    { "Wind Down",
-      "10-6-2 Hz • 200 Hz carrier",
-      EN_MODE_BINAURAL, PROG(s_wind_down) },
-    { "Power Nap",
-      "8-3 Hz, then a wake ramp",
-      EN_MODE_BINAURAL, PROG(s_power_nap) },
-    { "Deep Focus",
-      "14-18-14 Hz • pink bed",
-      EN_MODE_BINAURAL, PROG(s_deep_focus) },
-    { "Creative Drift",
-      "Steady 7.5 Hz • 180 Hz",
-      EN_MODE_BINAURAL, PROG(s_creative_drift) },
-    { "Morning Lift",
-      "6-18 Hz • carrier 200-260 Hz",
-      EN_MODE_BINAURAL, PROG(s_morning_lift) },
-    { "Meditation Descent",
-      "11-5.5 Hz • long fades",
-      EN_MODE_BINAURAL, PROG(s_meditation) },
+    PROGRAM("Wind Down",
+            "10-6-2 Hz • 200 Hz carrier",
+            EN_MODE_BINAURAL, s_wind_down),
+    PROGRAM("Power Nap",
+            "8-3 Hz, then a wake ramp",
+            EN_MODE_BINAURAL, s_power_nap),
+    PROGRAM("Deep Focus",
+            "14-18-14 Hz • pink bed",
+            EN_MODE_BINAURAL, s_deep_focus),
+    PROGRAM("Creative Drift",
+            "Steady 7.5 Hz • 180 Hz",
+            EN_MODE_BINAURAL, s_creative_drift),
+    PROGRAM("Morning Lift",
+            "6-18 Hz • carrier 200-260 Hz",
+            EN_MODE_BINAURAL, s_morning_lift),
+    PROGRAM("Meditation Descent",
+            "11-5.5 Hz • long fades",
+            EN_MODE_BINAURAL, s_meditation),
+
+    SUITE("Extended Practice",
+          "200 + 260 Hz • two layers",
+          EN_MODE_BINAURAL, s_extended),
+    SUITE("Stage 1",
+          "Orientation • 10-7-12 Hz",
+          EN_MODE_BINAURAL, s_stage_one),
+    SUITE("Stage 2",
+          "Body still • 10-4-12 Hz",
+          EN_MODE_BINAURAL, s_stage_two),
+    SUITE("Stage 3",
+          "Field practice • rise/settle x3",
+          EN_MODE_BINAURAL, s_stage_three),
 };
+
+int en_programs_in_group(en_group_t group, int *out, int cap)
+{
+    const int total = (int)(sizeof s_programs / sizeof s_programs[0]);
+    int found = 0;
+    for (int i = 0; i < total; i++) {
+        if (s_programs[i].group != group) continue;
+        if (out && found < cap) out[found] = i;
+        found++;
+    }
+    return found;
+}
 
 const en_program_t *en_programs(int *count)
 {
@@ -277,6 +444,77 @@ int en_program_seg_at(const en_program_t *p, double t_seconds)
     return -1;
 }
 
+/* Smoothstep: 3u^2 - 2u^3. Zero slope at both ends, so a glide meeting a hold
+   has no corner in it. Cheap enough to run per control block. */
+static double smoothstep(double u)
+{
+    if (u <= 0.0) return 0.0;
+    if (u >= 1.0) return 1.0;
+    return u * u * (3.0 - 2.0 * u);
+}
+
+static double seg_ramp(const en_prog_seg_t *s, double u)
+{
+    return s->interp == EN_INTERP_SMOOTH ? smoothstep(u) : u;
+}
+
+uint8_t en_segs_layers_at(const en_prog_seg_t *segs, int n_segs, double t,
+                          en_mode_t mode, en_layer_t *out,
+                          en_noise_kind_t *noise, double *noise_level)
+{
+    if (!segs || n_segs <= 0) {
+        out[0].mode = mode;
+        out[0].carrier_hz = 200.0;
+        out[0].beat_hz = 10.0;
+        out[0].level = 1.0;
+        if (noise) *noise = EN_NOISE_NONE;
+        if (noise_level) *noise_level = 0.0;
+        return 1;
+    }
+
+    if (t < 0.0) t = 0.0;
+
+    const en_prog_seg_t *s = &segs[n_segs - 1];
+    double u = 1.0;
+
+    double acc = 0.0;
+    for (int i = 0; i < n_segs; i++) {
+        double dur = (double)segs[i].seconds;
+        if (t < acc + dur || i == n_segs - 1) {
+            s = &segs[i];
+            u = dur > 0.0 ? (t - acc) / dur : 0.0;
+            if (u < 0.0) u = 0.0;
+            if (u > 1.0) u = 1.0;
+            break;
+        }
+        acc += dur;
+    }
+
+    if (noise) *noise = s->noise;
+    if (noise_level) *noise_level = s->noise_level;
+
+    const double w = seg_ramp(s, u);
+
+    if (!s->layers) {
+        out[0].mode = mode;
+        out[0].carrier_hz = s->carrier_hz;
+        out[0].beat_hz = s->beat_start + (s->beat_end - s->beat_start) * w;
+        out[0].level = 1.0;
+        return 1;
+    }
+
+    uint8_t n = s->layers;
+    if (n > EN_PROG_MAX_LAYERS) n = EN_PROG_MAX_LAYERS;
+    for (uint8_t j = 0; j < n; j++) {
+        const en_prog_layer_t *pl = &s->layer[j];
+        out[j].mode = mode;
+        out[j].carrier_hz = pl->carrier_hz;
+        out[j].beat_hz = pl->beat_start + (pl->beat_end - pl->beat_start) * w;
+        out[j].level = pl->level_start + (pl->level_end - pl->level_start) * w;
+    }
+    return n;
+}
+
 double en_program_beat_at(const en_program_t *p, double t_seconds)
 {
     if (p->n_segs == 0) return 0.0;
@@ -287,8 +525,13 @@ double en_program_beat_at(const en_program_t *p, double t_seconds)
         double dur = (double)p->segs[i].seconds;
         if (t_seconds < acc + dur) {
             double u = dur > 0.0 ? (t_seconds - acc) / dur : 0.0;
+            if (u < 0.0) u = 0.0;
+            if (u > 1.0) u = 1.0;
+            /* Through the same ramp the renderer uses, or the readout would
+               disagree with what is sounding for most of a smooth glide. */
             return p->segs[i].beat_start
-                 + (p->segs[i].beat_end - p->segs[i].beat_start) * u;
+                 + (p->segs[i].beat_end - p->segs[i].beat_start)
+                   * seg_ramp(&p->segs[i], u);
         }
         acc += dur;
     }
