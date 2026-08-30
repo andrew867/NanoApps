@@ -65,7 +65,7 @@ LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_n31.h\"
 TA_CFLAGS := -I$(TINYALSA)/include
 
 CORE_SRCS := $(CORE)/osc.c $(CORE)/noise.c $(CORE)/render.c \
-             $(CORE)/program.c $(CORE)/wavout.c
+             $(CORE)/program.c $(CORE)/measured.c $(CORE)/wavout.c
 
 APP_SRCS  := main_host.c ../ui.c ../engine.c \
              ../platform/audio_linux.c ../platform/sys_host.c $(CORE_SRCS)

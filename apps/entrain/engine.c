@@ -284,7 +284,12 @@ static void job_step(void)
 
     const en_segment_t *src = &E.job.seg;
 
-    en_segment_t slice = *src;
+    /* Static rather than automatic. en_segment_t carries two arrays of
+       EN_MAX_LAYERS layers, so at sixteen it is over a kilobyte, and this
+       runs on the device's main thread where a kilobyte of stack per call is
+       not worth spending to say `slice` is local. Nothing re-enters here. */
+    static en_segment_t slice;
+    slice = *src;
     slice.frames = n;
     slice.fade_in_s = 0.0;
     slice.fade_out_s = 0.0;

@@ -114,7 +114,25 @@ typedef enum {
     EN_INTERP_SMOOTH
 } en_interp_t;
 
-#define EN_PROG_MAX_LAYERS EN_MAX_LAYERS
+/*
+ * How many layers a stored program table can carry.
+ *
+ * Separate from EN_MAX_LAYERS, which is what the renderer can sound, because
+ * this one sits inside every segment of every table and so is paid for in
+ * flash 173 times over. At the renderer's sixteen that is 120 KB of program
+ * tables; at eight it is 65 KB, on a 465 KB binary.
+ *
+ * This is NOT a budget that anything gets dropped to fit. The measured
+ * material uses five concurrent carrier families, this is sized above that
+ * with room, and the assert below fails the build rather than silently
+ * truncating if a table ever needs more. If analysis finds a sixth or a
+ * ninth, raise this.
+ */
+#define EN_PROG_MAX_LAYERS 8
+
+#if EN_PROG_MAX_LAYERS > EN_MAX_LAYERS
+#error "a program cannot carry more layers than the renderer can sound"
+#endif
 
 /* One layer's contribution across a segment. Carrier is fixed for the segment;
    beat and level ramp. See render.h for what `level` means — absolute peak

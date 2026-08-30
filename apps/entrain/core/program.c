@@ -3,6 +3,7 @@
  */
 
 #include "program.h"
+#include "measured.h"
 #include "wavout.h"
 
 /* ---- bands -------------------------------------------------------------- */
@@ -361,6 +362,14 @@ static const en_prog_seg_t s_extended[] = {
 #define PROGRAM(nm, det, md, arr) ROW(nm, det, md, arr, EN_GROUP_PROGRAM)
 #define SUITE(nm, det, md, arr)   ROW(nm, det, md, arr, EN_GROUP_SUITE)
 
+/* The same shelf as the suites - to a listener they are the same kind of thing
+   - but these tables live in measured.c and are declared extern, so the macro
+   is spelled out rather than reusing ROW. */
+#define MEASURED(nm, det, arr)                                                \
+    { .name = (nm), .detail = (det), .mode = EN_MODE_BINAURAL,                \
+      .segs = (arr), .n_segs = (int)(sizeof arr / sizeof arr[0]),             \
+      .group = EN_GROUP_SUITE }
+
 static const en_program_t s_programs[] = {
     PROGRAM("Wind Down",
             "10-6-2 Hz • 200 Hz carrier",
@@ -393,6 +402,17 @@ static const en_program_t s_programs[] = {
     SUITE("Stage 3",
           "Field practice • rise/settle x3",
           EN_MODE_BINAURAL, s_stage_three),
+
+    /* Measured from recordings rather than read out of a generator's metadata.
+       See core/measured.c for what was taken and what was not. Their layer
+       counts are what the analysis found - three to five concurrent carrier
+       families - not a number chosen in advance. */
+    MEASURED("Practice 1", "Orientation, 60/102/114/300 Hz", en_meas_practice_1),
+    MEASURED("Practice 2", "10 to 4 Hz, 102 + 300 Hz", en_meas_practice_2),
+    MEASURED("Practice 3", "4 Hz held, 102/162/300 Hz", en_meas_practice_3),
+    MEASURED("Practice 4", "4 Hz, then a return, 102 Hz", en_meas_practice_4),
+    MEASURED("Practice 5", "4 to 1.4 Hz, 60/102/114/300 Hz", en_meas_practice_5),
+    MEASURED("Practice 6", "Steady 3.8 Hz, 102 + 300 Hz", en_meas_practice_6),
 };
 
 int en_programs_in_group(en_group_t group, int *out, int cap)
