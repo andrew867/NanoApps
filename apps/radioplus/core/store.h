@@ -68,13 +68,34 @@ typedef struct {
     uint16_t pi;                             /* 0 when unknown */
     uint8_t  pty;
     bool     rbds;                           /* which table pty came from */
+
+    /* Show this one on the simple screen, which holds a handful of big
+       buttons and nothing else. Off by default, including for presets in a
+       file written before this field existed: a simple screen that filled
+       itself with every preset the moment you upgraded would not be simple,
+       and the whole point is that the user picks the few. */
+    bool     simple;
 } en_preset_t;
+
+/* How many presets the simple screen will show. Six 96 x 84 buttons in a
+   2 x 3 grid is what fits at a size you can hit without looking. */
+#define EN_SIMPLE_MAX 6
 
 typedef struct {
     en_preset_t list[EN_PRESET_MAX];
     uint8_t     count;
     char        region[24];
 } en_presets_t;
+
+/* Presets flagged for the simple screen, in preset order, capped at
+   EN_SIMPLE_MAX. Returns how many were written. */
+uint8_t en_presets_simple(const en_presets_t *p, const en_preset_t **out,
+                          uint8_t cap);
+
+/* Flag or unflag one, refusing to go past EN_SIMPLE_MAX. Returns false when
+   the grid is already full, which the caller should say out loud rather than
+   silently ignoring the tap. */
+bool en_preset_set_simple(en_presets_t *p, uint32_t khz, bool on);
 
 void    en_presets_init(en_presets_t *p, const char *region);
 int     en_preset_find(const en_presets_t *p, uint32_t khz);
@@ -138,6 +159,13 @@ typedef struct {
        own the first time a station announces traffic would be a surprise, and
        a surprise that fills a disk. */
     bool     ta_record;
+
+    /* Which optional screens are in the swipe order. Both default off: the
+       swipe sequence a user learns should not grow a page because they
+       upgraded. */
+    bool     simple_screen;
+    bool     wide_screen;
+
     en_overrides_t overrides;
 } en_settings_t;
 

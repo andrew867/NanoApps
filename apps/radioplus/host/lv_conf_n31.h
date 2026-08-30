@@ -23,6 +23,17 @@
 #undef  LV_LIMITS_INCLUDE
 #define LV_LIMITS_INCLUDE       <limits.h>
 
+/* The landscape readout draws its text on rotated layers, and LVGL renders a
+   transformed layer into an alpha format before compositing it. The shared SDK
+   config compiles ARGB8888 out - correct for every other screen in the repo,
+   which is opaque XRGB8888 throughout - and without it a rotated layer draws
+   nothing at all. Turned on here rather than in sdk/lv_conf.h so that one
+   screen in one app does not grow every app in the repo.
+*/
+#undef  LV_DRAW_SW_SUPPORT_ARGB8888
+#define LV_DRAW_SW_SUPPORT_ARGB8888 1
+
+
 /* LVGL's TLSF pool is pinned to a fixed high-RAM address in the RetailOS
    build, which is a wild pointer under Linux. Use LVGL's own static array —
    the same thing the relocatable surface build does. Size stays at the

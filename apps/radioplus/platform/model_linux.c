@@ -125,6 +125,8 @@ static void settings_save(void)
     s_settings.khz = rp_model.khz;
     s_settings.rds_on = rp_model.rds_on;
     s_settings.ta_record = rp_model.ta_record;
+    s_settings.simple_screen = rp_model.simple_screen;
+    s_settings.wide_screen = rp_model.wide_screen;
 
     char buf[2048];
     uint32_t n = en_settings_save(&s_settings, buf, sizeof buf);
@@ -223,6 +225,8 @@ static void bring_up(void)
        radio is silent however well it is tuned. */
     rp_model.play_ok = (en_play_start() == EN_PLAY_OK);
     rp_model.ta_record = s_settings.ta_record;
+    rp_model.simple_screen = s_settings.simple_screen;
+    rp_model.wide_screen = s_settings.wide_screen;
 
     presets_load();
     library_scan();
@@ -516,6 +520,30 @@ void rp_act_ta_record(bool on)
     rp_model.ta_record = on;
     s_settings.ta_record = on;
     settings_save();
+}
+
+void rp_act_show_simple(bool on)
+{
+    rp_model.simple_screen = on;
+    settings_save();
+}
+
+void rp_act_show_wide(bool on)
+{
+    rp_model.wide_screen = on;
+    settings_save();
+}
+
+bool rp_act_simple_toggle(uint32_t khz)
+{
+    int at = en_preset_find(&rp_model.presets, khz);
+    if (at < 0) return false;
+
+    bool want = !rp_model.presets.list[at].simple;
+    if (!en_preset_set_simple(&rp_model.presets, khz, want)) return false;
+
+    presets_save();
+    return true;
 }
 
 /* ---- the register explorer ------------------------------------------------ */

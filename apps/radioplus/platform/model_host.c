@@ -53,6 +53,33 @@ static void seed_rds(void)
         uint16_t blk[4] = { 0xC2B5, b, c, d };
         en_rds_group(&rp_model.rds, blk, EN_RDS_ALL);
     }
+
+    /*
+     * One 4A, so the preview has a clock. Built as a real group and pushed
+     * through the decoder like everything else here, rather than by writing
+     * the ct_ fields directly: this way the modified-Julian-day conversion and
+     * the half-hour offset are exercised by every preview run, and a screen
+     * showing a time is evidence that the decoder produced one.
+     *
+     * MJD 61280 is 2026-08-28. 14:32 UTC at -3:30 (offset 7 half hours, west)
+     * is 11:02 local, which is what the screens should show.
+     */
+    {
+        const uint32_t mjd = 61280u;
+        const uint8_t hour = 14u, minute = 32u;
+        const uint8_t half_hours = 7u;      /* 3.5 h */
+
+        uint16_t b = (uint16_t)((4u << 12) | (1u << 10) | (22u << 5)
+                                | (uint16_t)((mjd >> 15) & 0x0003u));
+        uint16_t c = (uint16_t)(((mjd & 0x7FFFu) << 1)
+                                | (uint16_t)((hour >> 4) & 0x0001u));
+        uint16_t d = (uint16_t)(((uint16_t)(hour & 0x0Fu) << 12)
+                                | ((uint16_t)minute << 6)
+                                | 0x0020u          /* west of Greenwich */
+                                | half_hours);
+        uint16_t blk[4] = { 0xC2B5, b, c, d };
+        en_rds_group(&rp_model.rds, blk, EN_RDS_ALL);
+    }
 }
 
 static void seed_presets(void)
@@ -190,6 +217,16 @@ void rp_act_nudge(int32_t ms)
 
 void rp_act_pause_toggle(void) { rp_model.play_paused = !rp_model.play_paused; }
 void rp_act_ta_record(bool on) { rp_model.ta_record = on; }
+void rp_act_show_simple(bool on) { rp_model.simple_screen = on; }
+void rp_act_show_wide(bool on) { rp_model.wide_screen = on; }
+
+bool rp_act_simple_toggle(uint32_t khz)
+{
+    int at = en_preset_find(&rp_model.presets, khz);
+    if (at < 0) return false;
+    return en_preset_set_simple(&rp_model.presets, khz,
+                                !rp_model.presets.list[at].simple);
+}
 
 /* A shadow of the chip, so the register editor can be driven in the preview.
    Values persist for the run, which is enough to see a toggle stick. */

@@ -103,11 +103,13 @@
 #define TILT_MS 80
 
 
+/* Two screens. There were two more - a mount progress bar and a mount failure
+   - back when the launcher brought the volume up itself. It has not done that
+   for a while, and leaving the names here suggested to anyone reading that it
+   still might. */
 typedef enum {
     SCREEN_HOME,
     SCREEN_EXTRAS,
-    SCREEN_MOUNTING,
-    SCREEN_MOUNT_FAILED,
 } screen_t;
 
 static volatile sig_atomic_t s_quit;
@@ -210,7 +212,6 @@ static void go(screen_t s)
     switch (s) {
     case SCREEN_HOME:   n31_ui_home(); break;
     case SCREEN_EXTRAS: n31_ui_extras(s_selected, disk_mounted()); break;
-    default: break;                 /* mounting screens draw as they progress */
     }
 }
 

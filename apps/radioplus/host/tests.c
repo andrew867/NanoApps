@@ -930,6 +930,88 @@ static void test_sidecar(void)
     CHECK(strstr(whole, "\"duration_ms\":1500") != 0, "duration not written");
 }
 
+static void test_simple_flags(void)
+{
+    section("simple screen selection");
+
+    en_presets_t p;
+    en_presets_init(&p, "Americas");
+
+    en_preset_t e;
+    memset(&e, 0, sizeof e);
+    for (int i = 0; i < 9; i++) {
+        e.khz = 88100u + (uint32_t)i * 200u;
+        e.name[0] = (char)('A' + i);
+        e.name[1] = 0;
+        CHECK(en_preset_add(&p, &e), "add %d failed", i);
+    }
+
+    /* Nothing is on the simple screen until someone puts it there. A screen
+       that filled itself would not be the user's few. */
+    CHECK(en_presets_simple(&p, 0, EN_SIMPLE_MAX) == 0,
+          "presets start out on the simple screen");
+
+    for (int i = 0; i < EN_SIMPLE_MAX; i++)
+        CHECK(en_preset_set_simple(&p, 88100u + (uint32_t)i * 200u, true),
+              "flagging %d failed", i);
+    CHECK(en_presets_simple(&p, 0, EN_SIMPLE_MAX) == EN_SIMPLE_MAX,
+          "six should be flagged");
+
+    /* The seventh is refused rather than silently dropped, which is what lets
+       the UI say why instead of appearing to ignore the tap. */
+    CHECK(!en_preset_set_simple(&p, 88100u + 6 * 200u, true),
+          "a seventh was accepted");
+    CHECK(!p.list[6].simple, "the refused one was flagged anyway");
+
+    /* Re-flagging something already there is not a failure - it would be a
+       confusing way to report "no change needed". */
+    CHECK(en_preset_set_simple(&p, 88100u, true), "re-flagging reported failure");
+
+    /* Clearing one makes room again. */
+    CHECK(en_preset_set_simple(&p, 88100u, false), "unflagging failed");
+    CHECK(en_presets_simple(&p, 0, EN_SIMPLE_MAX) == EN_SIMPLE_MAX - 1,
+          "unflagging did not free a slot");
+    CHECK(en_preset_set_simple(&p, 88100u + 6 * 200u, true),
+          "the freed slot was not reusable");
+
+    /* An unknown frequency is a refusal, not a crash. */
+    CHECK(!en_preset_set_simple(&p, 1u, true), "an unknown frequency was flagged");
+
+    /* The chosen ones come back in preset order, and they are the ones set. */
+    const en_preset_t *pick[EN_SIMPLE_MAX];
+    uint8_t n = en_presets_simple(&p, pick, EN_SIMPLE_MAX);
+    CHECK(n == EN_SIMPLE_MAX, "expected %d picks, got %u", EN_SIMPLE_MAX, n);
+    for (uint8_t i = 1; i < n; i++)
+        CHECK(pick[i]->khz > pick[i - 1]->khz, "picks are out of preset order");
+
+    /* Round trip. The flag has to survive a save and load, or the simple
+       screen empties itself every time the app restarts. */
+    char buf[4096];
+    uint32_t len = en_presets_save(&p, buf, sizeof buf);
+    CHECK(len > 0, "save overflowed");
+
+    en_presets_t back;
+    CHECK(en_presets_load(&back, buf, len), "load failed");
+    CHECK(back.count == p.count, "count %u after reload", back.count);
+    for (uint8_t i = 0; i < back.count; i++)
+        CHECK(back.list[i].simple == p.list[i].simple,
+              "preset %u lost its simple flag", i);
+
+    /* A file written before the flag existed has to load with it off. Off is
+       the only safe default: a simple screen that filled itself with six
+       arbitrary stations because someone upgraded would be worse than empty. */
+    static const char legacy[] =
+        "{\"version\":1,\"region\":\"Americas\",\"presets\":["
+        "{\"khz\":88100,\"name\":\"A\",\"pi\":0x0000,\"pty\":0,\"rbds\":false},"
+        "{\"khz\":88300,\"name\":\"B\",\"pi\":0x0000,\"pty\":0,\"rbds\":false}]}";
+    en_presets_t old;
+    CHECK(en_presets_load(&old, legacy, (uint32_t)(sizeof legacy - 1)),
+          "a preset file without the flag failed to load");
+    CHECK(old.count == 2, "legacy file gave %u presets", old.count);
+    CHECK(en_presets_simple(&old, 0, EN_SIMPLE_MAX) == 0,
+          "a file written before the flag put stations on the simple screen");
+}
+
 static void test_settings(void)
 {
     section("settings");
@@ -1040,6 +1122,7 @@ int main(void)
     test_wav();
     test_presets();
     test_sidecar();
+    test_simple_flags();
     test_settings();
 
     printf("\n%d checks, %d failures\n", checks, failures);

@@ -92,8 +92,29 @@ int main(int argc, char **argv)
     rp_model_refresh();
     rp_ui_init();
 
+    /* Both optional screens are off by default, which is right on a device and
+       wrong here: a screen nobody renders is a screen whose layout nobody
+       checks. Turn them on for the shots. */
+    rp_act_show_simple(true);
+    rp_act_show_wide(true);
+
+    /* And put a couple of stations on the simple screen, so it renders as it
+       will look rather than as its empty state. The empty state gets its own
+       shot below. */
+    if (rp_model.presets.count) {
+        en_preset_set_simple(&rp_model.presets, rp_model.presets.list[0].khz, true);
+        if (rp_model.presets.count > 1)
+            en_preset_set_simple(&rp_model.presets,
+                                 rp_model.presets.list[1].khz, true);
+        if (rp_model.presets.count > 2)
+            en_preset_set_simple(&rp_model.presets,
+                                 rp_model.presets.list[2].khz, true);
+    }
+
     static const struct { rp_screen_t s; const char *name; } shots[] = {
+        { RP_SCREEN_SIMPLE,   "0-simple" },
         { RP_SCREEN_NOW,      "1-now" },
+        { RP_SCREEN_WIDE,     "1b-wide" },
         { RP_SCREEN_DIAL,     "2-dial" },
         { RP_SCREEN_PRESETS,  "3-presets" },
         { RP_SCREEN_LIBRARY,  "4-recordings" },
