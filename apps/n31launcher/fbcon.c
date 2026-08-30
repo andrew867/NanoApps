@@ -8,6 +8,8 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 /* The bind file of the framebuffer console, once found. Empty means we never
@@ -137,4 +139,56 @@ void n31_fbcon_restore(void)
     s_taken = false;
     s_lent = false;
     s_bind[0] = 0;
+}
+
+/*
+ * Somebody else has /dev/fb0 open. See the header for why this is a poll over
+ * /proc rather than a question asked of anything.
+ */
+bool n31_fbcon_foreign_owner(void)
+{
+    const pid_t self = getpid();
+
+    DIR *proc = opendir("/proc");
+    if (!proc) return false;
+
+    bool found = false;
+    struct dirent *pe;
+
+    while (!found && (pe = readdir(proc))) {
+        if (pe->d_name[0] < '0' || pe->d_name[0] > '9') continue;
+
+        long pid = strtol(pe->d_name, NULL, 10);
+        if (pid <= 0 || (pid_t)pid == self) continue;
+
+        char fddir[64];
+        snprintf(fddir, sizeof fddir, "/proc/%ld/fd", pid);
+
+        DIR *fds = opendir(fddir);
+        if (!fds) continue;                 /* gone, or not ours to look at */
+
+        struct dirent *fe;
+        while ((fe = readdir(fds))) {
+            if (fe->d_name[0] == '.') continue;
+
+            char link[96], target[128];
+            snprintf(link, sizeof link, "%s/%s", fddir, fe->d_name);
+
+            ssize_t n = readlink(link, target, sizeof target - 1);
+            if (n <= 0) continue;
+            target[n] = 0;
+
+            /* Any framebuffer, not only fb0: this device has one today, and a
+               launcher that only checked fb0 would be quietly wrong on a
+               device that had two. */
+            if (!strncmp(target, "/dev/fb", 7)) {
+                found = true;
+                break;
+            }
+        }
+        closedir(fds);
+    }
+
+    closedir(proc);
+    return found;
 }

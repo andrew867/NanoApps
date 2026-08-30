@@ -266,3 +266,6 @@ void rp_act_set_region(const en_region_t *rg)
     if (!en_region_on_grid(rg, rp_model.khz))
         rp_model.khz = en_region_step(rg, rp_model.khz, true);
 }
+
+/* The preview has no bring-up to report. */
+void rp_model_set_progress(const rp_progress_t *p) { (void)p; }

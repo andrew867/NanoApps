@@ -45,6 +45,26 @@ typedef enum {
 int         rp_ui_swipe_count(void);
 rp_screen_t rp_ui_swipe_at(int i);
 
+/*
+ * The boot screen, and the only thing on the display until the rest is built.
+ *
+ * Bringing the tuner and both halves of the audio path up takes several
+ * seconds, and none of the real screens exist until it finishes - so the panel
+ * held whatever was on it, which reads as a device that did not start rather
+ * than one that is starting.
+ *
+ * Call rp_ui_boot() before any of that with each step as it begins. It builds
+ * its screen on the first call and refreshes synchronously on every one, so a
+ * step that blocks for four seconds still leaves its own name on the screen
+ * while it does.
+ */
+void rp_ui_boot(const char *step);
+
+/* What the boot screen should say when a step failed rather than finished.
+   Shown in the warning colour and kept on screen under the following steps,
+   because the first thing that went wrong is the useful one. */
+void rp_ui_boot_failed(const char *what);
+
 void rp_ui_init(void);
 void rp_ui_tick(void);           /* call from the frame callback */
 void rp_ui_show(rp_screen_t s);

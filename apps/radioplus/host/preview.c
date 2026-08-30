@@ -89,6 +89,22 @@ int main(int argc, char **argv)
                            LV_DISPLAY_RENDER_MODE_DIRECT);
     lv_display_set_flush_cb(d, flush_cb);
 
+    /* The boot screen, captured before anything else exists - which is the
+       whole point of it. Done here rather than in the walk below, because by
+       then the real screens have replaced it. Driven through a few steps and
+       one failure, since that is the state worth looking at. */
+    rp_ui_boot("tuner init");
+    rp_ui_boot("audio capture");
+    rp_ui_boot_failed("no capture device hw:0,1");
+    rp_ui_boot("audio out");
+    {
+        char path[512];
+        lv_refr_now(NULL);
+        snprintf(path, sizeof path, "%s/0a-boot.bmp", out);
+        if (write_bmp(path, s_fb, RP_SCREEN_W, RP_SCREEN_H))
+            printf("  %s\n", path);
+    }
+
     rp_model_refresh();
     rp_ui_init();
 
