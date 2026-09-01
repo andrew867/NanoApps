@@ -33,7 +33,13 @@ static const struct {
     bool console;
 } k_builtin[] = {
     { "Radio+",  "FM, RDS, recording", "radioplus", "FM", 0x22D3EE, false },
-    { "TinyPod", "Music",              "tinypod",   "TP", 0x34D399, true  },
+    /* TinyPod draws its own pixels. It was marked as a console app back when
+       its only front end was the terminal one, and the launcher has run it
+       with `gui` since - so the launcher was handing the framebuffer console
+       back and clearing it, and then the kernel's fbcon drew over LVGL. That
+       is why it opened from a shell every time and from the launcher about
+       half the time: which one you saw depended on what the console did next. */
+    { "TinyPod", "Music",              "tinypod",   "TP", 0x34D399, false },
 };
 
 /* The home screen hands each of these a button, so the two must agree. */
