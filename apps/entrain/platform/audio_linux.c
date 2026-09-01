@@ -22,6 +22,7 @@
 #include "audio.h"
 #include "sys.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -36,11 +37,15 @@
 #define EN_DEFAULT_CARD   0
 #define EN_DEFAULT_DEVICE 0
 
-/* 1024 frames at 44.1 kHz is 23 ms a period; four periods is under 100 ms of
-   latency and leaves plenty of slack for a 55 MB device that is also
-   compositing LVGL. */
+/* 1024 frames at 44.1 kHz is 23 ms a period.
+ *
+ * Eight of them rather than four. The codec takes 60 ms to settle a rate
+ * change inside its play-start, so a 93 ms buffer leaves under half a period
+ * of slack for a restart on a device that is also compositing LVGL; 186 ms
+ * leaves enough that one late wake-up is not an underrun. Four is still tried
+ * if the driver will not give us eight - see pcm_try_open. */
 #define EN_PERIOD_FRAMES 1024
-#define EN_PERIOD_COUNT  4
+#define EN_PERIOD_COUNT  8
 
 static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t       s_thread;
@@ -69,6 +74,13 @@ static int    s_stop_when_silent, s_pause_when_silent;
 
 static int16_t s_buf[EN_PERIOD_FRAMES * 2];
 static int16_t s_mix[EN_PERIOD_FRAMES * 2];
+
+/* Frames of s_mix the device has not taken yet, counted from its end. A
+   period is generated once and then handed over until it is gone; it is never
+   dropped because the device was momentarily full. */
+static unsigned s_pending;
+static unsigned s_periods = EN_PERIOD_COUNT;   /* what the driver actually gave */
+static unsigned long s_restarts;               /* stream restarts, for the log */
 
 /* ---- configuration hooks ------------------------------------------------- */
 
@@ -165,30 +177,47 @@ static uint64_t now_ns(void)
 
 static int pcm_try_open(uint32_t rate)
 {
-    struct pcm_config cfg;
-    memset(&cfg, 0, sizeof cfg);
-    cfg.channels = 2;
-    cfg.rate = rate;
-    cfg.period_size = EN_PERIOD_FRAMES;
-    cfg.period_count = EN_PERIOD_COUNT;
-    cfg.format = PCM_FORMAT_S16_LE;
-    cfg.start_threshold = 0;
-    cfg.stop_threshold = 0;
-    cfg.silence_threshold = 0;
+    /* Biggest buffer first, then down. A driver that will not give us eight
+       periods should get four rather than nothing: falling back to the null
+       sink means silence, which is a worse answer than a short buffer. */
+    static const unsigned COUNTS[] = { EN_PERIOD_COUNT, 4 };
 
-    /* Non-blocking on purpose. The writer paces itself against the monotonic
-       clock, so it never needs the sink to block — and a blocking write into a
-       driver that is still being brought up is a good way to end up stuck in
-       an uninterruptible wait that nothing can clear. */
-    struct pcm *p = pcm_open((unsigned)s_card, (unsigned)s_device,
-                             PCM_OUT | PCM_NONBLOCK, &cfg);
-    if (!p) return 0;
-    if (!pcm_is_ready(p)) {
-        pcm_close(p);
-        return 0;
+    for (unsigned i = 0; i < sizeof COUNTS / sizeof COUNTS[0]; i++) {
+        struct pcm_config cfg;
+        struct pcm *p;
+
+        if (i && COUNTS[i] == COUNTS[i - 1])
+            continue;
+
+        memset(&cfg, 0, sizeof cfg);
+        cfg.channels = 2;
+        cfg.rate = rate;
+        cfg.period_size = EN_PERIOD_FRAMES;
+        cfg.period_count = COUNTS[i];
+        cfg.format = PCM_FORMAT_S16_LE;
+        /* Zero means "tinyalsa's defaults": start at half the buffer, stop at
+           the whole of it. Which is what we want, and saying so by hand only
+           risks disagreeing with the buffer we actually got. */
+        cfg.start_threshold = 0;
+        cfg.stop_threshold = 0;
+        cfg.silence_threshold = 0;
+
+        /* Non-blocking on purpose. The writer paces itself against the
+           monotonic clock, so it never needs the sink to block — and a
+           blocking write into a driver that is still being brought up is a
+           good way to end up stuck in an uninterruptible wait that nothing
+           can clear. */
+        p = pcm_open((unsigned)s_card, (unsigned)s_device,
+                     PCM_OUT | PCM_NONBLOCK, &cfg);
+        if (p && pcm_is_ready(p)) {
+            s_pcm = p;
+            s_periods = COUNTS[i];
+            return 1;
+        }
+        if (p)
+            pcm_close(p);
     }
-    s_pcm = p;
-    return 1;
+    return 0;
 }
 
 /* ---- gain ramp ----------------------------------------------------------- */
@@ -280,23 +309,57 @@ static void *writer(void *arg)
             continue;
         }
 
-        if (!produce()) continue;
+        /* Generate a period only when the last one has been handed over in
+           full. What the device would not take is kept and offered again,
+           rather than thrown away and replaced with the next period - which
+           is a gap in the tone, on an app whose whole job is an unbroken
+           one. */
+        if (s_pending == 0) {
+            if (!produce()) continue;
+            s_pending = EN_PERIOD_FRAMES;
+        }
 
         if (s_pcm) {
-            int rc = pcm_writei(s_pcm, s_mix, EN_PERIOD_FRAMES);
-            if (rc < 0) {
-                /* With a non-blocking handle, "buffer full" is the normal
-                   case whenever we are slightly ahead, and it is not an
-                   error — the pacing below absorbs it. Anything else is an
-                   underrun or a codec that has gone away: re-prepare once,
-                   and if that fails drop to the null sink rather than
-                   spinning on a dead handle. */
-                if (rc != -EAGAIN && pcm_prepare(s_pcm) < 0) {
-                    pcm_close(s_pcm);
-                    s_pcm = NULL;
-                    s_null_sink = 1;
+            const int16_t *from = s_mix + (EN_PERIOD_FRAMES - s_pending) * 2;
+            int rc = pcm_writei(s_pcm, from, s_pending);
+
+            if (rc > 0) {
+                /* Short writes are legal and were being ignored: the frames
+                   the device did not take were dropped along with the rest
+                   of the period. */
+                s_pending -= (unsigned)rc > s_pending ? s_pending : (unsigned)rc;
+            } else if (rc < 0) {
+                /*
+                 * errno, not the return value.
+                 *
+                 * tinyalsa returns -1 and sets errno; it does not return
+                 * -EAGAIN. So `rc != -EAGAIN` was true for every full
+                 * buffer - the normal case whenever we are slightly ahead of
+                 * real time - and every one of them went to pcm_prepare(),
+                 * which throws away everything the device is holding and
+                 * restarts the stream. That is a start/stop loop at close to
+                 * period rate, generated here: on this codec each restart
+                 * costs a 60 ms rate-change settle, so what comes out is a
+                 * fragment of tone, silence, a fragment of tone.
+                 *
+                 * A full buffer is not an error. Keep the frames, let the
+                 * pacing below absorb it, and offer them again. Only a real
+                 * fault re-prepares.
+                 */
+                int e = errno;
+
+                if (e != EAGAIN && e != EINTR) {
+                    s_restarts++;
+                    if (pcm_prepare(s_pcm) < 0) {
+                        pcm_close(s_pcm);
+                        s_pcm = NULL;
+                        s_null_sink = 1;
+                        s_pending = 0;
+                    }
                 }
             }
+        } else {
+            s_pending = 0;              /* null sink: nothing to hand over */
         }
 
         /* Never run ahead of real time.
@@ -475,9 +538,23 @@ double en_audio_elapsed(void)
 
 const char *en_audio_backend_name(void)
 {
+    /* The buffer and the restart count go on the About screen, because a
+       stream that keeps restarting sounds like a broken tone and there is
+       nowhere else on this device to see the difference. */
+    static char name[96];
+    unsigned ms;
+
     if (s_null_sink) return "tinyalsa (null sink - no PCM device)";
-    return s_vol_ctl ? "tinyalsa streaming, hardware volume"
-                     : "tinyalsa streaming, software volume";
+
+    ms = (unsigned)((uint64_t)EN_PERIOD_FRAMES * s_periods * 1000u /
+                    (s_rate ? s_rate : 44100u));
+    if (s_restarts)
+        snprintf(name, sizeof name, "tinyalsa, %u ms, %s vol, %lu restarts",
+                 ms, s_vol_ctl ? "hw" : "sw", s_restarts);
+    else
+        snprintf(name, sizeof name, "tinyalsa, %u ms buffer, %s volume",
+                 ms, s_vol_ctl ? "hardware" : "software");
+    return name;
 }
 
 /* Which mixer control the volume ended up on, for the About screen and for

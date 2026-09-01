@@ -1534,8 +1534,7 @@ static void build_tune(void)
     lv_obj_set_pos(title, MARGIN, 12);
 
     lv_obj_t *hint = make_para(s,
-        "Drag up and down for the beat, left and right for the carrier. "
-        "Double tap to reset.",
+        "Drag: beat up/down, carrier left/right.  Double tap resets.",
         F_CAPTION, C_TEXT_MUTE, CONTENT_W);
     lv_obj_set_pos(hint, MARGIN, 44);
 
@@ -1567,12 +1566,6 @@ static void build_tune(void)
     lv_obj_set_style_text_align(s_tune_state, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(s_tune_state, CONTENT_W);
     lv_obj_set_pos(s_tune_state, MARGIN, 316);
-
-    lv_obj_t *note = make_para(s,
-        "The loop already playing keeps going until the new one is ready.",
-        F_CAPTION, C_TEXT_MUTE, CONTENT_W);
-    lv_obj_set_style_text_align(note, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_pos(note, MARGIN, 344);
 
     lv_obj_t *hint2 = make_label(s, "swipe down for now playing",
                                  F_CAPTION, C_TEXT_MUTE);
@@ -1654,10 +1647,6 @@ static void build_timer(void)
 
     lv_obj_t *title = make_label(s, "Sleep Timer", F_TITLE, C_TEXT);
     lv_obj_set_pos(title, MARGIN, 12);
-
-    lv_obj_t *sub = make_para(s, "Fades out, then stops.",
-                              F_CAPTION, C_TEXT_MUTE, CONTENT_W);
-    lv_obj_set_pos(sub, MARGIN, 40);
 
     make_hairline(s, 62, MARGIN, CONTENT_W);
 
@@ -1799,7 +1788,7 @@ static void build_settings(void)
     const bool own_volume = !en_sys_has_system_volume();
 
     if (own_volume) {
-    lv_obj_t *vrow = setting_row(s, y, "Volume", "Starts moderate on purpose");
+    lv_obj_t *vrow = setting_row(s, y, "Volume", NULL);
     s_vol_lbl = make_label(vrow, "", F_CAPTION, C_TEXT_DIM);
     lv_obj_set_style_text_align(s_vol_lbl, LV_TEXT_ALIGN_RIGHT, 0);
     lv_obj_set_width(s_vol_lbl, 44);
@@ -1822,7 +1811,7 @@ static void build_settings(void)
     y += 34;
     } else {
         lv_obj_t *vnote = make_para(s,
-            "Volume is the iPod's own: use the buttons on the side.",
+            "Use the buttons on the side.",
             F_CAPTION, C_TEXT_MUTE, CONTENT_W);
         lv_obj_set_pos(vnote, MARGIN, y);
         y += 40;
@@ -1838,8 +1827,7 @@ static void build_settings(void)
     make_hairline(s, y + TAP_MIN, MARGIN, CONTENT_W);
     y += TAP_MIN + 10;
 
-    lv_obj_t *mrow = setting_row(s, y, "Reduce motion",
-                                 "Stops the ring pulsing");
+    lv_obj_t *mrow = setting_row(s, y, "Reduce motion", NULL);
     s_motion_sw = lv_switch_create(mrow);
     lv_obj_set_size(s_motion_sw, 44, 26);
     lv_obj_set_pos(s_motion_sw, CONTENT_W - 44, 14);
@@ -1850,17 +1838,13 @@ static void build_settings(void)
     make_hairline(s, y, MARGIN, CONTENT_W);
     y += 12;
 
-    lv_obj_t *note = make_para(s,
-        "Binaural needs headphones: the beat is the difference between "
-        "the ears. Isochronic works on speakers.",
+    /* One line, and only the part that changes what a listener should do.
+       The paragraph that used to be here explained the mechanism and then
+       disclaimed it, which is two things the settings screen does not need
+       and thirty vertical pixels it does. */
+    lv_obj_t *note = make_para(s, "Binaural needs headphones.",
         F_CAPTION, C_TEXT_DIM, CONTENT_W);
     lv_obj_set_pos(note, MARGIN, y);
-    y += 74;
-
-    lv_obj_t *about = make_para(s,
-        "Tones are generated on the device. No health claims are made.",
-        F_CAPTION, C_TEXT_MUTE, CONTENT_W);
-    lv_obj_set_pos(about, MARGIN, y);
     y += 30;
 
     /* Which build is actually running.
