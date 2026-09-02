@@ -74,9 +74,21 @@ scantest:
 	@for f in /tmp/n31os/apps/radioplus/radioplus /tmp/n31os/apps/tinypod/tinypod \
 	         /tmp/n31bin/radioplus /tmp/n31bin/tinypod; do \
 	   printf '#!/bin/sh\ntrue\n' > $$f; chmod +x $$f; done
-	@touch -d '2020-01-01 00:00' /tmp/n31os/apps/radioplus/radioplus
-	@touch -d '2020-01-01 00:00' /tmp/n31bin/tinypod
-	@N31_BUILTIN_DIR=/tmp/n31bin $(BUILD)/scantest; rc=$$?; rm -rf /tmp/n31os /tmp/n31bin; exit $$rc
+#
+# The dates say one thing and the stamps say the other, on purpose: on the
+# device the volume is FAT read back without a timezone, so its dates are
+# hours out and only the stamps mean anything. Radio+ is newer on disk by
+# date and older by stamp; TinyPod is the reverse.
+#
+	@touch -d '2020-01-01 00:00' /tmp/n31bin/radioplus
+	@touch -d '2020-01-01 00:00' /tmp/n31os/apps/tinypod/tinypod
+	@mkdir -p /tmp/n31builds
+	@printf '20200101.0000' > /tmp/n31os/apps/radioplus/BUILD
+	@printf '20260902.0511' > /tmp/n31builds/radioplus
+	@printf '20260902.1500' > /tmp/n31os/apps/tinypod/BUILD
+	@printf '20260902.1459' > /tmp/n31builds/tinypod
+	@N31_BUILTIN_DIR=/tmp/n31bin N31_BUILDS_DIR=/tmp/n31builds \
+	   $(BUILD)/scantest; rc=$$?; rm -rf /tmp/n31os /tmp/n31bin /tmp/n31builds; exit $$rc
 
 # The scanner thread, plain and then under ThreadSanitizer. A race here
 # would show up as a list that is occasionally wrong on a device, which is

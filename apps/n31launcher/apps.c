@@ -266,6 +266,14 @@ static const char *builtin_dir(void)
     return (d && *d) ? d : "/bin";
 }
 
+/* Where mk-initramfs records what it packed, one file per program. */
+static const char *builds_dir(void)
+{
+    const char *d = getenv("N31_BUILDS_DIR");
+
+    return (d && *d) ? d : "/etc/n31/builds";
+}
+
 static bool resolve_builtin(const char *prog, char *out, size_t cap)
 {
     static const char *forms[] = { "%s/%s-start", "%s/%s-boot", "%s/%s" };
@@ -397,11 +405,44 @@ static void scan_one_dir(const char *apps_dir, void *ctx)
 /*
  * When the build behind a resolved path was made.
  *
- * What resolve_in and resolve_builtin hand back is often a wrapper -
- * tinypod-boot, radioplus-start - and a wrapper carries its own date, not the
- * date of the binary it goes on to run. So judge by the binary when one is
- * named, and by the resolved path otherwise.
+ * Not by file date, where the two copies can be compared at all. The volume
+ * is FAT, written by Windows in local time, and the kernel reads those
+ * timestamps back without a timezone - so a file staged from this machine
+ * arrives on the device dated two and a half hours before it was written.
+ * Measured, on the copy that is on the volume right now: Windows says it was
+ * written at 22:31 and the device says 20:01. Against build dates minutes
+ * apart - the lean TinyPod and the wide one are a minute apart - that skew
+ * decides it, and decides it wrong.
+ *
+ * So each copy is staged with a BUILD file beside it holding the stamp the
+ * binary was built with, "YYYYMMDD.HHMM" off one clock in one format, which
+ * compares as a string and has no timezone anywhere in it. mk-initramfs
+ * writes them for /bin and install-n31os-disk.ps1 writes them for the volume.
+ *
+ * File dates are the fallback for a copy staged by hand, where they are the
+ * only evidence there is.
  */
+#define TP_STAMP_LEN 13         /* YYYYMMDD.HHMM */
+
+static bool build_stamp(const char *dir, const char *name, char *out)
+{
+    char path[288];
+    FILE *f;
+    size_t n;
+
+    *out = 0;
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    if (!(f = fopen(path, "r"))) return false;
+    n = fread(out, 1, TP_STAMP_LEN, f);
+    fclose(f);
+    out[n] = 0;
+
+    /* Only a stamp of the expected shape counts; anything else is a file
+       someone else put there and guessing at it is worse than not looking. */
+    if (n != TP_STAMP_LEN || out[8] != '.') { *out = 0; return false; }
+    return true;
+}
+
 static time_t built_at(const char *resolved, const char *binary)
 {
     struct stat st;
@@ -413,8 +454,14 @@ static time_t built_at(const char *resolved, const char *binary)
     return 0;
 }
 
-/* A builtin staged on the volume, and when it was built. */
-struct builtin_hit { n31_app_t *a; const char *prog; bool found; time_t when; };
+/* A builtin staged on the volume, and which build of it that is. */
+struct builtin_hit {
+    n31_app_t  *a;
+    const char *prog;
+    bool        found;
+    time_t      when;
+    char        stamp[TP_STAMP_LEN + 1];
+};
 
 static void find_builtin(const char *apps_dir, void *ctx)
 {
@@ -429,6 +476,9 @@ static void find_builtin(const char *apps_dir, void *ctx)
 
     snprintf(bin, sizeof bin, "%s/%s/%s", apps_dir, h->prog, exec);
     h->when = built_at(h->a->path, bin);
+
+    snprintf(bin, sizeof bin, "%s/%s", apps_dir, h->prog);
+    build_stamp(bin, "BUILD", h->stamp);
 }
 
 /* ---- the cheap check ------------------------------------------------------ */
@@ -539,8 +589,13 @@ bool n31_apps_scan_into(n31_app_list_t *out, n31_scan_state_t *state)
         a.builtin = true;
         a.console = k_builtin[i].console;
 
-        struct builtin_hit h = { &a, k_builtin[i].prog, false, 0 };
+        struct builtin_hit h;
         char shipped[sizeof a.path], shipped_bin[sizeof a.path];
+        char shipped_stamp[TP_STAMP_LEN + 1];
+
+        memset(&h, 0, sizeof h);
+        h.a = &a;
+        h.prog = k_builtin[i].prog;
 
         for_each_apps_dir(find_builtin, &h);
 
@@ -560,9 +615,17 @@ bool n31_apps_scan_into(n31_app_list_t *out, n31_scan_state_t *state)
          * wins here: that is metadata about the app, not a build of it.
          */
         if (resolve_builtin(a.prog, shipped, sizeof shipped)) {
+            bool newer;
+
             snprintf(shipped_bin, sizeof shipped_bin, "%s/%s",
                      builtin_dir(), a.prog);
-            if (!h.found || built_at(shipped, shipped_bin) > h.when) {
+
+            if (build_stamp(builds_dir(), a.prog, shipped_stamp) && *h.stamp)
+                newer = strcmp(shipped_stamp, h.stamp) > 0;
+            else
+                newer = built_at(shipped, shipped_bin) > h.when;
+
+            if (!h.found || newer) {
                 copy_str(a.path, sizeof a.path, shipped);
                 h.found = true;
             }

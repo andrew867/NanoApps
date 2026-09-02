@@ -67,23 +67,29 @@ int main(void)
      * The volume is searched before the copy baked into the initramfs, and it
      * used to win outright - so a rebuilt, repacked and reflashed app would
      * boot with the days-old binary on the read-only volume shadowing it, and
-     * nothing said a word. The rule now is whichever was built last, and this
-     * is the part of it that can be checked without a device: the fixture
-     * stages the same program in both places and touches one of them.
+     * nothing said a word. The rule now is whichever was built last.
+     *
+     * Which is decided on the build stamp, not the file date, because the
+     * volume is FAT written in local time and read back without a timezone -
+     * so its dates arrive hours out, against builds that are a minute apart.
+     * The fixture therefore points the two at each other: every file date here
+     * says the opposite of every stamp. Only a reader that goes by the stamp
+     * passes both of these.
      */
     {
         const n31_app_t *r;
 
-        /* Older on disk, newer in /bin: the /bin one. */
+        /* Radio+: newer on disk by date, older by stamp. The /bin one. */
         r = find("radioplus");
-        ok("a stale volume copy loses to the baked-in one",
+        ok("an older build on the volume loses, whatever its date",
            r && !strncmp(r->path, getenv("N31_BUILTIN_DIR"),
                          strlen(getenv("N31_BUILTIN_DIR"))));
 
-        /* And the other way round, because the volume copy is the one with an
-           app's data beside it and it has to keep winning when it is current. */
+        /* TinyPod: older on disk by date, newer by stamp - which is the real
+           arrangement, since the volume carries the wide FFmpeg build and
+           /bin the lean one, a minute apart. The volume one. */
         r = find("tinypod");
-        ok("a current volume copy still wins",
+        ok("a newer build on the volume wins, whatever its date",
            r && !strncmp(r->path, "/tmp/n31os/apps/", 16));
     }
 
