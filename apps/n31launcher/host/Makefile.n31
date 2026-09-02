@@ -61,7 +61,7 @@ LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_n31.h\"
              -I$(LVGL) -I$(LVGL)/src -I$(LVGL)/include -I$(LVGL)/.. -I..
 
 APP  := $(BUILD)/n31launcher
-SRCS := ../launcher.c ../ui.c ../apps.c ../fbcon.c ../status.c ../scanner.c ../klog.c ../../build_stamp.c
+SRCS := ../launcher.c ../ui.c ../apps.c ../fbcon.c ../status.c ../scanner.c ../klog.c ../backlight.c ../../build_stamp.c
 HDRS := $(wildcard ../*.h)
 
 

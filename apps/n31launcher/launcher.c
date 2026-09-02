@@ -55,6 +55,7 @@
 
 #include "ui.h"
 #include "apps.h"
+#include "backlight.h"
 #include "fbcon.h"
 #include "status.h"
 #include "scanner.h"
@@ -108,6 +109,25 @@
  * that needs it. The home screen has the parallax to feed; the others have
  * neither.
  */
+/*
+ * The Sleep button, as an input event like any other.
+ *
+ * gpio-d1830 reports it as KEY_POWER on a short press. Holding it is the
+ * kernel's business - it cuts power itself after about half a second - and
+ * n31-powerwatch deliberately does nothing with the short press, so this is
+ * free to mean sleep and wake.
+ */
+#define N31_KEY_POWER 116
+
+/*
+ * How long the screen stays lit with nobody touching it.
+ *
+ * Everything the launcher draws when idle is decoration: the parallax, the
+ * battery percentage, the tilt. None of it is worth a lit panel and a wake-up
+ * every eighty milliseconds when nobody is looking.
+ */
+#define SLEEP_MS 30000
+
 #define IDLE_QUIET_MS 250
 #define IDLE_HOME_MS  TILT_MS
 #define IDLE_OTHER_MS 120
@@ -225,6 +245,13 @@ static void open_keys(void)
  * path, because the mount point is not settled - any vfat under /mnt counts,
  * which is the same assumption the app scan makes.
  */
+static bool     s_asleep;          /* backlight off, drawing nothing */
+static uint32_t s_last_input;      /* when a key last arrived */
+
+/* Defined below, next to the poll they belong with; on_key comes first. */
+static void go_to_sleep(void);
+static void wake_up(void);
+
 static int  s_mounts_fd = -1;   /* held open so it can be polled */
 static bool s_mounted;          /* last answer, kept until the kernel says */
 static bool s_scan_wanted = true;
@@ -590,6 +617,24 @@ static void on_key(uint16_t code, int32_t value)
     const bool pressed = (value == 1);
     const bool repeat  = (value == 2);
 
+    s_last_input = millis();
+
+    /*
+     * Asleep, any button wakes and does nothing else. Swallowing the press is
+     * the point: a button found in a pocket should light the screen, not open
+     * whatever it happened to land on.
+     */
+    if (s_asleep) {
+        if (pressed) wake_up();
+        return;
+    }
+
+    /* Awake, the Sleep button sleeps. */
+    if (code == N31_KEY_POWER) {
+        if (pressed) go_to_sleep();
+        return;
+    }
+
     /* While an app is running its own buttons are its business. The launcher
        listens for HOME and nothing else. */
     if (s_child) {
@@ -656,12 +701,18 @@ static void on_key(uint16_t code, int32_t value)
  * wait from lv_timer_handler - which happens whenever a timer came due while
  * we were busy elsewhere - used to mean no sleep at all.
  */
+#define IDLE_FOREVER 0xFFFFFFFFu
+
 static void idle_for(uint32_t ms)
 {
     struct pollfd pfd[MAX_KEY_FDS + 1];
     int n = 0, mounts_slot = -1;
 
     if (ms < 4) ms = 4;
+
+    /* Indefinite means indefinite: poll returns when a button or the mount
+       table has something to say, and not before. */
+    int timeout = ms == IDLE_FOREVER ? -1 : (int)ms;
 
     for (int i = 0; i < s_key_fds; i++) {
         pfd[n].fd = s_key_fd[i];
@@ -681,11 +732,13 @@ static void idle_for(uint32_t ms)
     }
 
     if (!n) {
-        usleep(ms * 1000u);
+        /* No descriptors to wait on, so there is nothing to wake for either.
+           Sleep a bounded amount rather than for ever. */
+        usleep((ms == IDLE_FOREVER ? IDLE_QUIET_MS : ms) * 1000u);
         return;
     }
 
-    if (poll(pfd, (nfds_t)n, (int)ms) <= 0)
+    if (poll(pfd, (nfds_t)n, timeout) <= 0)
         return;
 
     if (mounts_slot >= 0 &&
@@ -715,6 +768,38 @@ static void idle_for(uint32_t ms)
             break;
         }
     }
+}
+
+/*
+ * The screen off, and back on.
+ *
+ * Only the backlight is touched. LVGL keeps its display and its object tree
+ * exactly as they were, so waking is a redraw of something already composed
+ * rather than a rebuild - which is why this can be aggressive about when it
+ * sleeps without being annoying to wake.
+ */
+static void go_to_sleep(void)
+{
+    if (s_asleep) return;
+    s_asleep = true;
+    n31_backlight_off();
+    printf("n31launcher: screen off\n");
+    fflush(stdout);
+}
+
+static void wake_up(void)
+{
+    if (!s_asleep) return;
+    s_asleep = false;
+    s_last_input = millis();
+    n31_backlight_on();
+
+    /* The console may have taken the framebuffer while nobody was looking,
+       and nothing on screen has been drawn since before that. */
+    n31_fbcon_reassert();
+    n31_ui_redraw();
+    printf("n31launcher: screen on\n");
+    fflush(stdout);
 }
 
 static void pump_keys(void)
@@ -777,6 +862,9 @@ int main(int argc, char **argv)
      * launcher behaves as it does with no volume, which is a state it already
      * handles.
      */
+    n31_backlight_open();
+    s_last_input = millis();
+
     s_mounts_fd = open("/proc/mounts", O_RDONLY);
     if (s_mounts_fd < 0)
         s_mounts_fd = open("/proc/self/mounts", O_RDONLY);
@@ -889,9 +977,25 @@ int main(int argc, char **argv)
 
         /* While an app owns the framebuffer the launcher draws nothing at all.
            There is no compositor here, and two writers would fight over every
-           frame. */
+           frame. The screen belongs to the app then, including whether it is
+           lit - so an app that wants it dark can say so itself. */
         if (s_child) {
+            s_last_input = millis();
             idle_for(IDLE_QUIET_MS);
+            continue;
+        }
+
+        /*
+         * Nobody has touched it for a while. Everything below this point
+         * draws or samples something that only matters to someone looking at
+         * it, so none of it runs; the wait below becomes indefinite and the
+         * launcher costs nothing at all until a button arrives.
+         */
+        if (!s_asleep && millis() - s_last_input >= SLEEP_MS)
+            go_to_sleep();
+
+        if (s_asleep) {
+            idle_for(IDLE_FOREVER);
             continue;
         }
 
