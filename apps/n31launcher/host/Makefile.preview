@@ -65,7 +65,18 @@ scantest:
 	@chmod +x /tmp/n31os/apps/demo/demo /tmp/n31os/apps/bare/bare
 	@printf '%s\n' '{ "name": "Demo App", "exec": "demo", "tagline": "a test", "glyph": "DA", "color": "#f43f5e", "screen": "console" }' > /tmp/n31os/apps/demo/app.json
 	@touch /tmp/n31os/apps/empty/readme
-	@$(BUILD)/scantest; rc=$$?; rm -rf /tmp/n31os; exit $$rc
+#
+# The two builtins, staged in both places, so the test can say which
+# copy runs. N31_BUILTIN_DIR stands in for /bin. Radio+ is stale on the
+# volume and current in /bin; TinyPod is the other way round.
+#
+	@mkdir -p /tmp/n31bin /tmp/n31os/apps/radioplus /tmp/n31os/apps/tinypod
+	@for f in /tmp/n31os/apps/radioplus/radioplus /tmp/n31os/apps/tinypod/tinypod \
+	         /tmp/n31bin/radioplus /tmp/n31bin/tinypod; do \
+	   printf '#!/bin/sh\ntrue\n' > $$f; chmod +x $$f; done
+	@touch -d '2020-01-01 00:00' /tmp/n31os/apps/radioplus/radioplus
+	@touch -d '2020-01-01 00:00' /tmp/n31bin/tinypod
+	@N31_BUILTIN_DIR=/tmp/n31bin $(BUILD)/scantest; rc=$$?; rm -rf /tmp/n31os /tmp/n31bin; exit $$rc
 
 # The scanner thread, plain and then under ThreadSanitizer. A race here
 # would show up as a list that is occasionally wrong on a device, which is

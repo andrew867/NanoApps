@@ -61,6 +61,32 @@ int main(void)
 
     ok("a folder with no executable is skipped", !have("empty"));
 
+    /*
+     * Which copy of a builtin runs.
+     *
+     * The volume is searched before the copy baked into the initramfs, and it
+     * used to win outright - so a rebuilt, repacked and reflashed app would
+     * boot with the days-old binary on the read-only volume shadowing it, and
+     * nothing said a word. The rule now is whichever was built last, and this
+     * is the part of it that can be checked without a device: the fixture
+     * stages the same program in both places and touches one of them.
+     */
+    {
+        const n31_app_t *r;
+
+        /* Older on disk, newer in /bin: the /bin one. */
+        r = find("radioplus");
+        ok("a stale volume copy loses to the baked-in one",
+           r && !strncmp(r->path, getenv("N31_BUILTIN_DIR"),
+                         strlen(getenv("N31_BUILTIN_DIR"))));
+
+        /* And the other way round, because the volume copy is the one with an
+           app's data beside it and it has to keep winning when it is current. */
+        r = find("tinypod");
+        ok("a current volume copy still wins",
+           r && !strncmp(r->path, "/tmp/n31os/apps/", 16));
+    }
+
     /* Nothing changed, so the second scan must be a no-op. That is what makes
        polling every two seconds affordable on a NAND-backed volume. */
     ok("an unchanged rescan reports no change", n31_apps_scan() == false);

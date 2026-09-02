@@ -7,8 +7,10 @@
 #include <dirent.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 n31_app_t n31_apps[N31_MAX_APPS];
@@ -251,12 +253,25 @@ static bool resolve_in(const char *apps_dir, const char *folder,
     return false;
 }
 
+/*
+ * Where the copies baked into this boot live. /bin on the device; somewhere
+ * under /tmp when a test wants to stage both halves and see which one wins,
+ * the same way N31_BACKLIGHT_CLASS lets the backlight be tested off a real
+ * one.
+ */
+static const char *builtin_dir(void)
+{
+    const char *d = getenv("N31_BUILTIN_DIR");
+
+    return (d && *d) ? d : "/bin";
+}
+
 static bool resolve_builtin(const char *prog, char *out, size_t cap)
 {
-    static const char *forms[] = { "/bin/%s-start", "/bin/%s-boot", "/bin/%s" };
+    static const char *forms[] = { "%s/%s-start", "%s/%s-boot", "%s/%s" };
 
     for (unsigned i = 0; i < sizeof forms / sizeof forms[0]; i++) {
-        snprintf(out, cap, forms[i], prog);
+        snprintf(out, cap, forms[i], builtin_dir(), prog);
         if (executable(out)) return true;
     }
     *out = 0;
@@ -379,19 +394,41 @@ static void scan_one_dir(const char *apps_dir, void *ctx)
     closedir(d);
 }
 
-/* A builtin staged on the volume: the disk copy is the newer one when both
-   exist, and it is the one with a manifest beside it. */
-struct builtin_hit { n31_app_t *a; const char *prog; bool found; };
+/*
+ * When the build behind a resolved path was made.
+ *
+ * What resolve_in and resolve_builtin hand back is often a wrapper -
+ * tinypod-boot, radioplus-start - and a wrapper carries its own date, not the
+ * date of the binary it goes on to run. So judge by the binary when one is
+ * named, and by the resolved path otherwise.
+ */
+static time_t built_at(const char *resolved, const char *binary)
+{
+    struct stat st;
+
+    if (binary && *binary && stat(binary, &st) == 0 && S_ISREG(st.st_mode))
+        return st.st_mtime;
+    if (resolved && *resolved && stat(resolved, &st) == 0)
+        return st.st_mtime;
+    return 0;
+}
+
+/* A builtin staged on the volume, and when it was built. */
+struct builtin_hit { n31_app_t *a; const char *prog; bool found; time_t when; };
 
 static void find_builtin(const char *apps_dir, void *ctx)
 {
     struct builtin_hit *h = ctx;
     if (h->found) return;
 
-    char exec[32];
+    char exec[32], bin[sizeof h->a->path];
     apply_manifest(apps_dir, h->prog, h->a, exec, sizeof exec);
     h->found = resolve_in(apps_dir, h->prog, exec,
                           h->a->path, sizeof h->a->path);
+    if (!h->found) return;
+
+    snprintf(bin, sizeof bin, "%s/%s/%s", apps_dir, h->prog, exec);
+    h->when = built_at(h->a->path, bin);
 }
 
 /* ---- the cheap check ------------------------------------------------------ */
@@ -502,10 +539,36 @@ bool n31_apps_scan_into(n31_app_list_t *out, n31_scan_state_t *state)
         a.builtin = true;
         a.console = k_builtin[i].console;
 
-        struct builtin_hit h = { &a, k_builtin[i].prog, false };
+        struct builtin_hit h = { &a, k_builtin[i].prog, false, 0 };
+        char shipped[sizeof a.path], shipped_bin[sizeof a.path];
+
         for_each_apps_dir(find_builtin, &h);
 
-        if (!h.found && !resolve_builtin(a.prog, a.path, sizeof a.path))
+        /*
+         * Then the copy baked into this boot, and take whichever is newer.
+         *
+         * The disk was searched first and used to win outright, on the
+         * reasoning that a staged copy is the newer of the two and is the one
+         * with its data beside it. The second half holds. The first half is
+         * only true until someone builds again: the volume is written by hand
+         * and is mounted read-only most of the time, so a fresh initramfs
+         * would boot with a days-old binary shadowing it and nothing said so.
+         * That is not a subtle failure either - it is the whole reason a fix
+         * can be built, packed and flashed and still not be what runs.
+         *
+         * The manifest keeps its say over the name, glyph and colour whatever
+         * wins here: that is metadata about the app, not a build of it.
+         */
+        if (resolve_builtin(a.prog, shipped, sizeof shipped)) {
+            snprintf(shipped_bin, sizeof shipped_bin, "%s/%s",
+                     builtin_dir(), a.prog);
+            if (!h.found || built_at(shipped, shipped_bin) > h.when) {
+                copy_str(a.path, sizeof a.path, shipped);
+                h.found = true;
+            }
+        }
+
+        if (!h.found)
             continue;   /* not installed: a row that opens nothing is worse
                            than a missing row - it looks like our bug */
 
