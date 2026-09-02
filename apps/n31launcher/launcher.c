@@ -48,6 +48,7 @@
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <poll.h>
 #include <unistd.h>
 
 #include "lvgl/lvgl.h"
@@ -74,10 +75,15 @@
  */
 #define SCREEN_GUARD_MS 350
 
-/* The volume is not always mounted when the launcher starts, so the list is
-   rebuilt occasionally and an app that appears simply appears. This is a
-   readdir of one directory, not a disk scan. */
-#define RESCAN_MS 2000
+/*
+ * No rescan interval.
+ *
+ * The volume is not always mounted when the launcher starts, so the list has
+ * to be rebuilt when one appears - but on a timer it found the same apps it
+ * found last time, every two seconds, and kept the storage awake to do it.
+ * /proc/mounts reports a change by poll, so the scan happens at startup and
+ * when the mount table actually moves.
+ */
 
 /* Battery, Bluetooth, playback and the tuner. A second is plenty - none of
    them change faster than that in any way worth drawing. */
@@ -92,6 +98,19 @@
    the console check because it walks /proc, and an app appearing half a second
    late to the launcher's notice costs nothing. */
 #define FOREIGN_MS 500
+
+/*
+ * How long the loop may sleep, by what the screen is doing.
+ *
+ * While an app owns the framebuffer the launcher draws nothing and only has
+ * to notice HOME, which poll() reports the instant it arrives - so a quarter
+ * of a second between wake-ups costs nothing and leaves the CPU to the app
+ * that needs it. The home screen has the parallax to feed; the others have
+ * neither.
+ */
+#define IDLE_QUIET_MS 250
+#define IDLE_HOME_MS  TILT_MS
+#define IDLE_OTHER_MS 120
 
 /*
  * How long to wait before trying the volume again after a failure, and how far
@@ -206,18 +225,46 @@ static void open_keys(void)
  * path, because the mount point is not settled - any vfat under /mnt counts,
  * which is the same assumption the app scan makes.
  */
+static int  s_mounts_fd = -1;   /* held open so it can be polled */
+static bool s_mounted;          /* last answer, kept until the kernel says */
+static bool s_scan_wanted = true;
+
+/*
+ * Read the mount table and note whether the volume is on it.
+ *
+ * Also re-arms the poll: the namespace compares its event counter against the
+ * one taken at the last read, so reading is what makes the next change
+ * signal again.
+ */
+static void mounts_read(void)
+{
+    char buf[4096];
+    ssize_t n, total = 0;
+    bool found = false;
+
+    if (s_mounts_fd < 0) return;
+    if (lseek(s_mounts_fd, 0, SEEK_SET) < 0) return;
+
+    /* One line can straddle a read, so scan the whole thing once it is in. */
+    while (total < (ssize_t)sizeof buf - 1 &&
+           (n = read(s_mounts_fd, buf + total, sizeof buf - 1 - (size_t)total)) > 0)
+        total += n;
+    buf[total > 0 ? total : 0] = 0;
+
+    for (char *l = buf; l && *l; ) {
+        char *e = strchr(l, '\n');
+        if (e) *e = 0;
+        if (strstr(l, " /mnt/") && strstr(l, " vfat ")) found = true;
+        if (!e) break;
+        *e = '\n';
+        l = e + 1;
+    }
+    s_mounted = found;
+}
+
 static bool disk_mounted(void)
 {
-    FILE *f = fopen("/proc/mounts", "r");
-    if (!f) return false;
-
-    char line[512];
-    bool found = false;
-    while (!found && fgets(line, sizeof line, f))
-        found = strstr(line, " /mnt/") && strstr(line, " vfat ");
-
-    fclose(f);
-    return found;
+    return s_mounted;
 }
 
 static void go(screen_t s)
@@ -597,6 +644,79 @@ static void on_key(uint16_t code, int32_t value)
     }
 }
 
+/*
+ * Sleep until there is a key or the deadline, whichever comes first.
+ *
+ * The loop used to usleep a fixed frame time, so a keypress waited for the
+ * next frame and an idle launcher woke thirty times a second to find nothing
+ * to do. poll() gives back both: input is noticed the moment it arrives, so
+ * the idle period can be as long as the screen's own needs allow.
+ *
+ * Floored, because the point of this is that the loop cannot spin. A zero
+ * wait from lv_timer_handler - which happens whenever a timer came due while
+ * we were busy elsewhere - used to mean no sleep at all.
+ */
+static void idle_for(uint32_t ms)
+{
+    struct pollfd pfd[MAX_KEY_FDS + 1];
+    int n = 0, mounts_slot = -1;
+
+    if (ms < 4) ms = 4;
+
+    for (int i = 0; i < s_key_fds; i++) {
+        pfd[n].fd = s_key_fd[i];
+        pfd[n].events = POLLIN;
+        pfd[n].revents = 0;
+        n++;
+    }
+
+    /* The mount table, which signals POLLPRI when it moves. This is the whole
+       reason the launcher no longer scans on a timer. */
+    if (s_mounts_fd >= 0) {
+        mounts_slot = n;
+        pfd[n].fd = s_mounts_fd;
+        pfd[n].events = POLLPRI | POLLERR;
+        pfd[n].revents = 0;
+        n++;
+    }
+
+    if (!n) {
+        usleep(ms * 1000u);
+        return;
+    }
+
+    if (poll(pfd, (nfds_t)n, (int)ms) <= 0)
+        return;
+
+    if (mounts_slot >= 0 &&
+        (pfd[mounts_slot].revents & (POLLPRI | POLLERR))) {
+        mounts_read();
+        s_scan_wanted = true;
+    }
+
+    /*
+     * A descriptor in error is ready for ever, which would turn this back
+     * into the spin it was written to remove - and a device that has gone
+     * away is exactly how that happens. Drop it; the launcher keeps whatever
+     * other buttons it found, and with none it falls back to sleeping.
+     */
+    for (int i = n - 1; i >= 0; i--) {
+        if (i == mounts_slot)
+            continue;
+        if (!(pfd[i].revents & (POLLERR | POLLHUP | POLLNVAL)))
+            continue;
+        for (int j = 0; j < s_key_fds; j++) {
+            if (s_key_fd[j] != pfd[i].fd)
+                continue;
+            printf("n31launcher: input device gone, dropping it\n");
+            fflush(stdout);
+            close(s_key_fd[j]);
+            s_key_fd[j] = s_key_fd[--s_key_fds];
+            break;
+        }
+    }
+}
+
 static void pump_keys(void)
 {
     struct n31_input_event ev;
@@ -649,6 +769,22 @@ int main(int argc, char **argv)
                "messages will draw over the UI\n");
 
     open_keys();
+
+    /*
+     * The mount table, held open for the whole run so it can be polled. The
+     * first read is what tells us the state now and arms the notification for
+     * everything after it; if it will not open, s_mounted stays false and the
+     * launcher behaves as it does with no volume, which is a state it already
+     * handles.
+     */
+    s_mounts_fd = open("/proc/mounts", O_RDONLY);
+    if (s_mounts_fd < 0)
+        s_mounts_fd = open("/proc/self/mounts", O_RDONLY);
+    if (s_mounts_fd >= 0)
+        mounts_read();
+    else
+        printf("n31launcher: no /proc/mounts - assuming no volume\n");
+
     if (!s_key_fds)
         printf("n31launcher: no key input - nothing can be started\n");
 
@@ -697,7 +833,6 @@ int main(int argc, char **argv)
      * second bring-up behind the user's back.
      */
 
-    uint32_t last_scan = millis();
     uint32_t last_status = millis();
     uint32_t last_tilt = millis();
     uint32_t last_fbcon = millis();
@@ -756,7 +891,7 @@ int main(int argc, char **argv)
            There is no compositor here, and two writers would fight over every
            frame. */
         if (s_child) {
-            usleep(FRAME_MS * 1000u);
+            idle_for(IDLE_QUIET_MS);
             continue;
         }
 
@@ -785,14 +920,19 @@ int main(int argc, char **argv)
             }
         }
         if (foreign) {
-            usleep(FRAME_MS * 1000u);
+            idle_for(IDLE_QUIET_MS);
             continue;
         }
 
-        if (millis() - last_scan >= RESCAN_MS) {
-            last_scan = millis();
-            if (!n31_scanner_busy())
-                n31_scanner_request();
+        /*
+         * Scan when there is a reason to, which means at startup and when the
+         * mount table moves. It used to be every two seconds for ever, which
+         * walked the volume looking for apps that were already found and kept
+         * the storage awake to do it.
+         */
+        if (s_scan_wanted && !n31_scanner_busy()) {
+            s_scan_wanted = false;
+            n31_scanner_request();
         }
 
         /* Collect on every pass, not on the poll interval: the worker finishes
@@ -820,9 +960,18 @@ int main(int argc, char **argv)
             }
         }
 
+        /*
+         * LVGL says when it next has something to do; the cap says how long
+         * we are willing to wait anyway, and that depends on the screen
+         * rather than on a fixed frame rate. An animation makes
+         * lv_timer_handler ask for a short wait, so this follows one without
+         * being told about it.
+         */
         uint32_t wait = lv_timer_handler();
-        if (wait > FRAME_MS) wait = FRAME_MS;
-        usleep(wait * 1000u);
+        uint32_t cap = s_screen == SCREEN_HOME ? IDLE_HOME_MS : IDLE_OTHER_MS;
+
+        if (wait > cap) wait = cap;
+        idle_for(wait);
     }
 
     /* Going away without taking them with us would leave something drawing to
