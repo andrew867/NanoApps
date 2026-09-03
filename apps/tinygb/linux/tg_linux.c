@@ -1,8 +1,15 @@
 /*
- * tg_linux.c — TinyGB on the N31 Linux port. Picture and sound.
+ * tg_linux.c — TinyGB on the N31 Linux port.
  *
  * Loads a cartridge, runs it, puts it on /dev/fb0 at 240x216 in the top half
- * of the panel, and plays it. No controls yet - that is Phase 03.
+ * of the panel, plays it, takes its buttons from whatever this device has, and
+ * keeps the cartridge's battery save on disk.
+ *
+ * Controls, in the absence of a working touchscreen: Volume Up and Down are A
+ * and B, Play/Pause is Start, and the accelerometer is the d-pad. Home leaves.
+ * The Apple Grape touch controller fails its firmware handshake on this build
+ * and parks itself, so tilt is what makes a game playable today - see
+ * tg_input.h, where touch is already a source waiting for the device to boot.
  *
  * What keeps time is the audio device, not the clock.
  *
@@ -20,6 +27,8 @@
 
 #include "../core/tg_core.h"
 #include "../platform/tg_fb.h"
+#include "../platform/tg_input.h"
+#include "../platform/tg_save.h"
 #include "../platform/tg_audio.h"
 #include "../platform/tg_scale.h"
 
@@ -97,7 +106,10 @@ static void usage(void)
         "  --bench       run flat out and report frames per second\n"
         "  --mute        no audio device; pace off the monotonic clock\n"
         "  --warmup N    run N frames before the timers start\n"
-        "  --noskip      repaint every row, even unchanged ones\n");
+        "  --noskip      repaint every row, even unchanged ones\n"
+        "  --no-tilt     do not use the accelerometer as a d-pad\n"
+        "  --tilt A,B    tilt press/release angles, percent of full scale\n"
+        "  --probe-input list input devices and print events, then exit\n");
 }
 
 int main(int argc, char **argv)
@@ -105,7 +117,11 @@ int main(int argc, char **argv)
     const char *rom_path = NULL, *fb_path = NULL;
     unsigned long limit = 0;
     unsigned long warmup = 0;
-    bool noskip = false;
+    bool noskip = false, tilt = true;
+    int tilt_on = 22, tilt_off = 12;
+    tg_input *input = NULL;
+    tg_save save;
+    bool have_save = false;
     bool smooth = true, bench = false, mute = false;
 
     uint8_t *rom = NULL, *sram = NULL;
@@ -142,6 +158,10 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--bench"))                  bench = true;
         else if (!strcmp(argv[i], "--mute"))                   mute = true;
         else if (!strcmp(argv[i], "--noskip"))                 noskip = true;
+        else if (!strcmp(argv[i], "--no-tilt"))                tilt = false;
+        else if (!strcmp(argv[i], "--tilt") && i + 1 < argc)
+            sscanf(argv[++i], "%d,%d", &tilt_on, &tilt_off);
+        else if (!strcmp(argv[i], "--probe-input")) { tg_input_probe(15); return 0; }
         else if (!strcmp(argv[i], "--warmup") && i + 1 < argc) warmup = strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(); return 0; }
         else if (argv[i][0] == '-')                            { usage(); return 2; }
@@ -178,6 +198,20 @@ int main(int argc, char **argv)
         fprintf(stderr, "tinygb: out of memory for cart RAM\n");
         free(rom);
         return 2;
+    }
+
+    /*
+     * The battery, before the core opens - a cartridge reads its save during
+     * its own startup, so loading afterwards would be a frame too late and the
+     * game would already have decided it was a new one.
+     */
+    if (info.sram_size) {
+        char sav[512];
+
+        tg_save_path_for(rom_path, sav, sizeof sav);
+        have_save = tg_save_load(&save, sav, sram, info.sram_size);
+        printf("tinygb: save %s  %s\n", sav,
+               have_save ? "loaded" : "(new)");
     }
 
     if (!(ctx = calloc(1, core->ctx_size))) {
@@ -252,6 +286,29 @@ int main(int argc, char **argv)
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
+    /*
+     * Whatever this device can offer. The touchscreen is the intended d-pad
+     * and is not booting on this build, so tilt is what makes a game playable
+     * today - and because the sources are OR-ed, touch appearing later needs
+     * no change here.
+     */
+    input = tg_input_open(TG_SRC_KEYS | (tilt ? TG_SRC_TILT : 0) | TG_SRC_TOUCH);
+    if (input) {
+        unsigned got = tg_input_sources(input);
+
+        tg_input_set_tilt(input, tilt_on, tilt_off);
+        printf("tinygb: input%s%s%s\n",
+               (got & TG_SRC_KEYS)  ? " keys" : "",
+               (got & TG_SRC_TILT)  ? " tilt" : "",
+               (got & TG_SRC_TOUCH) ? " touch" : "");
+        /* Level was measured during tg_input_open, so how the device was
+           lying a moment ago is now the neutral position. Worth saying: put
+           down flat and picked up to play, every direction is held at once. */
+        if (got & TG_SRC_TILT)
+            printf("tinygb: tilt d-pad - hold it the way you mean to play\n");
+        if (!got) printf("tinygb: no input devices - nothing to play with\n");
+    }
+
     core->set_buttons(ctx, 0);
 
     /*
@@ -294,6 +351,18 @@ int main(int argc, char **argv)
     next = started;
 
     while (!s_stop && (!limit || frames < limit)) {
+        if (input) {
+            core->set_buttons(ctx, tg_input_poll(input));
+            if (tg_input_take_quit(input)) break;   /* Home leaves the game */
+        }
+
+        /*
+         * Write the save out if it changed. Not only on the way out: a
+         * handheld leaves by having its power button held, and nothing gets to
+         * run at that point.
+         */
+        if (info.sram_size) tg_save_tick(&save, now_ns());
+
         t_mark = now_ns();
         core->run_frame(ctx);
         t_core += now_ns() - t_mark;
@@ -407,6 +476,10 @@ int main(int argc, char **argv)
     }
     status = 0;
 
+    if (info.sram_size && tg_save_flush(&save))
+        printf("tinygb: save written\n");
+
+    tg_input_close(input);
     tg_fb_close(&fb);
     core->close(ctx);
     tg_audio_close(audio);

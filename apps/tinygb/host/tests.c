@@ -14,6 +14,7 @@
 #include "../core/tg_core.h"
 #include "../platform/tg_audio.h"
 #include "../platform/tg_scale.h"
+#include "../platform/tg_tilt.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -445,6 +446,84 @@ static void test_audio_clock(void)
     }
 }
 
+/* ---- the tilt d-pad ------------------------------------------------------ */
+
+/*
+ * The accelerometer as a d-pad.
+ *
+ * Every failure here is quiet. An uncalibrated neutral holds a direction down
+ * forever and looks like a stuck button; a single threshold chatters the
+ * direction on and off many times a second and looks like a flaky game; a
+ * confused pair of axes gives controls that are merely baffling. None of it
+ * shows up as a crash, and none of it can be checked by tilting a device
+ * remotely - so it is checked here.
+ *
+ * The numbers are this device's: the LIS3LV02DL reports +-2304 for +-2 g, and
+ * it rested at Y = -1086 on the bench, which is most of a g down the long
+ * axis.
+ */
+static void test_tilt(void)
+{
+    enum { MIN = -2304, MAX = 2304 };
+    tg_tilt t;
+
+    printf("tilt d-pad:\n");
+
+    tg_tilt_init(&t, MIN, MAX, 14, 7);
+
+    /* Level, uncalibrated, is nothing pressed. */
+    ok("level presses nothing", tg_tilt_feed(&t, 0, 0) == 0);
+
+    /*
+     * The real reason calibration exists: resting at Y = -1086 is 47% of full
+     * scale, well past the 14% press angle, so without a measured neutral the
+     * device holds a direction from the moment it starts.
+     */
+    ok("resting on the bench would hold a direction",
+       tg_tilt_feed(&t, 11, -1086) != 0);
+
+    tg_tilt_set_centre(&t, 11, -1086);
+    ok("...and does not, once level is measured there",
+       tg_tilt_feed(&t, 11, -1086) == 0);
+
+    /* Past the press angle, in each direction. 14% of 2304 is 322 counts. */
+    ok("lean right",  tg_tilt_feed(&t, 11 + 400, -1086) == TG_RIGHT);
+    ok("lean left",   tg_tilt_feed(&t, 11 - 400, -1086) == TG_LEFT);
+    ok("tip down",    tg_tilt_feed(&t, 11, -1086 + 400) == TG_DOWN);
+    ok("tip up",      tg_tilt_feed(&t, 11, -1086 - 400) == TG_UP);
+
+    /* Both axes at once is a diagonal, not a fight between them. */
+    ok("a diagonal is two directions",
+       tg_tilt_feed(&t, 11 + 400, -1086 - 400) == (TG_RIGHT | TG_UP));
+
+    /*
+     * Hysteresis. Held at 250 counts - between the 7% release angle (161) and
+     * the 14% press angle (322) - the answer must depend on what came before,
+     * or a hand resting near the threshold toggles the direction many times a
+     * second.
+     */
+    tg_tilt_feed(&t, 11, -1086);                       /* everything released */
+    ok("just under the press angle does not press",
+       tg_tilt_feed(&t, 11 + 250, -1086) == 0);
+
+    tg_tilt_feed(&t, 11 + 400, -1086);                 /* press it properly */
+    ok("...but having pressed, it stays pressed there",
+       tg_tilt_feed(&t, 11 + 250, -1086) == TG_RIGHT);
+
+    ok("and releases below the release angle",
+       tg_tilt_feed(&t, 11 + 100, -1086) == 0);
+
+    /* A caller that asks for nonsense gets hysteresis anyway rather than a
+       release angle above the press angle, which would latch forever. */
+    tg_tilt_init(&t, MIN, MAX, 10, 50);
+    ok("a release angle above the press angle is corrected",
+       t.off_pct < t.on_pct);
+
+    /* A device with no usable range must not divide by it. */
+    tg_tilt_init(&t, 0, 0, 14, 7);
+    ok("a zero range presses nothing", tg_tilt_feed(&t, 999, 999) == 0);
+}
+
 int main(void)
 {
     test_header();
@@ -452,6 +531,7 @@ int main(void)
     test_run();
     test_scale();
     test_audio_clock();
+    test_tilt();
 
     printf(fails ? "\n%d FAILED\n" : "\nall passed\n", fails);
     return fails != 0;
