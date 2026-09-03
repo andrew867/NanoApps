@@ -19,6 +19,23 @@
 IPOD_ROOT ?= /mnt/c/src/ipod/artifacts/linux-n31
 TOOLCHAIN ?= $(IPOD_ROOT)/tinyalsa-build/arm-linux-musleabi-cross
 TINYALSA  ?= $(IPOD_ROOT)/tinyalsa-build/tinyalsa-2.0.0
+ALSALIB   ?= $(IPOD_ROOT)/alsa
+
+#
+# Which sound library. alsa-lib by default, and not for preference.
+#
+# tinyalsa is five files with no dependencies and would be the obvious choice,
+# but on this device its view of the stream is wrong: the status page it mmaps
+# never updates, so it re-prepares the stream before every write and reports a
+# state that never changes. mpg123 and ffplay use alsa-lib and play correctly
+# on the same hardware. Build with TG_AUDIO=tinyalsa to get the other one -
+# it is worth keeping, because it is much the smaller of the two and the fault
+# may be fixed in the driver.
+#
+#   make -f Makefile.n31                    alsa-lib   (default)
+#   make -f Makefile.n31 TG_AUDIO=tinyalsa  tinyalsa
+#
+TG_AUDIO ?= alsalib
 SSH_KEY   ?= $(IPOD_ROOT)/n31_id
 DEVICE    ?= root@192.168.7.2
 
@@ -48,10 +65,20 @@ CFLAGS := $(TG_OPT) -g0 -std=gnu11 $(ARCH_FLAGS) $(TG_EXTRA) \
           -ffunction-sections -fdata-sections \
           -Wall -Wextra -Wno-unused-parameter \
           -DAUDIO_SAMPLE_RATE=$(TG_AUDIO_RATE) \
-          -DMINIGB_APU_AUDIO_FORMAT_S16SYS=1 \
-          -I$(TINYALSA)/include
+          -DMINIGB_APU_AUDIO_FORMAT_S16SYS=1
 LDFLAGS := -static -Wl,--gc-sections
 LDLIBS  := -lm
+
+ifeq ($(TG_AUDIO),alsalib)
+AUDIO_SRC := ../platform/tg_audio_alsalib.c
+CFLAGS    += -I$(ALSALIB)/include
+# -lpthread because alsa-lib uses it, and it must follow -lasound: a static
+# archive only resolves symbols for objects already seen.
+LDLIBS    += $(ALSALIB)/lib/libasound.a -lpthread
+else
+AUDIO_SRC := ../platform/tg_audio_linux.c
+CFLAGS    += -I$(TINYALSA)/include
+endif
 
 # Someone else's emulator, and we are not going to relitigate its warnings.
 VENDOR_CFLAGS := -Wno-sign-compare -Wno-implicit-fallthrough \
@@ -62,7 +89,6 @@ SRCS := ../core/tg_core.c \
         ../vendor/minigb_apu.c \
         ../platform/tg_scale.c \
         ../platform/tg_fb_linux.c \
-        ../platform/tg_audio_linux.c \
         ../platform/tg_audio_clock.c \
         ../platform/tg_input_linux.c \
         ../platform/tg_tilt.c \
@@ -79,7 +105,15 @@ TA_SRCS := $(TINYALSA)/src/pcm.c $(TINYALSA)/src/pcm_hw.c \
            $(TINYALSA)/src/snd_card_plugin.c $(TINYALSA)/src/limits.c
 TA_OBJS := $(patsubst $(TINYALSA)/src/%.c,$(BUILD)/ta/%.o,$(TA_SRCS))
 
+SRCS += $(AUDIO_SRC)
+
 OBJS := $(addprefix $(BUILD)/,$(notdir $(SRCS:.c=.o)))
+
+# tinyalsa is only compiled in when it is the backend; a megabyte of unused
+# archive is not free on a 55 MiB machine.
+ifneq ($(TG_AUDIO),alsalib)
+LINK_TA := $(TA_OBJS)
+endif
 
 .PHONY: all push run check clean
 
@@ -87,7 +121,13 @@ all: $(APP)
 
 .PHONY: deps
 deps:
+ifeq ($(TG_AUDIO),alsalib)
+	@test -f $(ALSALIB)/lib/libasound.a || { \
+	   echo "no alsa-lib at $(ALSALIB) - run tools/linux-n31/build-n31-alsa-lib.sh"; \
+	   exit 1; }
+else
 	@test -d $(TINYALSA)/src || { echo "no tinyalsa at $(TINYALSA)"; exit 1; }
+endif
 
 $(BUILD):
 	@mkdir -p $(BUILD)
@@ -113,6 +153,7 @@ $(BUILD)/tg_core.o:     ../core/tg_core.c          | $(BUILD) ; $(CC) $(CFLAGS) 
 $(BUILD)/tg_scale.o:    ../platform/tg_scale.c     | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/tg_fb_linux.o: ../platform/tg_fb_linux.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/tg_audio_linux.o: ../platform/tg_audio_linux.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/tg_audio_alsalib.o: ../platform/tg_audio_alsalib.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/tg_audio_clock.o: ../platform/tg_audio_clock.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/tg_input_linux.o: ../platform/tg_input_linux.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/tg_tilt.o: ../platform/tg_tilt.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
@@ -120,7 +161,7 @@ $(BUILD)/tg_save.o: ../platform/tg_save.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP 
 $(BUILD)/fbcon.o:       ../../n31launcher/fbcon.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/tg_linux.o:    ../linux/tg_linux.c        | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
-$(APP): $(OBJS) $(TA_OBJS)
+$(APP): $(OBJS) $(LINK_TA)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 	$(STRIP) $@
 	@echo "  $(APP)  $$(stat -c%s $(APP)) bytes"
