@@ -1,0 +1,81 @@
+# Makefile.host — TinyGB's core on a desktop, with no device attached.
+#
+#   make -f Makefile.host              build build/tg_headless
+#   make -f Makefile.host test         run the unit tests
+#   make -f Makefile.host gate         fetch the test ROMs and run the Phase 00 gate
+#   make -f Makefile.host clean
+#
+# The point of this file is that everything below the front end - the core, the
+# cartridge header, the palette, the audio pull - is ordinary portable C, and
+# waiting for a cross-compile and an scp to find out that a header field was
+# read at the wrong offset would be the slowest possible way to work.
+
+BUILD  := build
+CC     ?= cc
+
+# -O2 because the gate runs a few thousand frames and an unoptimised Game Boy
+# is slow enough to be annoying. -g because when it is wrong, it is wrong in
+# 5000 lines of someone else's emulator.
+CFLAGS := -O2 -g -std=gnu11 -Wall -Wextra -Wno-unused-parameter \
+          -Wno-unused-function
+
+# The audio rate the APU is compiled for. minigb_apu bakes this in, so a build
+# is for one rate: 48000 matches the Linux sink, and the device build will set
+# 22050 to match RetailOS's mixer. Neither ever resamples.
+# The sample format has to be set for every object that sees minigb_apu.h -
+# minigb_apu.c is compiled on its own and #errors without it - so both live
+# here rather than in whichever source happens to include the header first.
+TG_AUDIO_RATE ?= 48000
+CFLAGS += -DAUDIO_SAMPLE_RATE=$(TG_AUDIO_RATE)           -DMINIGB_APU_AUDIO_FORMAT_S16SYS=1
+
+# Peanut-GB is a vendored single header full of deliberate implicit-fallthrough
+# and sign-conversion that we are not going to fix in someone else's emulator.
+# Scoped to that one object rather than blanketed over ours.
+VENDOR_CFLAGS := -Wno-sign-compare -Wno-implicit-fallthrough \
+                 -Wno-unused-but-set-variable -Wno-type-limits
+
+CORE_SRCS := ../core/tg_core.c ../core/tg_peanut.c ../vendor/minigb_apu.c
+CORE_OBJS := $(addprefix $(BUILD)/,$(notdir $(CORE_SRCS:.c=.o)))
+
+.PHONY: all test gate roms clean
+
+all: $(BUILD)/tg_headless
+
+$(BUILD):
+	@mkdir -p $(BUILD)
+
+$(BUILD)/tg_core.o: ../core/tg_core.c | $(BUILD)
+	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+
+$(BUILD)/tg_peanut.o: ../core/tg_peanut.c | $(BUILD)
+	$(CC) $(CFLAGS) $(VENDOR_CFLAGS) -MMD -MP -c -o $@ $<
+
+$(BUILD)/minigb_apu.o: ../vendor/minigb_apu.c | $(BUILD)
+	$(CC) $(CFLAGS) $(VENDOR_CFLAGS) -MMD -MP -c -o $@ $<
+
+$(BUILD)/tg_headless.o: tg_headless.c | $(BUILD)
+	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+
+$(BUILD)/tests.o: tests.c | $(BUILD)
+	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+
+$(BUILD)/tg_headless: $(CORE_OBJS) $(BUILD)/tg_headless.o
+	$(CC) -o $@ $^ -lm
+
+$(BUILD)/tests: $(CORE_OBJS) $(BUILD)/tests.o
+	$(CC) -o $@ $^ -lm
+
+test: $(BUILD)/tests
+	@$(BUILD)/tests
+
+# Test ROMs are fetched, never committed - see tools/fetch-testroms.sh.
+roms:
+	@bash ../tools/fetch-testroms.sh
+
+gate: all roms
+	@bash ../tools/gate.sh
+
+clean:
+	@rm -rf $(BUILD)
+
+-include $(wildcard $(BUILD)/*.d)
