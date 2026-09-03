@@ -35,7 +35,7 @@ VENDOR_CFLAGS := -Wno-sign-compare -Wno-implicit-fallthrough \
                  -Wno-unused-but-set-variable -Wno-type-limits
 
 CORE_SRCS := ../core/tg_core.c ../core/tg_peanut.c ../vendor/minigb_apu.c \
-             ../platform/tg_scale.c
+             ../platform/tg_scale.c ../platform/tg_audio_clock.c
 CORE_OBJS := $(addprefix $(BUILD)/,$(notdir $(CORE_SRCS:.c=.o)))
 
 .PHONY: all test gate roms clean
@@ -50,6 +50,9 @@ $(BUILD)/tg_core.o: ../core/tg_core.c | $(BUILD)
 
 $(BUILD)/tg_peanut.o: ../core/tg_peanut.c | $(BUILD)
 	$(CC) $(CFLAGS) $(VENDOR_CFLAGS) -MMD -MP -c -o $@ $<
+
+$(BUILD)/tg_audio_clock.o: ../platform/tg_audio_clock.c | $(BUILD)
+	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
 $(BUILD)/tg_scale.o: ../platform/tg_scale.c | $(BUILD)
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<

@@ -27,8 +27,15 @@ static inline uint32_t mix(uint32_t x, uint32_t y)
     return (x & y) + (((x ^ y) & 0xFEFEFEu) >> 1);
 }
 
+void tg_scaler_invalidate(tg_scaler *s)
+{
+    s->have_prev = false;
+}
+
 void tg_scaler_init(tg_scaler *s, const uint32_t pal[4], bool smooth)
 {
+    tg_scaler_invalidate(s);
+
     for (unsigned i = 0; i < 4; i++)
         s->solid[i] = pal[i] & 0x00FFFFFFu;
 
@@ -51,7 +58,7 @@ static void expand_row(const tg_scaler *s, const uint8_t *src, uint32_t *out)
     }
 }
 
-void tg_scale_15(const tg_scaler *s, uint32_t *dst, unsigned dst_stride_px,
+void tg_scale_15(tg_scaler *s, uint32_t *dst, unsigned dst_stride_px,
                  const uint8_t *src)
 {
     /*
@@ -67,9 +74,17 @@ void tg_scale_15(const tg_scaler *s, uint32_t *dst, unsigned dst_stride_px,
     uint32_t top[TG_SCALED_W], bot[TG_SCALED_W];
 
     for (unsigned p = 0; p < TG_H / 2; p++) {
+        const uint8_t *sp = src + (size_t)(p * 2) * TG_W;
         uint32_t *d0 = dst + (size_t)(p * 3) * dst_stride_px;
         uint32_t *d1 = d0 + dst_stride_px;
         uint32_t *d2 = d1 + dst_stride_px;
+
+        /* Both source rows identical to last time means all three destination
+           rows already hold the right pixels. 320 bytes of cached compare
+           against 2880 bytes of uncached write. */
+        if (s->have_prev &&
+            memcmp(sp, s->prev + (size_t)(p * 2) * TG_W, TG_W * 2) == 0)
+            continue;
 
         expand_row(s, src + (size_t)(p * 2)     * TG_W, top);
         expand_row(s, src + (size_t)(p * 2 + 1) * TG_W, bot);
@@ -79,4 +94,10 @@ void tg_scale_15(const tg_scaler *s, uint32_t *dst, unsigned dst_stride_px,
             d1[x] = mix(top[x], bot[x]);
         memcpy(d2, bot, sizeof bot);
     }
+
+    /* One copy of the whole frame rather than a copy per row: it is 23 KB of
+       cached memory either way, and doing it here keeps the comparison above
+       reading the OLD frame for the whole pass. */
+    memcpy(s->prev, src, sizeof s->prev);
+    s->have_prev = true;
 }

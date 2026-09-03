@@ -12,6 +12,7 @@
  */
 
 #include "../core/tg_core.h"
+#include "../platform/tg_audio.h"
 #include "../platform/tg_scale.h"
 
 #include <stdio.h>
@@ -257,7 +258,7 @@ static void test_scale(void)
        and a scaler that assumes stride == width writes a diagonal. */
     enum { STRIDE = TG_SCALED_W + 17 };
     static uint32_t dst[STRIDE * (TG_SCALED_H + 2)];
-    tg_scaler sc;
+    static tg_scaler sc;
 
     printf("scaler:\n");
 
@@ -330,6 +331,118 @@ static void test_scale(void)
     for (size_t i = 0; i < sizeof src; i++) src[i] = 1 | TG_PX_OBJ | TG_PX_OBJ1;
     tg_scale_15(&sc, dst, STRIDE, src);
     ok("ignores the palette bits", dst[0] == pal[1]);
+
+    /*
+     * Skipping unchanged rows.
+     *
+     * The blit is a quarter of the frame budget on the device because the
+     * framebuffer is uncached, and most of a Game Boy frame is usually the
+     * previous frame. The risk of skipping is stale pixels, so what is checked
+     * here is that a skipped frame leaves the CORRECT pixels behind and that
+     * anything which invalidates the assumption repaints.
+     */
+    memset(src, 1, sizeof src);
+    tg_scaler_init(&sc, pal, true);
+    tg_scale_15(&sc, dst, STRIDE, src);          /* full paint */
+
+    /* Scribble over the destination, then send the same frame again. With no
+       skipping the scribble would be repainted; with skipping it survives,
+       which is exactly the hazard - so this pins the behaviour rather than
+       pretending it does not exist. */
+    dst[5 * STRIDE + 7] = 0xDEADBEEF;
+    tg_scale_15(&sc, dst, STRIDE, src);
+    ok("an unchanged frame is skipped", dst[5 * STRIDE + 7] == 0xDEADBEEF);
+
+    /* ...and invalidating repaints it, which is what a menu closing must do. */
+    tg_scaler_invalidate(&sc);
+    tg_scale_15(&sc, dst, STRIDE, src);
+    ok("invalidate forces a repaint",  dst[5 * STRIDE + 7] == pal[1]);
+
+    /* A row that changes is redrawn even when its neighbours do not. */
+    memset(src + 40 * TG_W, 3, TG_W);
+    tg_scale_15(&sc, dst, STRIDE, src);
+    ok("a changed row is redrawn",     dst[60 * STRIDE] == pal[3]);
+    ok("its neighbours are still right", dst[0] == pal[1]);
+}
+
+/* ---- the audio clock ----------------------------------------------------- */
+
+/*
+ * How many audio frames one video frame is worth.
+ *
+ * The naive answer - rate divided by 59.7275, truncated - is 803 at 48 kHz,
+ * and 803 every frame is 47961 Hz. That starves the sink by 39 frames a
+ * second, which empties an eight-period buffer in about four seconds and
+ * presents as audio that clicks roughly every four seconds forever. The fix is
+ * to keep the remainder, and the thing worth testing is that it has no drift
+ * over a long run rather than that any single frame is right.
+ */
+static void test_audio_clock(void)
+{
+    tg_audio_clock c;
+
+    printf("audio clock:\n");
+
+    tg_audio_clock_init(&c, 48000);
+
+    {
+        unsigned n = tg_audio_clock_next(&c);
+
+        ok("a frame is 803 or 804 at 48 kHz", n == 803 || n == 804);
+    }
+
+    /* An hour of frames. The total must match the sample rate times the
+       elapsed time to within one frame - not approximately, exactly, because
+       the arithmetic is integer and the remainder is carried. */
+    {
+        const unsigned long VF = 60u * 60u * 60u;   /* ~1 hour of video frames */
+        unsigned long long total = 0;
+        unsigned lo = 0xFFFFFFFFu, hi = 0;
+
+        tg_audio_clock_init(&c, 48000);
+        for (unsigned long i = 0; i < VF; i++) {
+            unsigned n = tg_audio_clock_next(&c);
+
+            total += n;
+            if (n < lo) lo = n;
+            if (n > hi) hi = n;
+        }
+
+        /* What the sink will have consumed over the same span. */
+        {
+            /* seconds = VF * FPS_DEN / FPS_NUM, so frames = rate * that. */
+            unsigned long long want =
+                (unsigned long long)48000 * VF * TG_FPS_DEN / TG_FPS_NUM;
+            unsigned long long diff = total > want ? total - want : want - total;
+
+            ok("an hour of frames lands within one frame of the sink",
+               diff <= 1);
+        }
+
+        ok("never hands out a silly number", lo >= 800 && hi <= 810);
+        /* Both values must actually occur, or the remainder is not being
+           carried and this is just a constant with extra steps. */
+        ok("uses both 803 and 804", lo != hi);
+    }
+
+    /*
+     * A different rate has to work too - RetailOS's mixer is 22050.
+     *
+     * Sixty video frames is 1.0046 seconds, not one, because the Game Boy runs
+     * at 59.7275: the answer is 22151 and not 22050. Writing the expectation
+     * as "about a second's worth" got this wrong on the first attempt, which
+     * is a decent illustration of why the whole file exists.
+     */
+    {
+        unsigned long long total = 0;
+        unsigned long long want =
+            (unsigned long long)22050 * 60 * TG_FPS_DEN / TG_FPS_NUM;
+
+        tg_audio_clock_init(&c, 22050);
+        for (unsigned i = 0; i < 60; i++) total += tg_audio_clock_next(&c);
+        ok("22050 for RetailOS is exact too",
+           total >= want && total <= want + 1);
+    }
 }
 
 int main(void)
@@ -338,6 +451,7 @@ int main(void)
     test_registry();
     test_run();
     test_scale();
+    test_audio_clock();
 
     printf(fails ? "\n%d FAILED\n" : "\nall passed\n", fails);
     return fails != 0;

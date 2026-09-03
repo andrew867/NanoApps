@@ -18,6 +18,7 @@
 
 IPOD_ROOT ?= /mnt/c/src/ipod/artifacts/linux-n31
 TOOLCHAIN ?= $(IPOD_ROOT)/tinyalsa-build/arm-linux-musleabi-cross
+TINYALSA  ?= $(IPOD_ROOT)/tinyalsa-build/tinyalsa-2.0.0
 SSH_KEY   ?= $(IPOD_ROOT)/n31_id
 DEVICE    ?= root@192.168.7.2
 
@@ -37,11 +38,18 @@ ARCH_FLAGS := -mcpu=cortex-a8 -mthumb -mfpu=vfpv3-d16 -mfloat-abi=softfp
 # 44100 is accepted by hw_params here and then never actually clocked.
 TG_AUDIO_RATE ?= 48000
 
-CFLAGS := -O2 -g0 -std=gnu11 $(ARCH_FLAGS) \
+# Overridable so a flag sweep can compare builds without editing this file -
+# guessing between -O2/-O3 and thumb/arm on an in-order core is how an
+# afternoon disappears; measuring takes ten minutes.
+TG_OPT   ?= -O2
+TG_EXTRA ?=
+
+CFLAGS := $(TG_OPT) -g0 -std=gnu11 $(ARCH_FLAGS) $(TG_EXTRA) \
           -ffunction-sections -fdata-sections \
           -Wall -Wextra -Wno-unused-parameter \
           -DAUDIO_SAMPLE_RATE=$(TG_AUDIO_RATE) \
-          -DMINIGB_APU_AUDIO_FORMAT_S16SYS=1
+          -DMINIGB_APU_AUDIO_FORMAT_S16SYS=1 \
+          -I$(TINYALSA)/include
 LDFLAGS := -static -Wl,--gc-sections
 LDLIBS  := -lm
 
@@ -54,8 +62,19 @@ SRCS := ../core/tg_core.c \
         ../vendor/minigb_apu.c \
         ../platform/tg_scale.c \
         ../platform/tg_fb_linux.c \
+        ../platform/tg_audio_linux.c \
+        ../platform/tg_audio_clock.c \
         ../../n31launcher/fbcon.c \
         ../linux/tg_linux.c
+
+# tinyalsa is eight files with no dependencies, which is exactly why it is used
+# rather than alsa-lib: a fully static musl binary stays practical. Compiled in
+# rather than linked against, so there is nothing to install on the device.
+TA_SRCS := $(TINYALSA)/src/pcm.c $(TINYALSA)/src/pcm_hw.c \
+           $(TINYALSA)/src/pcm_plugin.c $(TINYALSA)/src/mixer.c \
+           $(TINYALSA)/src/mixer_hw.c $(TINYALSA)/src/mixer_plugin.c \
+           $(TINYALSA)/src/snd_card_plugin.c $(TINYALSA)/src/limits.c
+TA_OBJS := $(patsubst $(TINYALSA)/src/%.c,$(BUILD)/ta/%.o,$(TA_SRCS))
 
 OBJS := $(addprefix $(BUILD)/,$(notdir $(SRCS:.c=.o)))
 
@@ -63,8 +82,22 @@ OBJS := $(addprefix $(BUILD)/,$(notdir $(SRCS:.c=.o)))
 
 all: $(APP)
 
+.PHONY: deps
+deps:
+	@test -d $(TINYALSA)/src || { echo "no tinyalsa at $(TINYALSA)"; exit 1; }
+
 $(BUILD):
 	@mkdir -p $(BUILD)
+
+# Its own order-only target rather than a second mkdir in $(BUILD)'s recipe:
+# $(BUILD) already existed from the previous build, so that recipe never ran
+# again and the assembler was left writing into a directory that was not there.
+$(BUILD)/ta:
+	@mkdir -p $(BUILD)/ta
+
+# Someone else's library; its warnings are not ours to fix either.
+$(BUILD)/ta/%.o: $(TINYALSA)/src/%.c | $(BUILD)/ta
+	$(CC) $(CFLAGS) $(VENDOR_CFLAGS) -c -o $@ $<
 
 # Two pattern rules rather than a vpath, so the vendor warning suppressions
 # apply to exactly the two files that need them.
@@ -76,10 +109,12 @@ $(BUILD)/minigb_apu.o: ../vendor/minigb_apu.c | $(BUILD)
 $(BUILD)/tg_core.o:     ../core/tg_core.c          | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/tg_scale.o:    ../platform/tg_scale.c     | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/tg_fb_linux.o: ../platform/tg_fb_linux.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/tg_audio_linux.o: ../platform/tg_audio_linux.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/tg_audio_clock.o: ../platform/tg_audio_clock.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/fbcon.o:       ../../n31launcher/fbcon.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/tg_linux.o:    ../linux/tg_linux.c        | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
-$(APP): $(OBJS)
+$(APP): $(OBJS) $(TA_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 	$(STRIP) $@
 	@echo "  $(APP)  $$(stat -c%s $(APP)) bytes"

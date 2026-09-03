@@ -49,6 +49,21 @@
 typedef struct {
     uint32_t solid[4];    /* the four shades, as 0x00RRGGBB */
     uint32_t pair[16];    /* pair[a * 4 + b] - what goes between shade a and b */
+
+    /*
+     * The last frame, so rows that did not change can skip the write.
+     *
+     * The framebuffer is uncached: measured on the device, putting 207 KB into
+     * it costs 3.85 ms of a 16.74 ms frame, which is about 50 MB/s and is what
+     * display memory costs everywhere. Comparing 320 bytes of cached source
+     * per row pair is nearly free next to writing 2880 bytes of uncached
+     * destination, and a Game Boy frame is usually mostly the previous one -
+     * a static playfield, an open menu, a text box.
+     *
+     * 23 KB, which is a bargain for what it buys.
+     */
+    uint8_t prev[TG_W * TG_H];
+    bool    have_prev;
 } tg_scaler;
 
 /* `pal` is four entries of 0x00RRGGBB, lightest first. When `smooth` is false
@@ -69,7 +84,17 @@ void tg_scaler_init(tg_scaler *s, const uint32_t pal[4], bool smooth);
  * Writes exactly TG_SCALED_H rows of TG_SCALED_W pixels and touches nothing
  * else.
  */
-void tg_scale_15(const tg_scaler *s, uint32_t *dst, unsigned dst_stride_px,
+void tg_scale_15(tg_scaler *s, uint32_t *dst, unsigned dst_stride_px,
                  const uint8_t *src);
+
+/*
+ * Forget the last frame, so the next call writes every row.
+ *
+ * Required whenever anything else has drawn over the picture - a menu, a
+ * message, a mode change - because the skip assumes the destination still
+ * holds what this scaler last put there. Also called by tg_scaler_init, so a
+ * palette change repaints on its own.
+ */
+void tg_scaler_invalidate(tg_scaler *s);
 
 #endif /* TINYGB_SCALE_H */

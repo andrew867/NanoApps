@@ -1,18 +1,26 @@
 /*
- * tg_linux.c — TinyGB on the N31 Linux port. Phase 01: the picture.
+ * tg_linux.c — TinyGB on the N31 Linux port. Picture and sound.
  *
- * Loads a cartridge, runs it, and puts it on /dev/fb0 at 240x216 in the top
- * half of the panel. No sound yet (Phase 02), no controls yet (Phase 03) - so
- * what this proves is the thing worth proving first: that the core runs on the
- * device, at speed, with the picture where it should be.
+ * Loads a cartridge, runs it, puts it on /dev/fb0 at 240x216 in the top half
+ * of the panel, and plays it. No controls yet - that is Phase 03.
  *
- *   tinygb <rom.gb> [--fb /dev/fb0] [--frames N] [--sharp] [--bench]
+ * What keeps time is the audio device, not the clock.
+ *
+ * Each iteration runs one emulated frame, asks the core for exactly the number
+ * of audio frames that frame is worth, and writes them to a blocking sink. The
+ * write returns when the device has room, which is when the next frame is
+ * genuinely due - so the codec's crystal paces the emulator and the video
+ * follows the audio rather than the two running on separate clocks and sliding
+ * apart. With --mute there is no device, and a monotonic deadline stands in.
+ *
+ *   tinygb <rom.gb> [--fb /dev/fb0] [--frames N] [--sharp] [--bench] [--mute]
  *
  * Ctrl-C, or --frames, ends it and gives the console back.
  */
 
 #include "../core/tg_core.h"
 #include "../platform/tg_fb.h"
+#include "../platform/tg_audio.h"
 #include "../platform/tg_scale.h"
 
 #include <errno.h>
@@ -86,14 +94,19 @@ static void usage(void)
         "  --fb PATH     framebuffer device (default /dev/fb0)\n"
         "  --frames N    stop after N frames instead of running until Ctrl-C\n"
         "  --sharp       nearest-neighbour scaling instead of the smooth 1.5x\n"
-        "  --bench       run flat out and report frames per second\n");
+        "  --bench       run flat out and report frames per second\n"
+        "  --mute        no audio device; pace off the monotonic clock\n"
+        "  --warmup N    run N frames before the timers start\n"
+        "  --noskip      repaint every row, even unchanged ones\n");
 }
 
 int main(int argc, char **argv)
 {
     const char *rom_path = NULL, *fb_path = NULL;
     unsigned long limit = 0;
-    bool smooth = true, bench = false;
+    unsigned long warmup = 0;
+    bool noskip = false;
+    bool smooth = true, bench = false, mute = false;
 
     uint8_t *rom = NULL, *sram = NULL;
     void *ctx = NULL;
@@ -107,8 +120,19 @@ int main(int argc, char **argv)
     unsigned pal_n = 0, ox = 0, oy = 0;
     uint32_t *dst;
 
+    tg_audio *audio = NULL;
+    tg_audio_clock aclock;
+    int16_t *abuf = NULL;
+    unsigned abuf_cap = 0;
+
+    /* Where the frame goes. Two clock reads a frame is about a microsecond
+       and it is the difference between optimising the emulator and optimising
+       the blit, which on this device are not the same problem at all. */
+    long long t_core = 0, t_blit = 0, t_apu = 0, t_sink = 0, t_mark;
+
     long long frame_ns, started, next, last_report;
     unsigned long frames = 0, frames_at_report = 0;
+    unsigned long long audio_frames = 0;
     int status = 1;
 
     for (int i = 1; i < argc; i++) {
@@ -116,6 +140,9 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) limit = strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--sharp"))                  smooth = false;
         else if (!strcmp(argv[i], "--bench"))                  bench = true;
+        else if (!strcmp(argv[i], "--mute"))                   mute = true;
+        else if (!strcmp(argv[i], "--noskip"))                 noskip = true;
+        else if (!strcmp(argv[i], "--warmup") && i + 1 < argc) warmup = strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(); return 0; }
         else if (argv[i][0] == '-')                            { usage(); return 2; }
         else if (!rom_path)                                    rom_path = argv[i];
@@ -159,17 +186,55 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    /* No audio rate: Phase 02 turns the sound on. Asking for it now would
-       generate samples nothing consumes and slow the frame down. */
-    if ((r = core->open(ctx, rom, rom_len, sram, info.sram_size, 0)) != TG_OK) {
+    /*
+     * The sink opens first, because the core has to be told the rate that was
+     * actually granted rather than the one we asked for. minigb_apu is
+     * compiled for one rate, so if the device gave us a different one the core
+     * would be generating at the wrong pitch - and that is worth knowing about
+     * loudly rather than discovering by ear.
+     */
+    if (!bench) {
+        audio = tg_audio_open(AUDIO_SAMPLE_RATE, mute);
+        if (!audio) {
+            fprintf(stderr, "tinygb: no audio\n");
+            free(ctx); free(sram); free(rom);
+            return 2;
+        }
+        if (!tg_audio_is_silent(audio) &&
+            tg_audio_rate(audio) != (unsigned)AUDIO_SAMPLE_RATE) {
+            fprintf(stderr,
+                    "tinygb: the APU is built for %d Hz but the device gave "
+                    "%u Hz - pitch will be wrong\n",
+                    AUDIO_SAMPLE_RATE, tg_audio_rate(audio));
+        }
+    }
+
+    if ((r = core->open(ctx, rom, rom_len, sram, info.sram_size,
+                        audio ? AUDIO_SAMPLE_RATE : 0)) != TG_OK) {
         fprintf(stderr, "tinygb: %s\n", tg_strerror(r));
+        tg_audio_close(audio);
         free(ctx); free(sram); free(rom);
         return 2;
     }
 
+    if (audio) {
+        tg_audio_clock_init(&aclock, tg_audio_rate(audio));
+        /* Two video frames of headroom: the clock hands out 803 or 804, and a
+           buffer sized to the larger never has to grow mid-run. */
+        abuf_cap = tg_audio_rate(audio) / 30 + 64;
+        if (!(abuf = malloc((size_t)abuf_cap * 2 * sizeof *abuf))) {
+            fprintf(stderr, "tinygb: out of memory for the audio buffer\n");
+            core->close(ctx); tg_audio_close(audio);
+            free(ctx); free(sram); free(rom);
+            return 2;
+        }
+        printf("tinygb: audio %u Hz%s\n", tg_audio_rate(audio),
+               tg_audio_is_silent(audio) ? " (silent, paced only)" : "");
+    }
+
     if (!tg_fb_open(&fb, fb_path)) {
-        core->close(ctx);
-        free(ctx); free(sram); free(rom);
+        core->close(ctx); tg_audio_close(audio);
+        free(abuf); free(ctx); free(sram); free(rom);
         return 2;
     }
 
@@ -190,6 +255,34 @@ int main(int argc, char **argv)
     core->set_buttons(ctx, 0);
 
     /*
+     * Get past the boot logo before timing anything.
+     *
+     * A cartridge spends its first few hundred frames scrolling a logo with the
+     * CPU halted, which is nothing like the game that follows. Measuring from
+     * frame zero made Tetris report 7.3 ms of core time on one run and 14.6 ms
+     * on another purely because the runs had different frame counts - and that
+     * difference very nearly got read as a large win from an unrelated change
+     * to the blit.
+     */
+    for (unsigned long i = 0; i < warmup; i++) {
+        core->run_frame(ctx);
+        if (audio && core->audio_pull) {
+            /* Keep the APU's clock moving too, or the measured run starts with
+               a frame of backlog to work off. */
+            unsigned w = tg_audio_clock_next(&aclock);
+
+            if (w > abuf_cap) w = abuf_cap;
+            core->audio_pull(ctx, abuf, w);
+        }
+    }
+    if (warmup) {
+        /* Paint once, so the skip-unchanged logic starts from a real frame
+           rather than counting the whole first screen as changed. */
+        tg_scale_15(&scaler, dst, fb.stride_px, core->pixels(ctx));
+        printf("tinygb: %lu warm-up frames done\n", warmup);
+    }
+
+    /*
      * 70224 cycles a frame at 4194304 Hz is 16.7427 ms, not 16.6667. Keeping it
      * as the exact rational and deriving each deadline from the start rather
      * than from the previous frame is what stops a tenth of a millisecond per
@@ -201,11 +294,59 @@ int main(int argc, char **argv)
     next = started;
 
     while (!s_stop && (!limit || frames < limit)) {
+        t_mark = now_ns();
         core->run_frame(ctx);
+        t_core += now_ns() - t_mark;
+
+        t_mark = now_ns();
+        /* Forcing a repaint every frame is what the blit cost was before rows
+           could be skipped. Here so the two can be compared on the same game
+           at the same moment, rather than across two runs of different
+           content - which is exactly the mistake that made a boot logo look
+           like a performance regression. */
+        if (noskip) tg_scaler_invalidate(&scaler);
         tg_scale_15(&scaler, dst, fb.stride_px, core->pixels(ctx));
+        t_blit += now_ns() - t_mark;
+
         frames++;
 
-        if (!bench) {
+        if (audio) {
+            /*
+             * Sound first, picture already done. The write blocks until the
+             * device has room, so this is where the frame's time is spent -
+             * and by the time it returns, the next frame is due.
+             *
+             * Asking the clock how many frames this one is worth rather than
+             * using a constant is what stops the sink starving: 48000/59.7275
+             * is 803.65, and 803 every time is 39 frames a second short, which
+             * empties an eight-period buffer in about four seconds.
+             */
+            unsigned want = tg_audio_clock_next(&aclock);
+            unsigned got;
+
+            if (want > abuf_cap) want = abuf_cap;
+            t_mark = now_ns();
+            got = core->audio_pull ? core->audio_pull(ctx, abuf, want) : 0;
+            t_apu += now_ns() - t_mark;
+            if (got < want) {
+                /* A core with no APU, or one that came up short. Silence is
+                   the only honest filler; repeating the last block would be a
+                   buzz. */
+                memset(abuf + (size_t)got * 2, 0,
+                       (size_t)(want - got) * 2 * sizeof *abuf);
+            }
+            t_mark = now_ns();
+            if (!tg_audio_write(audio, abuf, want)) {
+                t_sink += now_ns() - t_mark;
+                fprintf(stderr, "tinygb: carrying on without sound\n");
+                tg_audio_close(audio);
+                audio = NULL;
+                next = now_ns();     /* the monotonic clock takes over */
+            } else {
+                t_sink += now_ns() - t_mark;
+                audio_frames += want;
+            }
+        } else if (!bench) {
             long long t;
 
             next += frame_ns;
@@ -243,11 +384,32 @@ int main(int argc, char **argv)
         printf("tinygb: %lu frames in %.2fs  =  %.2f fps%s\n",
                frames, secs, secs > 0 ? frames / secs : 0.0,
                bench ? "  (unpaced)" : "");
+
+        if (frames) {
+            /* Per frame, in milliseconds. The budget is 16.74. */
+            double f = (double)frames;
+
+            printf("tinygb: core %.2f ms  blit %.2f ms  apu %.2f ms"
+                   "  sink %.2f ms  per frame\n",
+                   t_core / f / 1e6, t_blit / f / 1e6,
+                   t_apu / f / 1e6, t_sink / f / 1e6);
+        }
+
+        if (audio_frames) {
+            /* The two clocks, side by side. If these disagree, the emulator
+               and the sink are running at different speeds and everything
+               else is guesswork. */
+            printf("tinygb: %llu audio frames  =  %.1f Hz measured"
+                   "  (%lu restarts)\n",
+                   audio_frames, secs > 0 ? audio_frames / secs : 0.0,
+                   tg_audio_restarts(audio));
+        }
     }
     status = 0;
 
     tg_fb_close(&fb);
     core->close(ctx);
-    free(ctx); free(sram); free(rom);
+    tg_audio_close(audio);
+    free(abuf); free(ctx); free(sram); free(rom);
     return status;
 }
