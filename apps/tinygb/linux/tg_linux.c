@@ -11,14 +11,22 @@
  * and parks itself, so tilt is what makes a game playable today - see
  * tg_input.h, where touch is already a source waiting for the device to boot.
  *
- * What keeps time is the audio device, not the clock.
+ * Two pacers, and both are needed.
  *
- * Each iteration runs one emulated frame, asks the core for exactly the number
- * of audio frames that frame is worth, and writes them to a blocking sink. The
- * write returns when the device has room, which is when the next frame is
- * genuinely due - so the codec's crystal paces the emulator and the video
- * follows the audio rather than the two running on separate clocks and sliding
- * apart. With --mute there is no device, and a monotonic deadline stands in.
+ * Each iteration runs one emulated frame, asks the core for exactly the audio
+ * that frame is worth, and writes it. A sink that blocks when full is the best
+ * clock in the machine - the codec's crystal is the only one here that is not
+ * approximate - so when the write blocks, it sets the pace and the video
+ * follows the audio.
+ *
+ * But it cannot be the ONLY pacer. This device's tinyalsa write returns
+ * success without blocking, whatever the buffer is doing, so relying on it
+ * alone let the emulator free-run at 104 fps and fire 90 kHz of audio at a
+ * 48 kHz device - which no sink survives, and which presented as a stream
+ * restarting on almost every frame. So a monotonic deadline runs underneath
+ * it: if the sink blocked, the deadline has already passed and nothing
+ * sleeps; if it did not, the deadline holds the frame rate to 59.7275 and the
+ * device is fed at exactly the rate it drains.
  *
  *   tinygb <rom.gb> [--fb /dev/fb0] [--frames N] [--sharp] [--bench] [--mute]
  *
@@ -109,7 +117,8 @@ static void usage(void)
         "  --noskip      repaint every row, even unchanged ones\n"
         "  --no-tilt     do not use the accelerometer as a d-pad\n"
         "  --tilt A,B    tilt press/release angles, percent of full scale\n"
-        "  --probe-input list input devices and print events, then exit\n");
+        "  --probe-input list input devices and print events, then exit\n"
+        "  --probe-audio print what the sound card will accept, then exit\n");
 }
 
 int main(int argc, char **argv)
@@ -162,6 +171,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--tilt") && i + 1 < argc)
             sscanf(argv[++i], "%d,%d", &tilt_on, &tilt_off);
         else if (!strcmp(argv[i], "--probe-input")) { tg_input_probe(15); return 0; }
+        else if (!strcmp(argv[i], "--probe-audio")) { tg_audio_probe(); return 0; }
         else if (!strcmp(argv[i], "--warmup") && i + 1 < argc) warmup = strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(); return 0; }
         else if (argv[i][0] == '-')                            { usage(); return 2; }
@@ -415,9 +425,17 @@ int main(int argc, char **argv)
                 t_sink += now_ns() - t_mark;
                 audio_frames += want;
             }
-        } else if (!bench) {
+        }
+
+        if (!bench) {
             long long t;
 
+            /*
+             * The deadline, whether or not there is a sink. When the write
+             * blocked, this has already passed and costs one clock read; when
+             * it did not, this is what keeps the emulator at 59.7275 fps
+             * instead of as fast as the CPU allows.
+             */
             next += frame_ns;
             t = now_ns();
             if (next > t) {

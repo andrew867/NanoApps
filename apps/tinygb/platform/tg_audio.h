@@ -86,6 +86,10 @@ typedef struct {
 void     tg_audio_clock_init(tg_audio_clock *c, unsigned rate);
 unsigned tg_audio_clock_next(tg_audio_clock *c);
 
+/* Print what the playback device says it can do, and return. For finding out
+   on a real device why a config that looks reasonable was refused. */
+void tg_audio_probe(void);
+
 /* How many underruns the device has reported, for the log. */
 unsigned long tg_audio_restarts(const tg_audio *a);
 
