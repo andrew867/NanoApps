@@ -12,6 +12,7 @@
  */
 
 #include "../core/tg_core.h"
+#include "../platform/tg_scale.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -241,11 +242,102 @@ static void test_run(void)
     free(rom);
 }
 
+/* ---- the scaler ---------------------------------------------------------- */
+
+/*
+ * 160x144 to 240x216 is two source pixels becoming three, and there are only a
+ * few ways to get it wrong - but each of them looks like "the picture is a bit
+ * off" rather than like a bug, so they are worth pinning.
+ */
+static void test_scale(void)
+{
+    static const uint32_t pal[4] = { 0xFFFFFF, 0xAAAAAA, 0x555555, 0x000000 };
+    static uint8_t  src[TG_W * TG_H];
+    /* A stride wider than the picture, because the real framebuffer has one
+       and a scaler that assumes stride == width writes a diagonal. */
+    enum { STRIDE = TG_SCALED_W + 17 };
+    static uint32_t dst[STRIDE * (TG_SCALED_H + 2)];
+    tg_scaler sc;
+
+    printf("scaler:\n");
+
+    ok("240x216 is exactly 1.5x",
+       TG_SCALED_W == 240 && TG_SCALED_H == 216);
+
+    /* A flat field must come out flat, whatever the blending does. */
+    memset(src, 2, sizeof src);
+    memset(dst, 0xAB, sizeof dst);
+    tg_scaler_init(&sc, pal, true);
+    tg_scale_15(&sc, dst, STRIDE, src);
+    {
+        int flat = 1;
+
+        for (unsigned y = 0; y < TG_SCALED_H && flat; y++)
+            for (unsigned x = 0; x < TG_SCALED_W; x++)
+                if (dst[y * STRIDE + x] != pal[2]) { flat = 0; break; }
+        ok("a flat field scales flat", flat);
+    }
+
+    /* Nothing outside the picture may be touched: the row after the last one,
+       and the columns past the right edge, still hold the fill. */
+    {
+        int clean = 1;
+
+        for (unsigned x = TG_SCALED_W; x < STRIDE; x++)
+            if (dst[x] != 0xABABABABu) { clean = 0; break; }
+        ok("does not write past the right edge", clean);
+
+        clean = 1;
+        for (unsigned x = 0; x < STRIDE; x++)
+            if (dst[TG_SCALED_H * STRIDE + x] != 0xABABABABu) { clean = 0; break; }
+        ok("does not write past the last row", clean);
+    }
+
+    /*
+     * The pattern that matters. Two adjacent source pixels of different shades
+     * become left, blend, right - so each source pixel keeps one full-strength
+     * output pixel and the seam between them is the average. Nearest
+     * neighbour would give left, left, right, which is what makes one-pixel
+     * Game Boy detail flicker between one and two pixels wide.
+     */
+    memset(src, 0, sizeof src);
+    src[0] = 0;   /* white */
+    src[1] = 3;   /* black */
+    tg_scaler_init(&sc, pal, true);
+    tg_scale_15(&sc, dst, STRIDE, src);
+    ok("smooth: left pixel is untouched",  dst[0] == 0xFFFFFF);
+    ok("smooth: middle is the average",    dst[1] == 0x7F7F7F);
+    ok("smooth: right pixel is untouched", dst[2] == 0x000000);
+
+    tg_scaler_init(&sc, pal, false);
+    tg_scale_15(&sc, dst, STRIDE, src);
+    ok("sharp: middle repeats the left",   dst[1] == 0xFFFFFF);
+    ok("sharp: right pixel is untouched",  dst[2] == 0x000000);
+
+    /* Vertically it is the same rule, and getting the row arithmetic wrong is
+       the classic way to produce a picture that is subtly squashed. */
+    memset(src, 0, sizeof src);
+    memset(src + TG_W, 3, TG_W);     /* row 0 white, row 1 black */
+    tg_scaler_init(&sc, pal, true);
+    tg_scale_15(&sc, dst, STRIDE, src);
+    ok("rows: first is the top source row",  dst[0 * STRIDE] == 0xFFFFFF);
+    ok("rows: second is the average",        dst[1 * STRIDE] == 0x7F7F7F);
+    ok("rows: third is the bottom row",      dst[2 * STRIDE] == 0x000000);
+
+    /* Only the shade bits are the shade. A core that also reports which
+       palette a pixel came from must not index past a four-entry table. */
+    memset(src, 0, sizeof src);
+    for (size_t i = 0; i < sizeof src; i++) src[i] = 1 | TG_PX_OBJ | TG_PX_OBJ1;
+    tg_scale_15(&sc, dst, STRIDE, src);
+    ok("ignores the palette bits", dst[0] == pal[1]);
+}
+
 int main(void)
 {
     test_header();
     test_registry();
     test_run();
+    test_scale();
 
     printf(fails ? "\n%d FAILED\n" : "\nall passed\n", fails);
     return fails != 0;

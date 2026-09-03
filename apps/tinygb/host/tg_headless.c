@@ -22,6 +22,7 @@
  */
 
 #include "../core/tg_core.h"
+#include "../platform/tg_scale.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -141,6 +142,41 @@ static int write_ppm(const char *path, const uint8_t *px,
     return 0;
 }
 
+/*
+ * The scaled picture, exactly as the device will show it.
+ *
+ * Same scaler the framebuffer front end uses, so what comes out of here is
+ * what goes on the panel - which makes "is 1.5x actually any good on Game Boy
+ * art" a question that can be answered on a desktop instead of over ssh.
+ */
+static int write_scaled_ppm(const char *path, const uint8_t *px,
+                            const uint32_t *pal, bool smooth)
+{
+    FILE *f = fopen(path, "wb");
+    tg_scaler sc;
+    uint32_t *buf;
+
+    if (!f) return -1;
+    if (!(buf = malloc((size_t)TG_SCALED_W * TG_SCALED_H * sizeof *buf))) {
+        fclose(f);
+        return -1;
+    }
+
+    tg_scaler_init(&sc, pal, smooth);
+    tg_scale_15(&sc, buf, TG_SCALED_W, px);
+
+    fprintf(f, "P6\n%d %d\n255\n", TG_SCALED_W, TG_SCALED_H);
+    for (size_t i = 0; i < (size_t)TG_SCALED_W * TG_SCALED_H; i++) {
+        uint8_t out[3] = { (uint8_t)(buf[i] >> 16), (uint8_t)(buf[i] >> 8),
+                           (uint8_t)buf[i] };
+
+        if (fwrite(out, 1, 3, f) != 3) { free(buf); fclose(f); return -1; }
+    }
+    free(buf);
+    fclose(f);
+    return 0;
+}
+
 /* ---- ------------------------------------------------------------------- */
 
 static void usage(void)
@@ -151,6 +187,8 @@ static void usage(void)
         "  -f N    run N frames (default 60)\n"
         "  -o P    write the final frame to P as binary PPM\n"
         "  -r P    write the final frame to P as raw shade indices\n"
+        "  -S P    write the frame SCALED to 240x216 as the device shows it\n"
+        "  --sharp nearest-neighbour scaling for -S, instead of smooth\n"
         "  -c ID   force a core by id; default is the best for the cartridge\n"
         "  -s      capture and print link-port output (Blargg's test ROMs)\n"
         "  -q      only print the summary line\n"
@@ -160,7 +198,8 @@ static void usage(void)
 int main(int argc, char **argv)
 {
     const char *rom_path = NULL, *out_path = NULL, *core_id = NULL;
-    const char *raw_path = NULL;
+    const char *raw_path = NULL, *scaled_path = NULL;
+    bool smooth = true;
     unsigned frames = 60;
     int want_serial = 0, quiet = 0;
 
@@ -197,6 +236,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-f") && i + 1 < argc) frames = (unsigned)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "-o") && i + 1 < argc) out_path = argv[++i];
         else if (!strcmp(argv[i], "-r") && i + 1 < argc) raw_path = argv[++i];
+        else if (!strcmp(argv[i], "-S") && i + 1 < argc) scaled_path = argv[++i];
+        else if (!strcmp(argv[i], "--sharp"))            smooth = false;
         else if (!strcmp(argv[i], "-c") && i + 1 < argc) core_id = argv[++i];
         else if (!strcmp(argv[i], "-s")) want_serial = 1;
         else if (!strcmp(argv[i], "-q")) quiet = 1;
@@ -281,6 +322,12 @@ int main(int argc, char **argv)
 
     if (raw_path && write_raw(raw_path, core->pixels(ctx)) != 0) {
         fprintf(stderr, "tg_headless: cannot write %s\n", raw_path);
+        status = 2;
+    }
+
+    if (scaled_path &&
+        write_scaled_ppm(scaled_path, core->pixels(ctx), pal, smooth) != 0) {
+        fprintf(stderr, "tg_headless: cannot write %s\n", scaled_path);
         status = 2;
     }
 

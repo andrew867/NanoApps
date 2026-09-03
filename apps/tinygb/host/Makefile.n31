@@ -1,0 +1,111 @@
+# Makefile.n31 — cross-build TinyGB for the N31 Linux port on iPod nano 7G.
+#
+#   make -f Makefile.n31            build build-n31/tinygb
+#   make -f Makefile.n31 push       build, scp to /tmp, chmod
+#   make -f Makefile.n31 run        push, then run it on the device
+#   make -f Makefile.n31 check      verify the float ABI and that it is static
+#
+# Target facts this encodes, all read off the device rather than assumed and all
+# the same ones Entrain's Makefile.n31 encodes - see it for the longer story:
+#
+#   * /dev/fb0 is 240x432, 32 bpp, 960-byte lines. A Game Boy scaled 1.5x is
+#     240x216, which is exactly the top half.
+#   * Cortex-A8, VFPv3-D16, and a SOFT-FLOAT ABI. -mfloat-abi=hard produces a
+#     binary that cannot call its own libc; VFPv4 is an undefined instruction
+#     on this core.
+#   * No NEON.
+#   * Static musl. The initramfs has essentially no shared libraries.
+
+IPOD_ROOT ?= /mnt/c/src/ipod/artifacts/linux-n31
+TOOLCHAIN ?= $(IPOD_ROOT)/tinyalsa-build/arm-linux-musleabi-cross
+SSH_KEY   ?= $(IPOD_ROOT)/n31_id
+DEVICE    ?= root@192.168.7.2
+
+CROSS  := $(TOOLCHAIN)/bin/arm-linux-musleabi-
+CCACHE := $(shell command -v ccache 2>/dev/null)
+CC     := $(CCACHE) $(CROSS)gcc
+STRIP  := $(CROSS)strip
+READELF:= $(CROSS)readelf
+
+BUILD  := build-n31
+APP    := $(BUILD)/tinygb
+
+ARCH_FLAGS := -mcpu=cortex-a8 -mthumb -mfpu=vfpv3-d16 -mfloat-abi=softfp
+
+# The APU is compiled for one rate and it is the sink's, so nothing resamples.
+# 48000 because the codec's 12 MHz master clock only divides into that family -
+# 44100 is accepted by hw_params here and then never actually clocked.
+TG_AUDIO_RATE ?= 48000
+
+CFLAGS := -O2 -g0 -std=gnu11 $(ARCH_FLAGS) \
+          -ffunction-sections -fdata-sections \
+          -Wall -Wextra -Wno-unused-parameter \
+          -DAUDIO_SAMPLE_RATE=$(TG_AUDIO_RATE) \
+          -DMINIGB_APU_AUDIO_FORMAT_S16SYS=1
+LDFLAGS := -static -Wl,--gc-sections
+LDLIBS  := -lm
+
+# Someone else's emulator, and we are not going to relitigate its warnings.
+VENDOR_CFLAGS := -Wno-sign-compare -Wno-implicit-fallthrough \
+                 -Wno-unused-but-set-variable -Wno-type-limits
+
+SRCS := ../core/tg_core.c \
+        ../core/tg_peanut.c \
+        ../vendor/minigb_apu.c \
+        ../platform/tg_scale.c \
+        ../platform/tg_fb_linux.c \
+        ../../n31launcher/fbcon.c \
+        ../linux/tg_linux.c
+
+OBJS := $(addprefix $(BUILD)/,$(notdir $(SRCS:.c=.o)))
+
+.PHONY: all push run check clean
+
+all: $(APP)
+
+$(BUILD):
+	@mkdir -p $(BUILD)
+
+# Two pattern rules rather than a vpath, so the vendor warning suppressions
+# apply to exactly the two files that need them.
+$(BUILD)/tg_peanut.o: ../core/tg_peanut.c | $(BUILD)
+	$(CC) $(CFLAGS) $(VENDOR_CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/minigb_apu.o: ../vendor/minigb_apu.c | $(BUILD)
+	$(CC) $(CFLAGS) $(VENDOR_CFLAGS) -MMD -MP -c -o $@ $<
+
+$(BUILD)/tg_core.o:     ../core/tg_core.c          | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/tg_scale.o:    ../platform/tg_scale.c     | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/tg_fb_linux.o: ../platform/tg_fb_linux.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/fbcon.o:       ../../n31launcher/fbcon.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/tg_linux.o:    ../linux/tg_linux.c        | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+
+$(APP): $(OBJS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+	$(STRIP) $@
+	@echo "  $(APP)  $$(stat -c%s $(APP)) bytes"
+	@$(MAKE) -s -f Makefile.n31 check
+
+# The two ways this binary can be wrong without failing to build. A hard-float
+# or VFPv4 object links fine here and dies on the device with an undefined
+# instruction, and a dynamic one dies looking for a loader that is not there.
+check: $(APP)
+	@fp=$$($(READELF) -A $(APP) | sed -n 's/.*Tag_FP_arch: //p'); \
+	 case "$$fp" in \
+	   VFPv2|VFPv3|VFPv3-D16) echo "  FP_arch $$fp  ok";; \
+	   *) echo "  FP_arch $$fp  NOT SAFE on Cortex-A8" >&2; exit 1;; \
+	 esac
+	@n=$$($(READELF) -d $(APP) 2>/dev/null | grep -c NEEDED); \
+	 if [ "$$n" -eq 0 ]; then echo "  static  ok"; \
+	 else echo "  $$n dynamic NEEDED entries" >&2; exit 1; fi
+
+push: $(APP)
+	scp -i $(SSH_KEY) $(APP) $(DEVICE):/tmp/tinygb
+	ssh -i $(SSH_KEY) $(DEVICE) 'chmod +x /tmp/tinygb'
+
+run: push
+	ssh -i $(SSH_KEY) $(DEVICE) '/tmp/tinygb $(ROM) $(ARGS)'
+
+clean:
+	@rm -rf $(BUILD)
+
+-include $(wildcard $(BUILD)/*.d)
