@@ -172,6 +172,7 @@ static uint32_t s_dying_since;
 
 static pid_t s_child;             /* a running app */
 static bool  s_child_console;     /* it draws through the console, not fb0 */
+static bool  s_child_owns_keys;   /* it handles HOME itself; leave it alone */
 static screen_t s_child_from;     /* the screen to come back to */
 static uint32_t s_launched_at;
 static char     s_launched_prog[32];
@@ -344,6 +345,7 @@ static bool launch(const n31_app_t *a)
 
     setpgid(pid, pid);            /* also here: whichever wins, it is set */
     s_child = pid;
+    s_child_owns_keys = a->owns_keys;
     s_launched_at = millis();
 
     /* Kept so a failure note can name the app rather than saying "it". */
@@ -433,6 +435,7 @@ static void close_app(void)
 
     ask_child_to_stop(s_child);
     s_child = 0;
+    s_child_owns_keys = false;
 
     /*
      * Say so now. The app may take a few seconds to save and go, and until
@@ -455,6 +458,7 @@ static bool app_gone(void)
 
     uint32_t ran_for = millis() - s_launched_at;
     s_child = 0;
+    s_child_owns_keys = false;
     after_app();
     report_exit(status, ran_for);
     return true;
@@ -629,20 +633,33 @@ static void on_key(uint16_t code, int32_t value)
         return;
     }
 
-    /* Awake, the Sleep button sleeps. */
-    if (code == N31_KEY_POWER) {
-        if (pressed) go_to_sleep();
-        return;
-    }
-
-    /* While an app is running its own buttons are its business. The launcher
-       listens for HOME and nothing else. */
+    /*
+     * While an app is running, every button is its business.
+     *
+     * The launcher used to take HOME and kill the child. That cost every app
+     * its fourth button and made quitting arrive as a signal, with no chance
+     * to write a config or stop a sink - so TinyPod could not use HOME to go
+     * back, and leaving it was indistinguishable from a crash.
+     *
+     * Now an app that says so in its manifest is left entirely alone and is
+     * expected to exit by itself. Everything else - fbDOOM, anything
+     * third-party - is closed with a short press of the Sleep button, which
+     * is the one button no app here does anything with. Holding it is still
+     * the kernel's hard power-off, so nothing can trap the device.
+     */
     if (s_child) {
-        if (code == N31_KEY_HOMEPAGE && pressed
+        if (code == N31_KEY_POWER && pressed
+            && !s_child_owns_keys
             && millis() - s_launched_at >= SCREEN_GUARD_MS) {
             close_app();
             n31_ui_redraw();
         }
+        return;
+    }
+
+    /* On the launcher's own screens, the Sleep button sleeps. */
+    if (code == N31_KEY_POWER) {
+        if (pressed) go_to_sleep();
         return;
     }
 

@@ -61,6 +61,22 @@ typedef struct {
      * which, so the manifest does.
      */
     bool     console;
+
+    /*
+     * Whether the app handles its own way out.
+     *
+     * HOME used to be the launcher's: it watched for it while a child was
+     * running and terminated whatever that was. Which meant no app could ever
+     * use its fourth button, and that quitting was a SIGTERM arriving without
+     * warning - no chance to write a config, finish a save, or stop a sink.
+     *
+     * So the buttons stay with the app. An app that says "keys": "own" gets
+     * all of them and is expected to exit by itself; anything else - fbDOOM,
+     * anything third-party, anything that has never heard of this launcher -
+     * is closed with a short press of the Sleep button, which is the one
+     * button no app on this device does anything with.
+     */
+    bool     owns_keys;
 } n31_app_t;
 
 /*

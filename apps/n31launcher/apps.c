@@ -33,15 +33,18 @@ static const struct {
     const char *name, *tagline, *prog, *glyph;
     uint32_t accent;
     bool console;
+    /* Whether it handles HOME itself. A builtin has no manifest to read when
+       no volume is mounted, so the fallback has to carry this too. */
+    bool owns_keys;
 } k_builtin[] = {
-    { "Radio+",  "FM, RDS, recording", "radioplus", "FM", 0x22D3EE, false },
+    { "Radio+",  "FM, RDS, recording", "radioplus", "FM", 0x22D3EE, false, false },
     /* TinyPod draws its own pixels. It was marked as a console app back when
        its only front end was the terminal one, and the launcher has run it
        with `gui` since - so the launcher was handing the framebuffer console
        back and clearing it, and then the kernel's fbcon drew over LVGL. That
        is why it opened from a shell every time and from the launcher about
        half the time: which one you saw depended on what the console did next. */
-    { "TinyPod", "Music",              "tinypod",   "TP", 0x34D399, false },
+    { "TinyPod", "Music",              "tinypod",   "TP", 0x34D399, false, true },
 };
 
 /* The home screen hands each of these a button, so the two must agree. */
@@ -219,6 +222,11 @@ static void apply_manifest(const char *apps_dir, const char *folder,
        most of these apps are LVGL. */
     if (json_str(js, "screen", v, sizeof v))
         a->console = !strcmp(v, "console");
+
+    /* "own" means the app takes every button, including HOME, and leaves when
+       it decides to. Anything else, and the Sleep button is the way out. */
+    if (json_str(js, "keys", v, sizeof v))
+        a->owns_keys = !strcmp(v, "own");
 }
 
 /* ---- the list ------------------------------------------------------------- */
@@ -588,6 +596,7 @@ bool n31_apps_scan_into(n31_app_list_t *out, n31_scan_state_t *state)
         a.accent  = k_builtin[i].accent;
         a.builtin = true;
         a.console = k_builtin[i].console;
+        a.owns_keys = k_builtin[i].owns_keys;
 
         struct builtin_hit h;
         char shipped[sizeof a.path], shipped_bin[sizeof a.path];
