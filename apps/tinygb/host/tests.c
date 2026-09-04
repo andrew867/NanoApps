@@ -537,56 +537,102 @@ static void test_audio_clock(void)
  * it rested at Y = -1086 on the bench, which is most of a g down the long
  * axis.
  */
+/*
+ * The tilt d-pad, on the device's real numbers.
+ *
+ * Full scale is +-2304 for +-2 g, so one gravity is 1152 counts. That matters
+ * more than it looks: an axis already reading a full g is pointing at the
+ * floor and has nowhere left to travel, which is why the choice of axis is
+ * part of what is tested here rather than a constant in the source.
+ */
 static void test_tilt(void)
 {
-    enum { MIN = -2304, MAX = 2304 };
+    enum { MIN = -2304, MAX = 2304, G = 1152 };
     tg_tilt t;
 
     printf("tilt d-pad:\n");
 
+    /*
+     * Upright: gravity down the long axis, which is how this device rests on
+     * the bench and how somebody holds it to play. Y is pinned near -1 g, so
+     * X and Z are the two that can answer.
+     */
     tg_tilt_init(&t, MIN, MAX, 14, 7);
+    tg_tilt_set_centre(&t, 11, -1086, 40);
 
-    /* Level, uncalibrated, is nothing pressed. */
-    ok("level presses nothing", tg_tilt_feed(&t, 0, 0) == 0);
+    ok("held upright, the pinned axis is left out",
+       t.roll_axis == TG_AX_X && t.pitch_axis == TG_AX_Z);
+
+    ok("level presses nothing", tg_tilt_feed(&t, 11, -1086, 40) == 0);
 
     /*
-     * The real reason calibration exists: resting at Y = -1086 is 47% of full
-     * scale, well past the 14% press angle, so without a measured neutral the
-     * device holds a direction from the moment it starts.
+     * Left and right, the way round the device actually is.
+     *
+     * Leaning it left raises X here, which is the opposite of what the first
+     * version assumed - and playing it was how that was found. 14% of 2304 is
+     * 322 counts, so 400 is past the press angle.
      */
-    ok("resting on the bench would hold a direction",
-       tg_tilt_feed(&t, 11, -1086) != 0);
+    ok("lean left",  tg_tilt_feed(&t, 11 + 400, -1086, 40) == TG_LEFT);
+    ok("lean right", tg_tilt_feed(&t, 11 - 400, -1086, 40) == TG_RIGHT);
 
-    tg_tilt_set_centre(&t, 11, -1086);
-    ok("...and does not, once level is measured there",
-       tg_tilt_feed(&t, 11, -1086) == 0);
+    /* Tipping reads Z, which at this posture is the axis with room to move. */
+    ok("tip up",   tg_tilt_feed(&t, 11, -1086, 40 + 400) == TG_UP);
+    ok("tip down", tg_tilt_feed(&t, 11, -1086, 40 - 400) == TG_DOWN);
 
-    /* Past the press angle, in each direction. 14% of 2304 is 322 counts. */
-    ok("lean right",  tg_tilt_feed(&t, 11 + 400, -1086) == TG_RIGHT);
-    ok("lean left",   tg_tilt_feed(&t, 11 - 400, -1086) == TG_LEFT);
-    ok("tip down",    tg_tilt_feed(&t, 11, -1086 + 400) == TG_DOWN);
-    ok("tip up",      tg_tilt_feed(&t, 11, -1086 - 400) == TG_UP);
-
-    /* Both axes at once is a diagonal, not a fight between them. */
     ok("a diagonal is two directions",
-       tg_tilt_feed(&t, 11 + 400, -1086 - 400) == (TG_RIGHT | TG_UP));
+       tg_tilt_feed(&t, 11 + 400, -1086, 40 + 400) == (TG_LEFT | TG_UP));
+
+    /*
+     * The bug this replaced, stated as a test.
+     *
+     * Y rests at -1086 and gravity stops at -1152, so Y has sixty-six counts
+     * of travel left in that direction against a press threshold of 322.
+     * Reading tip from Y could never fire, and it never did.
+     */
+    ok("the saturated axis is not the one being asked",
+       t.pitch_axis != TG_AX_Y);
+    ok("...and it could not have answered anyway", G - 1086 < (MAX * 14 / 100));
+
+    /*
+     * Calibration still earns its keep.
+     *
+     * Held upright the default axes happen to miss the pinned one, so the
+     * bench position is harmless - but laid flat it is the default pitch axis
+     * that is sitting at a full g, and an uncalibrated d-pad holds a
+     * direction from the moment it starts.
+     */
+    tg_tilt_init(&t, MIN, MAX, 14, 7);
+    ok("uncalibrated, resting flat holds a direction",
+       tg_tilt_feed(&t, 5, -20, -1120) != 0);
+
+    /*
+     * Flat on a table is the other posture people use, and there gravity is
+     * down Z - so the pair becomes X and Y and tipping reads Y again.
+     */
+    tg_tilt_init(&t, MIN, MAX, 14, 7);
+    tg_tilt_set_centre(&t, 5, -20, -1120);
+    ok("laid flat, the pair is the other two",
+       t.roll_axis == TG_AX_X && t.pitch_axis == TG_AX_Y);
+    ok("and tipping works there too",
+       tg_tilt_feed(&t, 5, -20 + 400, -1120) == TG_UP);
 
     /*
      * Hysteresis. Held at 250 counts - between the 7% release angle (161) and
      * the 14% press angle (322) - the answer must depend on what came before,
-     * or a hand resting near the threshold toggles the direction many times a
-     * second.
+     * or a hand resting near the threshold toggles many times a second.
      */
-    tg_tilt_feed(&t, 11, -1086);                       /* everything released */
+    tg_tilt_init(&t, MIN, MAX, 14, 7);
+    tg_tilt_set_centre(&t, 11, -1086, 40);
+    tg_tilt_feed(&t, 11, -1086, 40);
     ok("just under the press angle does not press",
-       tg_tilt_feed(&t, 11 + 250, -1086) == 0);
+       tg_tilt_feed(&t, 11 + 250, -1086, 40) == 0);
 
-    tg_tilt_feed(&t, 11 + 400, -1086);                 /* press it properly */
+    tg_tilt_feed(&t, 11 + 400, -1086, 40);
     ok("...but having pressed, it stays pressed there",
-       tg_tilt_feed(&t, 11 + 250, -1086) == TG_RIGHT);
+       tg_tilt_feed(&t, 11 + 250, -1086, 40) == TG_LEFT);
 
     ok("and releases below the release angle",
-       tg_tilt_feed(&t, 11 + 100, -1086) == 0);
+       tg_tilt_feed(&t, 11 + 100, -1086, 40) == 0);
 
     /* A caller that asks for nonsense gets hysteresis anyway rather than a
        release angle above the press angle, which would latch forever. */
@@ -596,7 +642,7 @@ static void test_tilt(void)
 
     /* A device with no usable range must not divide by it. */
     tg_tilt_init(&t, 0, 0, 14, 7);
-    ok("a zero range presses nothing", tg_tilt_feed(&t, 999, 999) == 0);
+    ok("a zero range presses nothing", tg_tilt_feed(&t, 999, 999, 999) == 0);
 }
 
 int main(void)

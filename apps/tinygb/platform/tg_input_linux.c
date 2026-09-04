@@ -57,7 +57,7 @@ struct tg_input {
        assumed, plus the last raw reading on each axis. */
     int      acc_fd;
     int      acc_min, acc_max;
-    int      acc_x, acc_y;
+    int      acc_x, acc_y, acc_z;
     tg_tilt  tilt;        /* the decision itself; see tg_tilt.h */
     uint8_t  tilt_bits;
 };
@@ -121,7 +121,7 @@ static bool looks_like_accel(int fd)
  */
 static void calibrate(tg_input *in)
 {
-    long sx = 0, sy = 0;
+    long sx = 0, sy = 0, sz = 0;
     unsigned n = 0;
     struct timespec deadline, now;
 
@@ -141,6 +141,7 @@ static void calibrate(tg_input *in)
             if (e.type != EV_ABS) continue;
             if (e.code == ABS_X) { sx += e.value; n++; }
             if (e.code == ABS_Y) { sy += e.value; }
+            if (e.code == ABS_Z) { sz += e.value; }
         }
 
         clock_gettime(CLOCK_MONOTONIC, &now);
@@ -160,15 +161,17 @@ static void calibrate(tg_input *in)
     if (n) {
         in->acc_x = (int)(sx / (long)n);
         in->acc_y = (int)(sy / (long)n);
-        tg_tilt_set_centre(&in->tilt, in->acc_x, in->acc_y);
+        in->acc_z = (int)(sz / (long)n);
+        tg_tilt_set_centre(&in->tilt, in->acc_x, in->acc_y, in->acc_z);
+        printf("tinygb: tilt %s\n", tg_tilt_describe(&in->tilt));
     }
 }
 
 /* Override the measured neutral, for a test that cannot hold anything. */
-void tg_input_set_centre(tg_input *in, int x, int y)
+void tg_input_set_centre(tg_input *in, int x, int y, int z)
 {
     if (!in) return;
-    tg_tilt_set_centre(&in->tilt, x, y);
+    tg_tilt_set_centre(&in->tilt, x, y, z);
 }
 
 tg_input *tg_input_open(unsigned sources)
@@ -228,15 +231,16 @@ unsigned tg_input_sources(const tg_input *in) { return in ? in->sources : 0; }
 
 void tg_input_set_tilt(tg_input *in, int on_pct, int off_pct)
 {
-    int cx, cy;
+    int cx, cy, cz;
 
     if (!in) return;
     /* Keep the measured neutral across a threshold change - re-init would
        throw away the calibration and put level back at zero. */
     cx = in->tilt.cx;
     cy = in->tilt.cy;
+    cz = in->tilt.cz;
     tg_tilt_init(&in->tilt, in->acc_min, in->acc_max, on_pct, off_pct);
-    tg_tilt_set_centre(&in->tilt, cx, cy);
+    tg_tilt_set_centre(&in->tilt, cx, cy, cz);
 }
 
 /* ---- the mapping --------------------------------------------------------- */
@@ -284,12 +288,14 @@ uint8_t tg_input_poll(tg_input *in)
             } else if (e.type == EV_ABS) {
                 if (e.code == ABS_X) in->acc_x = e.value;
                 if (e.code == ABS_Y) in->acc_y = e.value;
+                if (e.code == ABS_Z) in->acc_z = e.value;
             }
         }
     }
 
     if (in->sources & TG_SRC_TILT)
-        in->tilt_bits = tg_tilt_feed(&in->tilt, in->acc_x, in->acc_y);
+        in->tilt_bits = tg_tilt_feed(&in->tilt, in->acc_x, in->acc_y,
+                                     in->acc_z);
 
     return (uint8_t)(in->keys | in->tilt_bits);
 }

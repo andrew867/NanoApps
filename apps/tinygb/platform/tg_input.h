@@ -95,7 +95,7 @@ void tg_input_set_tilt(tg_input *in, int on_pct, int off_pct);
  * axis, which is past any threshold worth having. This is for a caller that
  * knows better, or a test.
  */
-void tg_input_set_centre(tg_input *in, int x, int y);
+void tg_input_set_centre(tg_input *in, int x, int y, int z);
 
 /* Print what every device reports, and keep printing events until `secs` have
    passed. For working out on a real device what is actually connected. */
