@@ -104,8 +104,30 @@ bool n31_backlight_open(void)
         return false;
     }
 
-    printf("n31launcher: backlight %s, level %d of %d\n",
-           s_name, s_level, s_max);
+    /*
+     * Whether the panel is ALREADY off, so on() and off() start out agreeing
+     * with the hardware.
+     *
+     * s_off used to start false regardless, and on() returns early unless it
+     * is set - so opening the backlight while the panel was already powered
+     * down left no way to light it again. The launcher never saw this,
+     * because it blanks and unblanks the panel itself and its idea of the
+     * state was always right; a second program opening the backlight after
+     * the first had blanked it comes up dark and stuck.
+     */
+    {
+        char p2[256];
+        int power = 0;
+
+        snprintf(p2, sizeof p2, "%s/bl_power", s_dir);
+        if (read_int(p2, &power) && power != BL_UNBLANK)
+            s_off = true;
+        else if (s_level <= 0)
+            s_off = true;       /* dimmed to nothing by the other route */
+    }
+
+    printf("n31launcher: backlight %s, level %d of %d%s\n",
+           s_name, s_level, s_max, s_off ? ", currently off" : "");
     fflush(stdout);
     return true;
 }

@@ -176,7 +176,11 @@ static void read_power(n31_status_t *s)
         if (e->d_name[0] == '.') continue;
 
         char base[128], path[192], v[64];
-        snprintf(base, sizeof base, "/sys/class/power_supply/%s", e->d_name);
+        /* Bounded: d_name can be 255 bytes and these buffers cannot hold
+           that plus the prefix. A power supply with a name that long does not
+           exist, and snprintf would truncate anyway - saying so here is what
+           lets this compile under -Werror where it is shared. */
+        snprintf(base, sizeof base, "/sys/class/power_supply/%.96s", e->d_name);
 
         snprintf(path, sizeof path, "%s/type", base);
         if (!read_str(path, v, sizeof v)) continue;
@@ -262,7 +266,7 @@ static void read_power(n31_status_t *s)
             while ((ue = readdir(u))) {
                 if (ue->d_name[0] == '.') continue;
                 char p[192], st[64];
-                snprintf(p, sizeof p, "/sys/class/udc/%s/state", ue->d_name);
+                snprintf(p, sizeof p, "/sys/class/udc/%.96s/state", ue->d_name);
                 if (read_str(p, st, sizeof st) && strcmp(st, "not attached")) {
                     s->plugged = true;
                     break;

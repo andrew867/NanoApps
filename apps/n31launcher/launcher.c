@@ -324,9 +324,72 @@ static bool settling(void)
  * radioplus, since the volume it was found on is mounted read-only. Only if it
  * is missing do we fall back to the path discovery already resolved.
  */
+/*
+ * Can this file actually be read, all of it?
+ *
+ * The volume is vfat on NAND behind a reimplemented FTL, and it returns read
+ * errors on regions it cannot map - so a binary can be present, the right
+ * size, marked executable, and still not readable. Demand paging turns that
+ * into either a shell reporting 126, or worse, a SIGBUS partway through a
+ * session once execution reaches a page that will not load.
+ *
+ * Reading it through first costs a few hundred milliseconds on a megabyte and
+ * turns both of those into something that can be said out loud before
+ * anything starts. It is not a fix for the disk; it is the difference between
+ * a diagnosis and a mystery.
+ */
+static bool readable_through(const char *path, char *why, size_t whysz)
+{
+    char buf[16384];
+    ssize_t n;
+    int fd;
+
+    if (!path || !path[0]) return true;   /* nothing to check */
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        snprintf(why, whysz, "cannot open it (%s)", strerror(errno));
+        return false;
+    }
+
+    while ((n = read(fd, buf, sizeof buf)) > 0)
+        ;
+
+    if (n < 0) {
+        snprintf(why, whysz, "the disk returned %s", strerror(errno));
+        close(fd);
+        return false;
+    }
+
+    close(fd);
+    return true;
+}
+
 static bool launch(const n31_app_t *a)
 {
     if (!a || s_child) return false;
+
+    /*
+     * Check the copy we resolved before starting it, and say so if it is
+     * unreadable rather than letting the exec fail with a bare number.
+     *
+     * Nothing is skipped on failure: n31-autostart searches again and may
+     * find a shipped copy in /bin that reads perfectly well, and letting it
+     * try is more useful than refusing. The note is what makes the eventual
+     * failure legible if it does not.
+     */
+    if (a->path[0]) {
+        char why[96];
+
+        if (!readable_through(a->path, why, sizeof why)) {
+            char note[192];
+
+            snprintf(note, sizeof note, "%s: %s on the volume",
+                     a->name[0] ? a->name : a->prog, why);
+            printf("n31launcher: %s (%s)\n", note, a->path);
+            n31_ui_home_note(note);
+        }
+    }
 
     pid_t pid = fork();
     if (pid < 0) return false;
@@ -493,6 +556,15 @@ static void report_exit(int status, uint32_t ran_for)
         /* The exec chain in launch() ends in _exit(127), and so does the
            shell's "not found" - either way nothing ran. */
         n += snprintf(note + n, sizeof note - (size_t)n, "was not found");
+    else if (code == 126)
+        /*
+         * The shell's "found it, could not run it". On this device that is
+         * almost never a permission bit - the volume is mounted fmask=0022 -
+         * and almost always the FTL failing to read the file back. Saying
+         * "code 126" sent people looking at chmod for an hour.
+         */
+        n += snprintf(note + n, sizeof note - (size_t)n,
+                      "could not be read from the disk");
     else if (code)
         n += snprintf(note + n, sizeof note - (size_t)n, "exited (code %d)",
                       code);
