@@ -52,7 +52,7 @@ LV_CONF_ID := $(shell md5sum $(LV_CONF) 2>/dev/null | cut -c1-12)
 LV_CACHE   ?= $(HOME)/.cache/n31-lvgl/entrain-n31-$(LV_CONF_ID)
 
 # Cortex-A8, Thumb-2, hardware FP but soft-float ABI, and no NEON.
-ARCH_FLAGS := -mcpu=cortex-a8 -mthumb -mfpu=vfpv3-d16 -mfloat-abi=softfp
+ARCH_FLAGS := -mcpu=cortex-a5 -mthumb -mfpu=vfpv4 -mfloat-abi=softfp
 
 CFLAGS  := -O2 -g0 -std=gnu99 $(ARCH_FLAGS) \
            -ffunction-sections -fdata-sections \

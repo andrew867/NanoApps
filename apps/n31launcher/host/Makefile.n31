@@ -51,7 +51,7 @@ $(LV_CACHE):
 LVLIB_OWN  = $(LV_CACHE)/liblvgl_n31.a
 LVLIB     ?= $(LVLIB_OWN)
 
-ARCH_FLAGS := -mcpu=cortex-a8 -mthumb -mfpu=vfpv3-d16 -mfloat-abi=softfp
+ARCH_FLAGS := -mcpu=cortex-a5 -mthumb -mfpu=vfpv4 -mfloat-abi=softfp
 
 CFLAGS := -O2 -g0 -std=gnu99 $(ARCH_FLAGS) \
           -ffunction-sections -fdata-sections \

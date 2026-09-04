@@ -10,10 +10,21 @@
 #
 #   * /dev/fb0 is 240x432, 32 bpp, 960-byte lines. A Game Boy scaled 1.5x is
 #     240x216, which is exactly the top half.
-#   * Cortex-A8, VFPv3-D16, and a SOFT-FLOAT ABI. -mfloat-abi=hard produces a
-#     binary that cannot call its own libc; VFPv4 is an undefined instruction
-#     on this core.
-#   * No NEON.
+#   * Cortex-A5, VFPv4 with 32 double registers, and a SOFT-FLOAT ABI.
+#     Read off the device rather than assumed - /proc/cpuinfo gives CPU part
+#     0xc05, which is an A5, and lists vfpv4 and vfpd32 among its features.
+#     This file used to say Cortex-A8 with VFPv3-D16 and claim VFPv4 was an
+#     undefined instruction here; all three were wrong, and the last one had
+#     been propagating into the build's own safety check.
+#
+#     The soft-float ABI is the one thing that IS as described, and it is a
+#     property of the toolchain rather than the part: this targets
+#     arm-linux-musleabi, whose libc passes floats in integer registers, so
+#     -mfloat-abi=hard fails at the link against every libc object with "uses
+#     VFP register arguments". Hard float needs a musleabihf toolchain, not a
+#     different flag.
+#   * No NEON - it is absent from the feature list, so vfpv4 and not
+#     neon-vfpv4.
 #   * Static musl. The initramfs has essentially no shared libraries.
 
 IPOD_ROOT ?= /mnt/c/src/ipod/artifacts/linux-n31
@@ -49,7 +60,7 @@ READELF:= $(CROSS)readelf
 BUILD  := build-n31
 APP    := $(BUILD)/tinygb
 
-ARCH_FLAGS := -mcpu=cortex-a8 -mthumb -mfpu=vfpv3-d16 -mfloat-abi=softfp
+ARCH_FLAGS := -mcpu=cortex-a5 -mthumb -mfpu=vfpv4 -mfloat-abi=softfp
 
 # The APU is compiled for one rate and it is the sink's, so nothing resamples.
 # 48000 because the codec's 12 MHz master clock only divides into that family -
@@ -242,15 +253,27 @@ $(APP): $(OBJS) $(LINK_TA) $(LVLIB)
 	@echo "  $(APP)  $$(stat -c%s $(APP)) bytes"
 	@$(MAKE) -s -f Makefile.n31 check
 
-# The two ways this binary can be wrong without failing to build. A hard-float
-# or VFPv4 object links fine here and dies on the device with an undefined
-# instruction, and a dynamic one dies looking for a loader that is not there.
+# The two ways this binary can be wrong without failing to build: a float ABI
+# the libc does not share, and a dynamic binary looking for a loader that is
+# not in the initramfs.
+#
+# The FP_arch list is what the part reports it can execute. It used to stop at
+# VFPv3-D16 on the strength of a claim that VFPv4 faulted here, which
+# /proc/cpuinfo disproves - so the check was rejecting instructions the core
+# runs perfectly well. NEON stays off the list, because that one really is
+# absent from the features.
+#
+# Tag_ABI_VFP_args is the separate question and the one that actually breaks:
+# it says floats travel in VFP registers, which this libc does not do.
 check: $(APP)
 	@fp=$$($(READELF) -A $(APP) | sed -n 's/.*Tag_FP_arch: //p'); \
 	 case "$$fp" in \
-	   VFPv2|VFPv3|VFPv3-D16) echo "  FP_arch $$fp  ok";; \
-	   *) echo "  FP_arch $$fp  NOT SAFE on Cortex-A8" >&2; exit 1;; \
+	   VFPv2|VFPv3|VFPv3-D16|VFPv4|VFPv4-D16) echo "  FP_arch $$fp  ok";; \
+	   *) echo "  FP_arch $$fp  NOT SAFE on Cortex-A5" >&2; exit 1;; \
 	 esac
+	@if $(READELF) -A $(APP) | grep -q Tag_ABI_VFP_args; then \
+	   echo "  hard-float ABI against a soft-float libc" >&2; exit 1; \
+	 else echo "  float ABI  softfp  ok"; fi
 	@n=$$($(READELF) -d $(APP) 2>/dev/null | grep -c NEEDED); \
 	 if [ "$$n" -eq 0 ]; then echo "  static  ok"; \
 	 else echo "  $$n dynamic NEEDED entries" >&2; exit 1; fi

@@ -63,7 +63,7 @@ LVLIB   := $(LV_CACHE)/liblvgl_n31.a
 # Still borrowed: eight files, no configuration, nothing to disagree about.
 TALIB  ?= ../../entrain/host/build-n31/libtinyalsa_n31.a
 
-ARCH_FLAGS := -mcpu=cortex-a8 -mthumb -mfpu=vfpv3-d16 -mfloat-abi=softfp
+ARCH_FLAGS := -mcpu=cortex-a5 -mthumb -mfpu=vfpv4 -mfloat-abi=softfp
 
 CFLAGS := -O2 -g0 -std=gnu99 $(ARCH_FLAGS) \
           -ffunction-sections -fdata-sections \
