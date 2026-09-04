@@ -69,6 +69,7 @@ const char *tg_strerror(enum tg_result r)
     case TG_ERR_NO_CORE:     return "no such core";
     case TG_ERR_CAPACITY:    return "the buffer provided is too small";
     case TG_ERR_UNSUPPORTED: return "the core does not support that";
+    case TG_ERR_STATE:       return "that save state was not written by this build";
     case TG_ERR_INTERNAL:    return "internal error";
     }
     return "unknown error";

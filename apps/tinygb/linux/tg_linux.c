@@ -36,7 +36,10 @@
 #include "../core/tg_core.h"
 #include "../platform/tg_fb.h"
 #include "../platform/tg_input.h"
+#include "../platform/tg_palette.h"
 #include "../platform/tg_roms.h"
+#include "../ui/tg_menu.h"
+#include "../../build_stamp.h"
 #include "../platform/tg_save.h"
 #include "../platform/tg_audio.h"
 #include "../platform/tg_scale.h"
@@ -155,8 +158,160 @@ static void print_library(const tg_rom_list *l, bool ok)
         printf("  %s\n", l->name[i]);
 }
 
-int main(int argc, char **argv)
+/* ---- save states --------------------------------------------------------- */
+
+/*
+ * Where a save state lives: beside the cartridge, same name, .st0.
+ *
+ * The same convention as the battery save next to it, for the same reason -
+ * a folder of games stays a folder of games, and nothing has to be told where
+ * anything is. Numbered from the start so a second slot is a file name and
+ * not a format change.
+ */
+static void state_path_for(const char *rom, char *out, size_t cap)
 {
+    const char *dot = strrchr(rom, '.');
+    size_t n = dot ? (size_t)(dot - rom) : strlen(rom);
+
+    if (n > cap - 5) n = cap - 5;
+    memcpy(out, rom, n);
+    memcpy(out + n, ".st0", 5);
+}
+
+static bool state_exists(const char *rom)
+{
+    char path[768];
+    FILE *f;
+
+    state_path_for(rom, path, sizeof path);
+    f = fopen(path, "rb");
+    if (!f) return false;
+    fclose(f);
+    return true;
+}
+
+static bool state_write(const tg_core *core, void *ctx, const char *rom)
+{
+    char path[768];
+    uint8_t *blob;
+    size_t need;
+    FILE *f;
+    bool ok;
+
+    if (!core->state_size || !core->state_save) return false;
+
+    need = core->state_size(ctx);
+    if (!need || !(blob = malloc(need))) return false;
+
+    if (core->state_save(ctx, blob, need) != TG_OK) {
+        free(blob);
+        return false;
+    }
+
+    state_path_for(rom, path, sizeof path);
+    if (!(f = fopen(path, "wb"))) {
+        free(blob);
+        return false;
+    }
+    ok = fwrite(blob, 1, need, f) == need;
+    /* A half-written state is worse than none: it looks loadable and is not.
+       fclose reports the write that fflush deferred. */
+    if (fclose(f) != 0) ok = false;
+    free(blob);
+    return ok;
+}
+
+static bool state_read(const tg_core *core, void *ctx, const char *rom)
+{
+    char path[768];
+    uint8_t *blob;
+    long len;
+    FILE *f;
+    bool ok = false;
+
+    if (!core->state_load) return false;
+
+    state_path_for(rom, path, sizeof path);
+    if (!(f = fopen(path, "rb"))) return false;
+
+    if (fseek(f, 0, SEEK_END) == 0 && (len = ftell(f)) > 0 &&
+        fseek(f, 0, SEEK_SET) == 0 && (blob = malloc((size_t)len)) != NULL) {
+        if (fread(blob, 1, (size_t)len, f) == (size_t)len)
+            ok = core->state_load(ctx, blob, (size_t)len) == TG_OK;
+        free(blob);
+    }
+    fclose(f);
+    return ok;
+}
+
+/*
+ * Home, mid-game.
+ *
+ * Returns true when the session is over - the caller stops its loop and reads
+ * *action to find out whether that is another cartridge or the way out.
+ * False means carry on playing.
+ */
+static bool pause_menu(tg_menu_state *st, void *ctx, const tg_core *core,
+                       tg_save *save, bool has_sram, const char *rom_path,
+                       enum tg_menu_action *action)
+{
+    st->have_game = true;
+    st->can_state = core->state_size && core->state_save && core->state_load;
+    st->have_state = state_exists(rom_path);
+
+    for (;;) {
+        enum tg_menu_action act;
+
+        tg_menu_resume();
+        act = tg_menu_run(st, true);
+        tg_menu_suspend();
+
+        switch (act) {
+        case TG_MENU_RESUME:
+            return false;
+
+        case TG_MENU_SAVE_STATE:
+            /* The battery goes with it. A state restored beside a stale .sav
+               is a game whose memory disagrees with its cartridge. */
+            if (has_sram) tg_save_flush(save);
+            st->have_state = state_write(core, ctx, rom_path);
+            tg_menu_note(st->have_state ? "state saved"
+                                        : "could not write the state");
+            break;
+
+        case TG_MENU_LOAD_STATE:
+            tg_menu_note(state_read(core, ctx, rom_path)
+                             ? "state loaded" : "could not read the state");
+            break;
+
+        case TG_MENU_RESET:
+            core->reset(ctx);
+            return false;
+
+        case TG_MENU_PLAY:
+        case TG_MENU_QUIT:
+            *action = act;
+            return true;
+        }
+    }
+}
+
+/*
+ * One session: a cartridge, from load to cleanup.
+ *
+ * This was main. It became a function so the menu could sit outside it and
+ * call it again with a different cartridge - and so that everything it owns,
+ * the core context above all, stays alive while the pause menu is on screen.
+ * A save state is a snapshot of that context; tearing the session down to
+ * show a menu would leave nothing to snapshot.
+ *
+ * Returns what to do next: TG_MENU_QUIT to leave, or TG_MENU_PLAY with
+ * st->rom_path pointing at another cartridge.
+ */
+static enum tg_menu_action play_once(int argc, char **argv, tg_menu_state *st,
+                                     bool have_menu)
+{
+    enum tg_menu_action next_action = TG_MENU_QUIT;
     const char *rom_path = NULL, *fb_path = NULL;
     /* The library directory, a slash, and a FAT long name. */
     char rom_resolved[768];
@@ -225,6 +380,17 @@ int main(int argc, char **argv)
      * starts the first cartridge, which is the closest thing to a menu until
      * there is one.
      */
+    /*
+     * The menu has already chosen, so the picker below is only for the
+     * command line - which is still how the test scripts and the benchmark
+     * drive this.
+     */
+    if (have_menu && st->rom_path[0]) {
+        rom_path = st->rom_path;
+        smooth = st->smooth;
+        tilt = st->tilt;
+    }
+
     if (list_only || !rom_path) {
         tg_rom_list lib;
         bool ok = tg_roms_scan(&lib);
@@ -366,6 +532,16 @@ int main(int argc, char **argv)
            fb_path ? fb_path : "/dev/fb0", fb.w, fb.h, fb.bpp, fb.stride_px);
 
     pal = core->palette(ctx, &pal_n);
+
+    /*
+     * The core publishes the DMG's own green; the menu may have chosen
+     * something else. A DMG core reports a shade and not a colour, so which
+     * four colours those shades are is entirely ours to decide.
+     */
+    if (have_menu && st->palette < tg_palette_count()) {
+        pal = tg_palette_at(st->palette)->shade;
+        pal_n = 4;
+    }
     tg_scaler_init(&scaler, pal, smooth);
 
     /* Black once, so the half below the picture is not last boot's console. */
@@ -443,7 +619,34 @@ int main(int argc, char **argv)
     while (!s_stop && (!limit || frames < limit)) {
         if (input) {
             core->set_buttons(ctx, tg_input_poll(input));
-            if (tg_input_take_quit(input)) break;   /* Home leaves the game */
+
+            if (tg_input_take_quit(input)) {
+                /*
+                 * Home pauses rather than quits.
+                 *
+                 * Without a menu there is nowhere to pause to, so it still
+                 * ends the session - which is what the benchmark and the
+                 * test scripts rely on.
+                 */
+                if (!have_menu)
+                    break;
+
+                if (pause_menu(st, ctx, core, &save, info.sram_size != 0,
+                               rom_path, &next_action)) {
+                    /* Leaving, one way or another. */
+                    break;
+                }
+
+                /* Back into the game: the menu may have changed how it is
+                   drawn, and the clock has to forget the time spent paused
+                   or the pacer will sprint to catch up. */
+                if (st->palette < tg_palette_count())
+                    tg_scaler_init(&scaler, tg_palette_at(st->palette)->shade,
+                                   st->smooth);
+                tg_fb_fill(&fb, 0x000000);
+                tg_scaler_invalidate(&scaler);
+                next = now_ns();
+            }
         }
 
         /*
@@ -582,5 +785,98 @@ int main(int argc, char **argv)
     core->close(ctx);
     tg_audio_close(audio);
     free(abuf); free(ctx); free(sram); free(rom);
-    return status;
+    (void)status;
+    return next_action;
+}
+
+/*
+ * The app: pick something, play it, come back.
+ *
+ * With no menu - a ROM named on the command line, or no framebuffer to draw
+ * one on - this is a single session and an exit code, which is what every
+ * script that drives TinyGB expects.
+ */
+int main(int argc, char **argv)
+{
+    tg_menu_state st;
+    enum tg_menu_action act;
+    bool named = false;
+    int i;
+
+    memset(&st, 0, sizeof st);
+    st.smooth = true;
+    st.tilt = true;
+
+    /* Which build this is. A copy on the device that is months old looks
+       exactly like the one just compiled, and the launcher reads this stamp
+       out of the binary to decide between two of them. */
+    printf("tinygb: build %s\n", en_build_version());
+
+    /*
+     * Whether the command line already settled what to do.
+     *
+     * A named cartridge, a listing or a probe means one session and an exit
+     * code, which is what the test scripts and the benchmark read. The menu
+     * is for the device, where there is nobody to type a path.
+     */
+    for (i = 1; i < argc; i++) {
+        const char *a = argv[i];
+
+        if (!strcmp(a, "--list") || !strcmp(a, "--probe-input") ||
+            !strcmp(a, "--probe-audio") || !strcmp(a, "--bench") ||
+            !strcmp(a, "-h") || !strcmp(a, "--help")) {
+            named = true;
+            break;
+        }
+        /* The options that take a value, so their value is not mistaken for
+           a cartridge. */
+        if (!strcmp(a, "--fb") || !strcmp(a, "--frames") ||
+            !strcmp(a, "--warmup") || !strcmp(a, "--tilt")) {
+            i++;
+            continue;
+        }
+        if (a[0] != '-') {
+            named = true;
+            break;
+        }
+    }
+
+    if (named)
+        return play_once(argc, argv, &st, false) == TG_MENU_QUIT ? 0 : 0;
+
+    if (!tg_menu_init(NULL)) {
+        fprintf(stderr, "tinygb: no menu, and no cartridge named\n");
+        return 2;
+    }
+
+    act = tg_menu_run(&st, false);
+
+    for (;;) {
+        if (act == TG_MENU_QUIT)
+            break;
+
+        if (act == TG_MENU_PLAY) {
+            st.have_game = true;
+            act = play_once(argc, argv, &st, true);
+            continue;
+        }
+
+        /*
+         * Anything else came from a session that never got going.
+         *
+         * play_once still reports the ordinary command-line exit codes on its
+         * failure paths - it was main until recently - and those land in this
+         * enum as whatever they happen to equal. Rather than teach a dozen
+         * error returns a new vocabulary, the rule here is that only QUIT
+         * leaves and only PLAY starts something: everything else goes back to
+         * the picker, which is where someone whose cartridge would not load
+         * wants to be anyway.
+         */
+        st.have_game = false;
+        tg_menu_note("that cartridge would not start");
+        act = tg_menu_run(&st, false);
+    }
+
+    tg_menu_close();
+    return 0;
 }

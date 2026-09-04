@@ -298,6 +298,151 @@ static const uint32_t k_dmg_palette[4] = {
     0x0F380Fu,   /* 3 - darkest */
 };
 
+/* ---- save states --------------------------------------------------------- */
+
+/*
+ * The whole machine, as one blob.
+ *
+ * struct gb_s holds the CPU, the LCD controller, the timers and all of WRAM,
+ * VRAM, OAM and HRAM as arrays inside itself - so a snapshot of it is a
+ * snapshot of the console. What it also holds is the six callbacks and the
+ * priv pointer that lead back here, and those belong to THIS process: they
+ * are written out with everything else and thrown away on the way back in,
+ * because a pointer from the run that saved is meaningless to the run that
+ * loads.
+ *
+ * The cartridge RAM lives in our own context rather than in gb_s, so it is
+ * appended. The APU goes with it, or a load lands mid-envelope and the first
+ * moment after it is a click.
+ *
+ * A state is only valid for the build that wrote it. There is no version
+ * negotiation and there should not be: struct gb_s is a vendored header that
+ * can gain a field in any update, and a state restored into a struct that has
+ * moved under it is a crash rather than a wrong note. The header records the
+ * sizes and a mismatch is refused.
+ */
+#define TG_STATE_MAGIC 0x31534754u   /* "TGS1" */
+
+struct state_head {
+    uint32_t magic;
+    uint32_t gb_size;
+    uint32_t sram_len;
+    uint32_t apu_size;
+};
+
+static size_t peanut_state_size(void *vctx);
+
+static size_t state_bytes(const peanut_ctx *c)
+{
+    size_t n = sizeof(struct state_head) + sizeof c->gb + c->sram_len;
+
+#if TG_WITH_SOUND
+    n += sizeof c->apu;
+#endif
+    return n;
+}
+
+static size_t peanut_state_size(void *vctx)
+{
+    const peanut_ctx *c = vctx;
+
+    return c ? state_bytes(c) : 0;
+}
+
+static enum tg_result peanut_state_save(void *vctx, void *dst, size_t cap)
+{
+    peanut_ctx *c = vctx;
+    struct state_head h;
+    uint8_t *p = dst;
+
+    if (!c || !dst)
+        return TG_ERR_INTERNAL;
+
+    if (cap < state_bytes(c))
+        return TG_ERR_CAPACITY;
+
+    h.magic    = TG_STATE_MAGIC;
+    h.gb_size  = (uint32_t)sizeof c->gb;
+    h.sram_len = (uint32_t)c->sram_len;
+#if TG_WITH_SOUND
+    h.apu_size = (uint32_t)sizeof c->apu;
+#else
+    h.apu_size = 0;
+#endif
+
+    memcpy(p, &h, sizeof h);            p += sizeof h;
+    memcpy(p, &c->gb, sizeof c->gb);    p += sizeof c->gb;
+    if (c->sram_len) {
+        memcpy(p, c->sram, c->sram_len);
+        p += c->sram_len;
+    }
+#if TG_WITH_SOUND
+    memcpy(p, &c->apu, sizeof c->apu);
+#endif
+
+    return TG_OK;
+}
+
+static enum tg_result peanut_state_load(void *vctx, const void *src, size_t len)
+{
+    peanut_ctx *c = vctx;
+    struct state_head h;
+    const uint8_t *p = src;
+    struct gb_s restored;
+
+    if (!c || !src)
+        return TG_ERR_INTERNAL;
+    if (len < sizeof h)
+        return TG_ERR_STATE;
+
+    memcpy(&h, p, sizeof h);
+    p += sizeof h;
+
+    if (h.magic != TG_STATE_MAGIC ||
+        h.gb_size != sizeof c->gb ||
+        h.sram_len != c->sram_len ||
+        len < state_bytes(c))
+        return TG_ERR_STATE;
+
+    memcpy(&restored, p, sizeof restored);
+    p += sizeof restored;
+
+    /*
+     * Keep this run's pointers, take everything else.
+     *
+     * The saved ones point into the process that wrote them - a different
+     * mapping, quite possibly a different binary - and following one is not a
+     * wrong note, it is a jump to an address that no longer means anything.
+     */
+    restored.gb_rom_read       = c->gb.gb_rom_read;
+    restored.gb_cart_ram_read  = c->gb.gb_cart_ram_read;
+    restored.gb_cart_ram_write = c->gb.gb_cart_ram_write;
+    restored.gb_error          = c->gb.gb_error;
+    restored.gb_serial_tx      = c->gb.gb_serial_tx;
+    restored.gb_serial_rx      = c->gb.gb_serial_rx;
+    restored.gb_bootrom_read   = c->gb.gb_bootrom_read;
+    restored.display.lcd_draw_line = c->gb.display.lcd_draw_line;
+    restored.direct.priv       = c;
+
+    c->gb = restored;
+
+    if (c->sram_len) {
+        memcpy(c->sram, p, c->sram_len);
+        p += c->sram_len;
+    }
+#if TG_WITH_SOUND
+    if (h.apu_size == sizeof c->apu) {
+        memcpy(&c->apu, p, sizeof c->apu);
+        /* Whatever was part-way through the spill belonged to the old
+           position and would play before the restored one. */
+        c->spill_have = 0;
+        c->spill_taken = 0;
+    }
+#endif
+
+    return TG_OK;
+}
+
 static const uint32_t *peanut_palette(void *vctx, unsigned *count)
 {
     (void)vctx;
@@ -357,7 +502,7 @@ const tg_core tg_core_peanut = {
     .id    = "peanut",
     .name  = "Peanut-GB",
     .blurb = "Small and fast. Original Game Boy only.",
-    .caps  = TG_CAP_DMG
+    .caps  = TG_CAP_DMG | TG_CAP_STATE
 #if TG_WITH_SOUND
            | TG_CAP_SOUND
 #endif
@@ -377,9 +522,12 @@ const tg_core tg_core_peanut = {
     .audio_pull    = NULL,
 #endif
     .set_serial_sink = peanut_set_serial_sink,
-    /* Peanut-GB has no serialiser of its own. Save states are a second core's
-       feature, or ours to add later against a stable gb_s layout. */
-    .state_size = NULL,
-    .state_save = NULL,
-    .state_load = NULL,
+    /*
+     * Peanut-GB has no serialiser of its own, so this is ours: struct gb_s
+     * holds the whole console including its memories, and the only things in
+     * it that do not travel are the callbacks. See peanut_state_save.
+     */
+    .state_size = peanut_state_size,
+    .state_save = peanut_state_save,
+    .state_load = peanut_state_load,
 };

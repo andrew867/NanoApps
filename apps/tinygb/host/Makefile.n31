@@ -43,6 +43,7 @@ CROSS  := $(TOOLCHAIN)/bin/arm-linux-musleabi-
 CCACHE := $(shell command -v ccache 2>/dev/null)
 CC     := $(CCACHE) $(CROSS)gcc
 STRIP  := $(CROSS)strip
+AR     := $(CROSS)ar
 READELF:= $(CROSS)readelf
 
 BUILD  := build-n31
@@ -84,6 +85,51 @@ endif
 VENDOR_CFLAGS := -Wno-sign-compare -Wno-implicit-fallthrough \
                  -Wno-unused-but-set-variable -Wno-type-limits
 
+#
+# LVGL, for the menu.
+#
+# Built from a native mirror and cached per config, the same way Entrain and
+# the launcher do it - see apps/lvgl-mirror.mk for why compiling it across the
+# Windows mount is not an option. The cache directory carries the config's
+# hash, so changing lv_conf selects different objects rather than rebuilding
+# these.
+#
+LVGL     ?= ../../../lvgl
+include ../../lvgl-mirror.mk
+
+LV_CONF    := lv_conf_n31.h
+LV_CONF_ID := $(shell md5sum $(LV_CONF) 2>/dev/null | cut -c1-12)
+LV_CACHE   ?= $(HOME)/.cache/n31-lvgl/tinygb-n31-$(LV_CONF_ID)
+
+LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_n31.h\" \
+             -I$(LVGL_SRC) -I$(LVGL_SRC)/src -I$(LVGL_SRC)/include -I$(LVGL_SRC)/..
+
+# Everything but the platforms this target will never be.
+LV_SRCS := $(shell find $(LVGL_SRC)/src -name '*.c' \
+             -not -name 'lv_freertos.c' -not -name 'lv_cmsis_rtos2.c' \
+             -not -name 'lv_mqx.c'      -not -name 'lv_rtthread.c' \
+             -not -name 'lv_windows.c'  -not -name 'lv_sdl2.c' \
+             -not -path '*/drivers/nuttx/*'    -not -path '*/drivers/qnx/*' \
+             -not -path '*/drivers/uefi/*'     -not -path '*/drivers/windows/*' \
+             -not -path '*/drivers/wayland/*'  -not -path '*/drivers/x11/*' \
+             -not -path '*/drivers/libinput/*' -not -path '*/drivers/opengles/*' \
+             -not -path '*/drivers/sdl/*'      -not -path '*/drivers/display/drm/*' \
+             2>/dev/null)
+LV_OBJS := $(patsubst $(LVGL_SRC)/%.c,$(LV_CACHE)/%.o,$(LV_SRCS))
+LVLIB   := $(LV_CACHE)/liblvgl_n31.a
+
+CFLAGS  += $(LV_CFLAGS)
+
+# ---- build stamp -----------------------------------------------------------
+#
+# Which build this is. An app on the device that is months old looks exactly
+# like the one just compiled - and the disk installer reported "no build stamp
+# in the binary" for TinyGB, so the launcher was falling back to file dates to
+# decide between two copies.
+BUILD_STAMP := $(shell date -u +%Y%m%d.%H%M)
+BUILD_GIT   := $(shell git rev-parse --short=7 HEAD 2>/dev/null || echo nogit)
+CFLAGS += -DEN_BUILD_STAMP='"$(BUILD_STAMP)"' -DEN_BUILD_GIT='"$(BUILD_GIT)"'
+
 SRCS := ../core/tg_core.c \
         ../core/tg_peanut.c \
         ../vendor/minigb_apu.c \
@@ -93,6 +139,9 @@ SRCS := ../core/tg_core.c \
         ../platform/tg_input_linux.c \
         ../platform/tg_tilt.c \
         ../platform/tg_roms.c \
+        ../platform/tg_palette.c \
+        ../ui/tg_menu.c \
+        ../../build_stamp.c \
         ../platform/tg_save.c \
         ../../n31launcher/fbcon.c \
         ../linux/tg_linux.c
@@ -117,6 +166,13 @@ LINK_TA := $(TA_OBJS)
 endif
 
 .PHONY: all push run check clean
+
+# Stated rather than implied. Including lvgl-mirror.mk above this brings its
+# own lvgl-resync rule in first, and the first rule in a makefile is what a
+# bare `make` builds - so without this, building TinyGB deleted the LVGL
+# mirror and reported success. Entrain's makefile carries the same line and
+# the same warning.
+.DEFAULT_GOAL := all
 
 all: $(APP)
 
@@ -163,7 +219,24 @@ $(BUILD)/tg_save.o: ../platform/tg_save.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP 
 $(BUILD)/fbcon.o:       ../../n31launcher/fbcon.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/tg_linux.o:    ../linux/tg_linux.c        | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
-$(APP): $(OBJS) $(LINK_TA)
+$(LV_CACHE)/%.o: $(LVGL_SRC)/%.c
+	@mkdir -p $(dir $@)
+	@$(CC) $(CFLAGS) -w $(LV_CFLAGS) -c -o $@ $<
+
+$(LVLIB): $(LV_OBJS)
+	@echo "  AR  $@"
+	@$(AR) crs $@ $^
+
+$(BUILD)/tg_menu.o: ../ui/tg_menu.c | $(BUILD)
+	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+
+$(BUILD)/build_stamp.o: ../../build_stamp.c | $(BUILD)
+	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+
+$(BUILD)/tg_palette.o: ../platform/tg_palette.c | $(BUILD)
+	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+
+$(APP): $(OBJS) $(LINK_TA) $(LVLIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 	$(STRIP) $@
 	@echo "  $(APP)  $$(stat -c%s $(APP)) bytes"

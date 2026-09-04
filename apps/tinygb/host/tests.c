@@ -251,6 +251,81 @@ static void test_run(void)
  * few ways to get it wrong - but each of them looks like "the picture is a bit
  * off" rather than like a bug, so they are worth pinning.
  */
+/*
+ * Save, run on, load, and end up where the save was.
+ *
+ * The failure this catches is the one that cannot be seen by looking: a state
+ * that restores MOST of the machine leaves a game that plays for a few
+ * seconds and then diverges, which reads as emulator inaccuracy rather than
+ * as a broken save. Running both paths forward from the same state and
+ * comparing frames is what tells the two apart.
+ */
+static void test_state(void)
+{
+    const tg_core *c = tg_core_by_id("peanut");
+    uint8_t *rom = make_rom(0x00, 0x00, 0x00, "STATE");
+    void *ctx;
+    uint8_t *blob, *frame_a;
+    size_t need;
+    int same = 1;
+
+    printf("save states:\n");
+
+    if (!c) { fails++; free(rom); return; }
+
+    ok("the core declares them", (c->caps & TG_CAP_STATE) != 0 &&
+                                 c->state_size && c->state_save && c->state_load);
+    if (!c->state_size) { free(rom); return; }
+
+    ctx = calloc(1, c->ctx_size);
+    if (!ctx) { fails++; free(rom); return; }
+    if (c->open(ctx, rom, ROM_BYTES, NULL, 0, 0) != TG_OK) {
+        fails++; free(ctx); free(rom); return;
+    }
+
+    c->set_buttons(ctx, 0);
+    for (int i = 0; i < 20; i++) c->run_frame(ctx);
+
+    need = c->state_size(ctx);
+    ok("asks for a sensible size", need > sizeof(void *) && need < (4u << 20));
+
+    blob = malloc(need);
+    frame_a = malloc((size_t)TG_W * TG_H);
+    if (!blob || !frame_a) {
+        fails++; free(blob); free(frame_a); free(ctx); free(rom); return;
+    }
+
+    ok("refuses a buffer that is too small",
+       c->state_save(ctx, blob, need - 1) == TG_ERR_CAPACITY);
+    ok("saves", c->state_save(ctx, blob, need) == TG_OK);
+
+    /* Where the machine gets to from the save, kept to compare against. */
+    for (int i = 0; i < 30; i++) c->run_frame(ctx);
+    memcpy(frame_a, c->pixels(ctx), (size_t)TG_W * TG_H);
+
+    /* Somewhere else entirely, so a load that does nothing cannot pass. */
+    for (int i = 0; i < 60; i++) c->run_frame(ctx);
+
+    ok("loads", c->state_load(ctx, blob, need) == TG_OK);
+    for (int i = 0; i < 30; i++) c->run_frame(ctx);
+
+    for (size_t i = 0; i < (size_t)TG_W * TG_H; i++)
+        if (c->pixels(ctx)[i] != frame_a[i]) { same = 0; break; }
+    ok("the same thirty frames come out again", same);
+
+    /* Rubbish must be refused rather than restored into the machine. */
+    blob[0] ^= 0xFFu;
+    ok("refuses a state it did not write",
+       c->state_load(ctx, blob, need) == TG_ERR_STATE);
+    ok("refuses a truncated state",
+       c->state_load(ctx, blob, 3) == TG_ERR_STATE);
+
+    free(frame_a);
+    free(blob);
+    free(ctx);
+    free(rom);
+}
+
 static void test_scale(void)
 {
     static const uint32_t pal[4] = { 0xFFFFFF, 0xAAAAAA, 0x555555, 0x000000 };
@@ -529,6 +604,7 @@ int main(void)
     test_header();
     test_registry();
     test_run();
+    test_state();
     test_scale();
     test_audio_clock();
     test_tilt();

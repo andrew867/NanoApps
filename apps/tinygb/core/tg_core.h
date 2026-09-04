@@ -72,6 +72,9 @@ enum tg_result {
     TG_ERR_NO_CORE,      /* no such core id */
     TG_ERR_CAPACITY,     /* caller's context or SRAM buffer is too small */
     TG_ERR_UNSUPPORTED,  /* a core declining something it does not claim */
+    /* A save state that this build cannot restore: written by another build,
+       or by another core, or simply not a save state. */
+    TG_ERR_STATE,
     TG_ERR_INTERNAL,
 };
 
@@ -151,9 +154,15 @@ typedef struct tg_core {
     void (*set_serial_sink)(void *ctx, void (*fn)(void *user, uint8_t byte),
                             void *user);
 
-    /* Save state. Both NULL when TG_CAP_STATE is absent. `size` is queried by
-       passing NULL for `dst`. */
+    /*
+     * Save state. All three NULL when TG_CAP_STATE is absent.
+     *
+     * state_size is asked before saving rather than inferred from a fixed
+     * maximum: it depends on the cartridge's RAM, which is a property of the
+     * game and not of the core. Zero when this core has no save states.
+     */
     size_t (*state_size)(void *ctx);
+
     enum tg_result (*state_save)(void *ctx, void *dst, size_t cap);
     enum tg_result (*state_load)(void *ctx, const void *src, size_t len);
 } tg_core;
