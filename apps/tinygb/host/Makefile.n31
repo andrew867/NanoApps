@@ -92,6 +92,7 @@ SRCS := ../core/tg_core.c \
         ../platform/tg_audio_clock.c \
         ../platform/tg_input_linux.c \
         ../platform/tg_tilt.c \
+        ../platform/tg_roms.c \
         ../platform/tg_save.c \
         ../../n31launcher/fbcon.c \
         ../linux/tg_linux.c
@@ -157,6 +158,7 @@ $(BUILD)/tg_audio_alsalib.o: ../platform/tg_audio_alsalib.c | $(BUILD) ; $(CC) $
 $(BUILD)/tg_audio_clock.o: ../platform/tg_audio_clock.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/tg_input_linux.o: ../platform/tg_input_linux.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/tg_tilt.o: ../platform/tg_tilt.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/tg_roms.o: ../platform/tg_roms.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/tg_save.o: ../platform/tg_save.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/fbcon.o:       ../../n31launcher/fbcon.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/tg_linux.o:    ../linux/tg_linux.c        | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<

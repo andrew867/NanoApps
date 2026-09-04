@@ -36,6 +36,7 @@
 #include "../core/tg_core.h"
 #include "../platform/tg_fb.h"
 #include "../platform/tg_input.h"
+#include "../platform/tg_roms.h"
 #include "../platform/tg_save.h"
 #include "../platform/tg_audio.h"
 #include "../platform/tg_scale.h"
@@ -107,7 +108,12 @@ static uint8_t *read_file(const char *path, size_t *len_out)
 static void usage(void)
 {
     fprintf(stderr,
-        "usage: tinygb <rom.gb> [options]\n"
+        "usage: tinygb [rom] [options]\n"
+        "  rom           a path, or any part of a name in the library, so\n"
+        "                'zelda' or 'blue' finds the cartridge without its\n"
+        "                region codes. With no rom, the library is listed\n"
+        "                and the first cartridge starts.\n"
+        "  --list        list the library and exit\n"
         "  --fb PATH     framebuffer device (default /dev/fb0)\n"
         "  --frames N    stop after N frames instead of running until Ctrl-C\n"
         "  --sharp       nearest-neighbour scaling instead of the smooth 1.5x\n"
@@ -121,9 +127,40 @@ static void usage(void)
         "  --probe-audio print what the sound card will accept, then exit\n");
 }
 
+/*
+ * The library, as the menu will one day show it.
+ *
+ * Printed rather than drawn, because there is no menu yet - but the scan is
+ * the same one it will use, so what is listed here is what will be on it.
+ */
+static void print_library(const tg_rom_list *l, bool ok)
+{
+    unsigned i;
+
+    if (!ok) {
+        printf("tinygb: no library at %s\n", l->dir);
+        printf("        put cartridges there, or pass a path, or set\n"
+               "        TINYGB_ROMS.\n");
+        return;
+    }
+
+    if (l->n == 0) {
+        printf("tinygb: no cartridges in %s\n", l->dir);
+        return;
+    }
+
+    printf("tinygb: %u cartridge%s in %s\n",
+           l->n, l->n == 1 ? "" : "s", l->dir);
+    for (i = 0; i < l->n; i++)
+        printf("  %s\n", l->name[i]);
+}
+
 int main(int argc, char **argv)
 {
     const char *rom_path = NULL, *fb_path = NULL;
+    /* The library directory, a slash, and a FAT long name. */
+    char rom_resolved[768];
+    bool list_only = false;
     unsigned long limit = 0;
     unsigned long warmup = 0;
     bool noskip = false, tilt = true;
@@ -170,6 +207,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--no-tilt"))                tilt = false;
         else if (!strcmp(argv[i], "--tilt") && i + 1 < argc)
             sscanf(argv[++i], "%d,%d", &tilt_on, &tilt_off);
+        else if (!strcmp(argv[i], "--list"))                   list_only = true;
         else if (!strcmp(argv[i], "--probe-input")) { tg_input_probe(15); return 0; }
         else if (!strcmp(argv[i], "--probe-audio")) { tg_audio_probe(); return 0; }
         else if (!strcmp(argv[i], "--warmup") && i + 1 < argc) warmup = strtoul(argv[++i], NULL, 10);
@@ -179,7 +217,49 @@ int main(int argc, char **argv)
         else                                                   { usage(); return 2; }
     }
 
-    if (!rom_path) { usage(); return 2; }
+    /*
+     * Which cartridge.
+     *
+     * Three ways in, and they all end at a path: --list just says what is
+     * there; a bare name is matched against the library; nothing at all
+     * starts the first cartridge, which is the closest thing to a menu until
+     * there is one.
+     */
+    if (list_only || !rom_path) {
+        tg_rom_list lib;
+        bool ok = tg_roms_scan(&lib);
+
+        print_library(&lib, ok);
+
+        if (list_only || !ok || lib.n == 0) {
+            tg_roms_free(&lib);
+            return (list_only && ok) ? 0 : 2;
+        }
+
+        snprintf(rom_resolved, sizeof rom_resolved, "%s/%s",
+                 lib.dir, lib.name[0]);
+        tg_roms_free(&lib);
+        rom_path = rom_resolved;
+        printf("tinygb: starting %s\n", rom_path);
+    } else {
+        bool ambiguous;
+
+        if (!tg_roms_resolve(rom_path, rom_resolved, sizeof rom_resolved,
+                             &ambiguous)) {
+            char dir[512];
+
+            tg_roms_dir(dir, sizeof dir);
+            if (ambiguous)
+                fprintf(stderr, "tinygb: \"%s\" matches more than one "
+                                "cartridge in %s - be more specific\n",
+                        rom_path, dir);
+            else
+                fprintf(stderr, "tinygb: no cartridge \"%s\" - not a file, "
+                                "and not in %s\n", rom_path, dir);
+            return 2;
+        }
+        rom_path = rom_resolved;
+    }
 
     if (!(rom = read_file(rom_path, &rom_len))) {
         fprintf(stderr, "tinygb: cannot read %s\n", rom_path);
