@@ -20,6 +20,13 @@
  *                  "0x%02x: %*ph"
  *   hci_cmd    RW  arbitrary command, not used here
  *
+ * Mute is the exception that does not appear in that list, because it is not in
+ * sysfs at all: bcm2078-bt exports it and the nano7-audio machine driver
+ * publishes it as the "FM Tuner Mute" control on card 0. That is the proper
+ * interface for it - a mixer control is how everything else on this card is
+ * turned down - so this file reaches it through tinyalsa's mixer rather than
+ * asking for a sysfs attribute that deliberately does not exist.
+ *
  * Note what fm_reg buys beyond convenience: register 0x80 is the RDS FIFO, so
  * reading it gives raw tuples that this app can decode itself with core/rds.c
  * rather than settling for the driver's summary. The driver's own pi, ps and rt
@@ -39,6 +46,8 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+#include <tinyalsa/asoundlib.h>
 
 #include "../core/fmreg.h"
 
@@ -185,12 +194,19 @@ en_tuner_err_t en_tuner_init(void)
     }
     s_ready = true;
 
-    /* hci0 has to be up before anything works, because FM_RDS_Command rides on
-       it. Say so plainly rather than letting every later call fail. */
-    /* The controller existing is not the same as it being usable, so bring it
-       up rather than reporting on it. If it is missing entirely the driver has
-       not bound and there is nothing to do about that here. */
-    /* The controller existing is not the same as it being usable. */
+    /*
+     * The controller existing is not the same as it being usable, so bring it
+     * up rather than reporting on it: FM_RDS_Command rides on hci0 and every
+     * later call fails without it. If hci0 is missing entirely the Bluetooth
+     * driver has not bound and there is nothing to do about that from here.
+     *
+     * This call is not instant any more. hci_bcm now sets
+     * HCI_QUIRK_NON_PERSISTENT_SETUP, which is what stops the interrupt storm
+     * a down controller used to cause - but it also means the kernel re-runs
+     * hdev->setup() on every HCIDEVUP, so the ioctl below carries a 31 KB
+     * patchram upload and a baud change and blocks for seconds. It is called
+     * once, from init, and that is the reason to keep it there.
+     */
     bool present = access("/sys/class/bluetooth/hci0", F_OK) == 0;
     hci_state_t st = present ? hci_up() : HCI_DOWN;
 
@@ -226,6 +242,71 @@ en_tuner_err_t en_tuner_power(bool on)
 {
     return attr_write("fm_power", on ? "1\n" : "0\n");
 }
+
+/* ---- mute ---------------------------------------------------------------- */
+
+/*
+ * The mixer is opened for each call and closed again.
+ *
+ * Mute is pressed by hand or bracketed around a sweep - tens of times in a
+ * session, not thousands - and a control handle held open across the life of
+ * the app is a handle to be invalidated when the card goes away. Opening it per
+ * call costs an ioctl and cannot go stale.
+ */
+#define FM_MUTE_CARD 0
+#define FM_MUTE_CTL  "FM Tuner Mute"
+
+static struct mixer_ctl *mute_ctl(struct mixer **out)
+{
+    struct mixer *m = mixer_open(FM_MUTE_CARD);
+    struct mixer_ctl *c;
+
+    if (!m)
+        return NULL;
+
+    c = mixer_get_ctl_by_name(m, FM_MUTE_CTL);
+    if (!c) {
+        mixer_close(m);
+        return NULL;
+    }
+    *out = m;
+    return c;
+}
+
+en_tuner_err_t en_tuner_mute(bool on)
+{
+    struct mixer *m = NULL;
+    struct mixer_ctl *c = mute_ctl(&m);
+    int rc;
+
+    /*
+     * A card without the control is a machine driver that predates it, not a
+     * failure of this app. Reported as unsupported so a caller can leave the
+     * affordance off rather than showing one that does nothing.
+     */
+    if (!c)
+        return EN_TUNER_UNSUPPORTED;
+
+    rc = mixer_ctl_set_value(c, 0, on ? 1 : 0);
+    mixer_close(m);
+    return rc == 0 ? EN_TUNER_OK : EN_TUNER_FAILED;
+}
+
+int en_tuner_muted(void)
+{
+    struct mixer *m = NULL;
+    struct mixer_ctl *c = mute_ctl(&m);
+    int v;
+
+    if (!c)
+        return -1;
+
+    v = mixer_ctl_get_value(c, 0);
+    mixer_close(m);
+    return v < 0 ? -1 : (v ? 1 : 0);
+}
+
+/* ---- tuning -------------------------------------------------------------- */
 
 en_tuner_err_t en_tuner_tune(uint32_t khz)
 {

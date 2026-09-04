@@ -32,6 +32,44 @@
 #define PLAY_CARD   0
 #define PLAY_DEVICE 0        /* IIS0, the headphones */
 
+/*
+ * Where the audio goes, which is not always the headphones.
+ *
+ * With snd-aloop loaded there is a second destination worth having: writing to
+ * hw:Loopback,0 puts the radio where tinybtd's SBC encoder can read it from
+ * hw:Loopback,1, and FM comes out of a pair of Bluetooth headphones. That was
+ * once assumed to need hardware routing the SoC does not have; with the encoder
+ * in software it is two PCMs and a kernel module.
+ *
+ * Doing it here rather than with an arecord pipe keeps the parts of this app
+ * that make it worth using: the live ring, scrubbing back, and recording all
+ * sit between the tuner and this write, and a pipe straight off the capture
+ * device bypasses every one of them.
+ *
+ * RADIOPLUS_PCM_OUT is "card,device". Two things to know before setting it:
+ *
+ *   The loopback takes its rate from whichever side opens first, and this
+ *   writes 44.1 kHz stereo - so the reader must agree, which is convenient
+ *   because 44.1 is also what A2DP negotiates most often.
+ *
+ *   A loopback with nothing reading it fills and stops. The radio then goes
+ *   silent and the underrun count climbs, which is a fair description of what
+ *   has happened but is not obvious from the front. Start the encoder first.
+ */
+static unsigned s_card = PLAY_CARD;
+static unsigned s_device = PLAY_DEVICE;
+
+static void pick_device(void)
+{
+    const char *e = getenv("RADIOPLUS_PCM_OUT");
+    unsigned c, d;
+
+    if (e && sscanf(e, "%u,%u", &c, &d) == 2) {
+        s_card = c;
+        s_device = d;
+    }
+}
+
 #define RATE     44100u
 #define CHANNELS 2u
 #define BITS     16u
@@ -162,10 +200,12 @@ en_play_err_t en_play_start(void)
     cfg.start_threshold = PERIOD_FRAMES;
     cfg.stop_threshold = PERIOD_FRAMES * PERIOD_COUNT;
 
-    s_pcm = pcm_open(PLAY_CARD, PLAY_DEVICE, PCM_OUT, &cfg);
+    pick_device();
+
+    s_pcm = pcm_open(s_card, s_device, PCM_OUT, &cfg);
     if (!s_pcm || !pcm_is_ready(s_pcm)) {
         snprintf(s_desc, sizeof s_desc, "hw:%u,%u unavailable: %s",
-                 PLAY_CARD, PLAY_DEVICE,
+                 s_card, s_device,
                  s_pcm ? pcm_get_error(s_pcm) : "no device");
         if (s_pcm) { pcm_close(s_pcm); s_pcm = 0; }
         return EN_PLAY_NO_DEVICE;
@@ -184,8 +224,12 @@ en_play_err_t en_play_start(void)
         return EN_PLAY_FAILED;
     }
 
-    snprintf(s_desc, sizeof s_desc, "tinyalsa hw:%u,%u  %u Hz %u ch",
-             PLAY_CARD, PLAY_DEVICE, RATE, CHANNELS);
+    /* The settings screen shows this, and on a device with two possible
+       destinations "which one" is the first thing worth knowing. */
+    snprintf(s_desc, sizeof s_desc, "tinyalsa hw:%u,%u  %u Hz %u ch%s",
+             s_card, s_device, RATE, CHANNELS,
+             (s_card == PLAY_CARD && s_device == PLAY_DEVICE)
+                 ? "" : "  (RADIOPLUS_PCM_OUT)");
     return EN_PLAY_OK;
 }
 

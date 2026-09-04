@@ -55,6 +55,28 @@ void           en_tuner_shutdown(void);
 const char *en_tuner_backend(void);
 
 en_tuner_err_t en_tuner_power(bool on);
+
+/*
+ * Squelch, at the tuner rather than anywhere downstream.
+ *
+ * MANUAL_MUTE is the chip's own mute bit in I2C_FM_AUDIO_CTRL, and it is the
+ * right place for this: the IIS2 side has no gain stage of its own, and muting
+ * by closing the capture PCM would stop the port's clock and take RDS with it -
+ * so the one thing worth keeping during a sweep is exactly the thing that
+ * method throws away.
+ *
+ * There is deliberately no volume here. No FM volume register appears anywhere
+ * in the recovered FM_RDS_Command map; level on this path is the codec's
+ * playback volume once the audio reaches the headphones, which is already a
+ * control on this card. A software gain would be a second volume corresponding
+ * to nothing.
+ *
+ * en_tuner_muted() returns 1 or 0, or negative if the question cannot be put -
+ * which is not the same as unmuted and should not be drawn as though it were.
+ */
+en_tuner_err_t en_tuner_mute(bool on);
+int            en_tuner_muted(void);
+
 en_tuner_err_t en_tuner_tune(uint32_t khz);
 en_tuner_err_t en_tuner_seek(bool up);
 en_tuner_err_t en_tuner_state(en_tuner_state_t *out);

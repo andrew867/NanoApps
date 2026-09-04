@@ -1390,6 +1390,7 @@ static void scan_pump(void)
     }
 
     if (s_scan.phase == EN_SCAN_DONE) {
+        rp_act_squelch(false);
         s_scan_added = en_scan_commit(&s_scan, &rp_model.presets);
         rp_act_presets_save();
         s_scan_note_for = 60;
@@ -1406,6 +1407,7 @@ static void on_scan(lv_event_t *e)
     if (scan_running()) {
         /* Cancel. Put the tuner back before anything else, so a cancelled
            scan costs nothing but the time it ran for. */
+        rp_act_squelch(false);
         en_scan_stop(&s_scan);
         rp_act_tune(s_scan.resume_khz);
         s_scan_added = 0;
@@ -1417,9 +1419,29 @@ static void on_scan(lv_event_t *e)
     s_scan_last_ms = lv_tick_get();
     s_scan_added = 0;
     s_scan_note_for = 0;
+
+    /*
+     * Quiet for the duration.
+     *
+     * A sweep crosses two hundred channels of hiss on its way to twenty
+     * stations, and the naming pass then hops between those every few seconds -
+     * neither is anything anybody wants to hear. This mutes at the tuner's own
+     * MANUAL_MUTE bit, which matters here specifically: muting by closing the
+     * capture PCM would stop the IIS2 clock, and RDS is the entire point of the
+     * naming pass.
+     *
+     * Both ways out of a scan clear it - completion above, cancel just up
+     * there - and it is a separate flag from the user's own mute so that
+     * finishing a scan cannot unmute a radio the user silenced before starting
+     * one.
+     */
+    rp_act_squelch(true);
+
     if (en_scan_start(&s_scan, rp_model.region, rp_model.khz, RP_SCAN_RSSI,
                       rp_model.can_seek))
         rp_act_tune_quiet(s_scan.khz);
+    else
+        rp_act_squelch(false);   /* it never started; do not leave it muted */
 }
 
 /* ---- Presets --------------------------------------------------------------- */

@@ -31,6 +31,21 @@ typedef struct {
     bool     tuner_ok;
     const char *tuner_note;  /* why not, when tuner_ok is false */
 
+    /*
+     * Quiet, and who asked for it.
+     *
+     * Two things want the tuner muted and they must not undo each other: the
+     * user pressing mute, and the band scan squelching a sweep across two
+     * hundred channels of noise. Kept as two flags rather than one, because a
+     * scan that ends by unmuting has just overridden a decision the user made
+     * before it started.
+     *
+     * The chip is muted when either is set. `muted` is the one to draw.
+     */
+    bool     muted;          /* the user asked for it */
+    bool     squelched;      /* something is sweeping the band */
+    bool     mute_ok;        /* the card publishes the control at all */
+
     /* Region and decoded RDS */
     const en_region_t *region;
     en_rds_t rds;
@@ -132,6 +147,17 @@ void rp_act_presets_save(void);
 void rp_act_step(bool up);
 void rp_act_seek(bool up);
 void rp_act_power(bool on);
+
+/*
+ * Mute, and squelch, which are the same bit in the chip and different
+ * decisions above it. Both are safe to call when the platform has no mute:
+ * they set the flag so the UI stays consistent and do nothing to the hardware.
+ *
+ * Neither persists. A radio that comes back silent because it was silent last
+ * week is a radio nobody can fix.
+ */
+void rp_act_mute(bool on);
+void rp_act_squelch(bool on);
 
 /* Auto, forced mono, or forced stereo. Forced mono is the useful one: a weak
    station is steadier in mono than blending in and out of it. */

@@ -224,6 +224,14 @@ static void bring_up(void)
     rp_model.tuner_ok = (te == EN_TUNER_OK);
     rp_model.tuner_note = en_tuner_strerror(te);
     rp_model.can_raw = rp_model.tuner_ok && en_tuner_can_raw();
+
+    /*
+     * Asked rather than assumed. The control comes from the machine driver,
+     * so a card built before it exists answers negative - and the UI is
+     * expected to leave the affordance off rather than offer one that does
+     * nothing.
+     */
+    rp_model.mute_ok = rp_model.tuner_ok && en_tuner_muted() >= 0;
     /* The driver exposes fm_seek, so the chip does the finding. */
     rp_model.can_seek = rp_model.tuner_ok;
 
@@ -536,6 +544,31 @@ void rp_act_power(bool on)
 {
     rp_model.powered = on;
     if (rp_model.tuner_ok) en_tuner_power(on);
+}
+
+/*
+ * One bit in the chip, two reasons to set it.
+ *
+ * The flags are updated whether or not the hardware takes it, so the UI shows
+ * what was asked for on a card that has no such control. That is the honest
+ * way round: the alternative is a mute button that silently does not latch.
+ */
+static void mute_apply(void)
+{
+    if (rp_model.mute_ok)
+        en_tuner_mute(rp_model.muted || rp_model.squelched);
+}
+
+void rp_act_mute(bool on)
+{
+    rp_model.muted = on;
+    mute_apply();
+}
+
+void rp_act_squelch(bool on)
+{
+    rp_model.squelched = on;
+    mute_apply();
 }
 
 void rp_act_record_toggle(void)

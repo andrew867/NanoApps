@@ -266,6 +266,11 @@ void rp_act_step(bool up)
 void rp_act_seek(bool up) { rp_act_step(up); }
 void rp_act_power(bool on) { rp_model.powered = on; }
 
+/* No tuner behind this build, so these are the flags and nothing else - which
+   is enough for the preview to draw the state it would be in. */
+void rp_act_mute(bool on)    { rp_model.muted = on; }
+void rp_act_squelch(bool on) { rp_model.squelched = on; }
+
 void rp_act_record_toggle(void)
 {
     s_recording = !s_recording;
