@@ -93,6 +93,7 @@ static lv_obj_t *s_live_fill, *s_live_lbl, *s_rec_dot, *s_rec_lbl;
 static lv_obj_t *s_band_lbl, *s_rec_btn_lbl, *s_tl_lbl, *s_tr_lbl;
 static lv_obj_t *s_clock;
 static lv_obj_t *s_keep_btn, *s_keep_lbl;
+static lv_obj_t *s_mute_btn, *s_mute_lbl;
 
 /* the simple screen */
 static lv_obj_t *s_simple_grid, *s_simple_empty;
@@ -798,6 +799,24 @@ static void on_af_tap(lv_event_t *e)
     rp_act_af_follow(!rp_model.af.enabled);
 }
 
+/*
+ * Mute.
+ *
+ * This toggles the user's mute and nothing else. The band scan sets its own
+ * squelch flag and the chip is silent while either is set, so a scan finishing
+ * cannot unmute a radio that was silenced before it started - and this button
+ * cannot un-squelch a sweep that is still running, which would be a control
+ * lying about what it did.
+ *
+ * The glyph follows rp_model.muted rather than the audio, for the same reason.
+ * During a scan the progress bar already says why nothing is coming out.
+ */
+static void on_mute_tap(lv_event_t *e)
+{
+    (void)e;
+    rp_act_mute(!rp_model.muted);
+}
+
 static void on_stereo_tap(lv_event_t *e)
 {
     (void)e;
@@ -857,6 +876,34 @@ static void build_now(void)
 
     s_unit = label(s, "MHz", F_UNIT, C_TEXT_MUTE);
     lv_obj_set_pos(s_unit, RP_SCREEN_W - MARGIN - 42, 82);
+
+    /*
+     * Mute, in the corner of the frequency block.
+     *
+     * Not on the pill row with STEREO and AF, which is where a fourth pill
+     * would belong semantically: that row is full. STEREO already reaches the
+     * TRAFFIC pill when it reads "ST FORCED", and adding a fourth chip to the
+     * thirty-odd pixels left over would be a layout that survives until the
+     * first long string.
+     *
+     * Here instead, above the unit and clear of everything: the frequency
+     * label stops at MARGIN + CONTENT_W - 40, the unit sits below at y 82, and
+     * this is the rectangle between them. It is also where the control belongs
+     * on a radio - beside the dial, not three screens into a settings list -
+     * which is the same argument the AF badge is a control for.
+     *
+     * The extended click area is what makes a 40x30 chip a finger target
+     * without a 44 px hole in the layout.
+     */
+    s_mute_btn = panel(s, RP_SCREEN_W - MARGIN - 40, 48, 40, 30, C_SURFACE);
+    lv_obj_set_style_radius(s_mute_btn, 3, 0);
+    lv_obj_add_flag(s_mute_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_mute_btn, on_mute_tap, LV_EVENT_CLICKED, 0);
+    lv_obj_set_style_bg_color(s_mute_btn, lv_color_hex(C_SURFACE_2),
+                              LV_STATE_PRESSED);
+    lv_obj_set_ext_click_area(s_mute_btn, 10);
+    s_mute_lbl = label(s_mute_btn, LV_SYMBOL_VOLUME_MAX, F_BODY, C_TEXT_DIM);
+    lv_obj_center(s_mute_lbl);
 
     /* Station name, from RDS. Falls back to nothing rather than to a
        placeholder: an empty line reads as "not yet", where "Unknown" reads as
@@ -1073,6 +1120,30 @@ static void refresh_now(void)
                  rp_model.af.phase == EN_AF_TRYING ? C_TA : C_RDS);
     }
     pill_set(s_ta_badge, rp_model.rds.ta, C_TA);
+
+    /*
+     * Mute.
+     *
+     * Hidden outright when the card does not publish the control, rather than
+     * shown and inert - the same rule the LIVE button follows, and the same one
+     * the register explorer follows on a backend that cannot do raw access.
+     *
+     * Amber and not the recording red: the radio being silenced is a state the
+     * listener chose and can see they chose, which is what amber already means
+     * on this screen for forced mono. Red on this screen means a recording is
+     * running and should keep meaning only that.
+     */
+    if (s_mute_btn) {
+        show(s_mute_btn, rp_model.mute_ok);
+        if (rp_model.mute_ok && s_mute_lbl) {
+            lv_label_set_text(s_mute_lbl, rp_model.muted ? LV_SYMBOL_MUTE
+                                                         : LV_SYMBOL_VOLUME_MAX);
+            lv_obj_set_style_text_color(s_mute_lbl,
+                lv_color_hex(rp_model.muted ? C_TA : C_TEXT_DIM), 0);
+            lv_obj_set_style_bg_color(s_mute_btn,
+                lv_color_hex(rp_model.muted ? C_SURFACE_2 : C_SURFACE), 0);
+        }
+    }
 
     /* The buffer strip. How much has been captured, and where in it the
        headphones are - which is the same picture whether that is the live edge

@@ -159,6 +159,11 @@ void rp_model_refresh(void)
         rp_model.behind_max_ms = 30000;
         rp_model.play_ok = true;
         rp_model.can_raw = true;
+        /* The preview exists to show the layout the device would draw, and the
+           mute button hides itself on a card that has no such control - so
+           without this the one screen that could have caught a collision in it
+           never renders it. */
+        rp_model.mute_ok = true;
         rp_model.backend = "bcm2078-bt at /sys/devices/platform/soc/bcm2078";
         rp_model.capture_backend = "tinyalsa hw:0,1  44100 Hz 2 ch  30s buffer";
 
