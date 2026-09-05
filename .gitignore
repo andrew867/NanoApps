@@ -9,3 +9,9 @@ tools/dependencies/*/target/
 *.bin
 *.elf
 *.o
+
+# The importer's product-name patterns. Deliberately not tracked: the tool
+# exists to strip those names, and carrying them in the repository would
+# publish them in every clone. See the note beside _PRODUCTS_FILE in
+# apps/entrain/tools/import-freqsets.py.
+apps/entrain/tools/strip-products.txt

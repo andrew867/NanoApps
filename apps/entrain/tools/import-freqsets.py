@@ -21,6 +21,10 @@ Names are sanitised: any '|' becomes '/', and the originating products are not
 named, per the archive's own convention of describing what a thing is rather
 than whose it was. The frequency data is carried through unchanged.
 
+The patterns that do that last part are not in this repository - see the note
+above _PRODUCTS_FILE. Without them this refuses to run rather than producing a
+bundle with the names left in.
+
     python3 import-freqsets.py <sessions-dir> -o ../../../data/Entrain/frequencies.set
 """
 
@@ -31,22 +35,78 @@ import os
 import re
 import sys
 
-# Bracketed suffixes naming the source product, and the "via X" trailers that
-# do the same job. Removed from the title; the numbers are what is being
-# imported, not the provenance.
-_STRIP_PATTERNS = [
-    re.compile(r"\s*\((?:[^()]*\b(?:halo|spooky|s2d|scalar|dh|jw|mw)\b[^()]*)\)\s*", re.I),
+# Trailers and boilerplate that carry no information, removed from the title.
+# Nothing here names anything; the patterns that do are loaded separately.
+_GENERIC_PATTERNS = [
     re.compile(r"\s*\bvia\b[^,()]*$", re.I),
     re.compile(r"\s*\[[^\]]*\]\s*"),
-    # The product name also turns up bare in a few titles, not only inside a
-    # bracketed suffix.
-    re.compile(r"\b(?:spooky ?2?|aha ?halo|halo)\b", re.I),
     re.compile(r"\s*\(SS\)\s*"),
     # Boilerplate carried by 181 of the 416 titles. It distinguishes nothing
     # and ate the name budget, which is why so many were truncating mid-word.
     re.compile(r"\s*[-–]?\s*\bCorrection\s*(?:and|&)\s*Balance\b", re.I),
     re.compile(r"\s*\(no Meds?\)\s*", re.I),
 ]
+
+# The patterns that match the originating products by name, kept OUT of this
+# file and out of the repository.
+#
+# This tool exists to strip those names, and a stripper that carries its
+# targets in its own source publishes them in every clone of the project -
+# which is the thing the convention was trying to avoid, achieved backwards.
+# The archive's own policy is to describe what a thing is rather than whose it
+# was, and that has to apply to the importer as much as to the output.
+#
+# So they live in a sibling file that .gitignore excludes: one regex per line,
+# blank lines and # comments skipped. Written once on a machine that has the
+# archive, and never needing to change again.
+#
+#     # strip-products.txt
+#     \s*\((?:[^()]*\b(?:<short forms and initials>)\b[^()]*)\)\s*
+#     \b(?:<the product names, alternated>)\b
+#
+# Absent, this refuses rather than proceeding. A run that quietly skipped the
+# scrubbing would produce a bundle with the names baked in, and the bundle is
+# exactly the artefact that gets committed and shipped - so the failure has to
+# be loud, and it has to come before the writing rather than after it.
+_PRODUCTS_FILE = "strip-products.txt"
+
+
+def load_product_patterns(path, allow_missing):
+    """The name-stripping patterns, or None to mean "stop"."""
+    if not os.path.exists(path):
+        if allow_missing:
+            sys.stderr.write(
+                "warning: %s is absent and --allow-unscrubbed was given.\n"
+                "         Titles will keep whatever names they arrived with.\n"
+                % path)
+            return []
+        sys.stderr.write(
+            "error: %s not found.\n\n"
+            "  It holds the patterns that strip the originating products'\n"
+            "  names out of set titles, and it is deliberately not in the\n"
+            "  repository - see the note in this script. Write it once, on a\n"
+            "  machine that has the archive: one regex per line, # comments\n"
+            "  and blank lines skipped.\n\n"
+            "  To import anyway, leaving the names in, pass\n"
+            "  --allow-unscrubbed.\n" % path)
+        return None
+
+    out = []
+    with open(path, "r", encoding="utf-8") as f:
+        for n, line in enumerate(f, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                out.append(re.compile(line, re.I))
+            except re.error as e:
+                sys.stderr.write("%s:%d: bad pattern: %s\n" % (path, n, e))
+                return None
+    return out
+
+
+# Generic only until main() adds the product patterns to it.
+_STRIP_PATTERNS = list(_GENERIC_PATTERNS)
 
 MAX_STEPS = 96          # must match EN_FREQSET_MAX_STEPS in core/freqset.h
 MAX_NAME = 56           # must match EN_FREQSET_NAME_MAX
@@ -73,7 +133,24 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("sessions", help="directory of *.frequency_session.json")
     ap.add_argument("-o", "--out", required=True)
+    ap.add_argument("--products", default=None,
+                    help="patterns that strip product names "
+                         "(default: %s beside this script)"
+                         % _PRODUCTS_FILE)
+    ap.add_argument("--allow-unscrubbed", action="store_true",
+                    help="import with no product patterns, leaving "
+                         "whatever names the titles arrived with")
     args = ap.parse_args()
+
+    # Before anything is read, let alone written. The point of refusing is
+    # that no bundle exists to be committed by mistake.
+    global _STRIP_PATTERNS
+    products = args.products or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), _PRODUCTS_FILE)
+    loaded = load_product_patterns(products, args.allow_unscrubbed)
+    if loaded is None:
+        return 2
+    _STRIP_PATTERNS = list(_GENERIC_PATTERNS) + loaded
 
     files = sorted(glob.glob(os.path.join(args.sessions, "*.json")))
     if not files:
