@@ -281,6 +281,9 @@ void rp_act_step(bool up)
 }
 
 void rp_act_seek(bool up) { rp_act_step(up); }
+/* Nothing here is brought up, so nothing is ever waited for. */
+const char *rp_model_waiting(void) { return NULL; }
+
 void rp_act_power(bool on) { rp_model.powered = on; }
 
 /* No tuner behind this build, so these are the flags and nothing else - which

@@ -40,6 +40,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -115,23 +116,79 @@ static en_tuner_err_t attr_read(const char *name, char *buf, size_t n)
  *
  * Doing it here rather than in a launcher means the radio works when started by
  * hand, from a menu, or on boot, instead of only through one script.
+ *
+ * Two operations, and the difference between them is the whole of this file's
+ * startup behaviour.
+ *
+ *   ASKING is an ioctl that returns immediately. HCIGETDEVINFO hands back the
+ *   controller's flags and HCI_UP is bit zero of them.
+ *
+ *   RAISING is not. hci_bcm now carries HCI_QUIRK_NON_PERSISTENT_SETUP - it
+ *   has to, or a controller left DOWN keeps a serdev open with its receiver
+ *   enabled and buries the machine in interrupts - and the quirk means the
+ *   kernel re-runs hdev->setup() on every open. That is a 31 KB patchram
+ *   upload and a baud change, held under the device's request lock. HCIDEVUP
+ *   blocks for seconds.
+ *
+ * These used to be one call, which is why this app reported "no Bluetooth"
+ * while the boot script was still bringing the controller up: one attempt, at
+ * the wrong instant, and the answer latched. Now the asking is cheap enough to
+ * do several times a second and the raising happens on a thread of its own, so
+ * the interface keeps drawing while the radio comes up underneath it.
  */
 #define BT_AF_BLUETOOTH 31
 #define BT_PROTO_HCI    1
 #define BT_HCIDEVUP     _IOW('H', 201, int)
+#define BT_HCIGETDEVINFO 0x800448d3u   /* _IOR('H', 211, int) as EABI packs it */
 
-/* Why it could not be raised, for the message. The three cases want different
-   things done about them and lumping them together sends people to the wrong
-   place. */
+/*
+ * Only the front of what the kernel returns is named. Everything past the
+ * flags is left as padding rather than transcribed, because a field name
+ * guessed wrong here would be worse than no name at all and nothing in this
+ * app needs the rest.
+ */
+struct bt_dev_info {
+    uint16_t dev_id;
+    char     name[8];
+    uint8_t  bdaddr[6];
+    uint32_t flags;
+    uint8_t  rest[220];
+};
+
+/* Why it could not be raised, for the message. These want different things
+   done about them and lumping them together sends people to the wrong place. */
 typedef enum {
     HCI_IS_UP = 0,
     HCI_NO_SOCKETS,      /* kernel has the device but no AF_BLUETOOTH */
-    HCI_DOWN             /* sockets exist; the controller refused to come up */
+    HCI_DOWN,            /* sockets exist; the controller is not running */
+    HCI_ABSENT           /* no hci0 at all - the driver has not bound yet */
 } hci_state_t;
 
-static hci_state_t hci_up(void)
+/* One raise at a time, and never on the caller's thread. */
+static pthread_mutex_t s_hci_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool s_raising;
+
+/* 1 up, 0 down, negative if the question could not be put. */
+static int hci_flags_up(int fd)
 {
-    int fd = socket(BT_AF_BLUETOOTH, SOCK_RAW, BT_PROTO_HCI);
+    struct bt_dev_info di;
+
+    memset(&di, 0, sizeof di);
+    di.dev_id = 0;
+    if (ioctl(fd, BT_HCIGETDEVINFO, &di) < 0)
+        return -1;
+    return (di.flags & 1u) ? 1 : 0;
+}
+
+/* The cheap half. No side effects, safe to call as often as you like. */
+static hci_state_t hci_state(void)
+{
+    int fd, up;
+
+    if (access("/sys/class/bluetooth/hci0", F_OK) != 0)
+        return HCI_ABSENT;
+
+    fd = socket(BT_AF_BLUETOOTH, SOCK_RAW, BT_PROTO_HCI);
     if (fd < 0) {
         /* Observed on this device: hci0 is registered through serdev, but
            AF_BLUETOOTH is absent from /proc/net/protocols, so there is no
@@ -139,13 +196,77 @@ static hci_state_t hci_up(void)
         return HCI_NO_SOCKETS;
     }
 
-    int r = ioctl(fd, BT_HCIDEVUP, 0);
-    int err = errno;
+    up = hci_flags_up(fd);
     close(fd);
 
-    /* Already up is the common case and is success, not failure. */
-    if (r == 0 || err == EALREADY || err == EBUSY) return HCI_IS_UP;
-    return HCI_DOWN;
+    /*
+     * A controller that will not answer HCIGETDEVINFO is not up, whatever else
+     * is wrong with it. Reported as DOWN rather than as its own state because
+     * the thing to do about it is the same, and en_tuner_state will say more.
+     */
+    return up == 1 ? HCI_IS_UP : HCI_DOWN;
+}
+
+static void *hci_raise_worker(void *arg)
+{
+    int fd;
+
+    (void)arg;
+
+    fd = socket(BT_AF_BLUETOOTH, SOCK_RAW, BT_PROTO_HCI);
+    if (fd >= 0) {
+        /*
+         * The return is not trusted. HCIDEVUP starts a bring-up that can still
+         * fail partway through, and EALREADY means somebody else got there
+         * first, which is success. The next hci_state() is the answer either
+         * way, so this simply asks and does not interpret.
+         */
+        (void)ioctl(fd, BT_HCIDEVUP, 0);
+        close(fd);
+    }
+
+    pthread_mutex_lock(&s_hci_lock);
+    s_raising = false;
+    pthread_mutex_unlock(&s_hci_lock);
+    return NULL;
+}
+
+/*
+ * Start a raise if one is warranted and none is already running.
+ *
+ * Detached rather than joined: nothing waits for this. The caller polls
+ * hci_state() and finds out when it finds out, which is what keeps a
+ * multi-second patchram upload off the thread that is drawing the screen.
+ */
+static void hci_raise_async(void)
+{
+    pthread_t th;
+    pthread_attr_t at;
+
+    pthread_mutex_lock(&s_hci_lock);
+    if (s_raising) {
+        pthread_mutex_unlock(&s_hci_lock);
+        return;
+    }
+    s_raising = true;
+    pthread_mutex_unlock(&s_hci_lock);
+
+    if (pthread_attr_init(&at) != 0)
+        goto give_up;
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&th, &at, hci_raise_worker, NULL) != 0) {
+        pthread_attr_destroy(&at);
+        goto give_up;
+    }
+    pthread_attr_destroy(&at);
+    return;
+
+give_up:
+    /* No thread means no raise, and leaving the flag set would mean never
+       trying again. Better to be slow than to be permanently stuck. */
+    pthread_mutex_lock(&s_hci_lock);
+    s_raising = false;
+    pthread_mutex_unlock(&s_hci_lock);
 }
 
 /* ---- finding the device -------------------------------------------------- */
@@ -183,46 +304,72 @@ static bool find_dir(const char *root, int depth)
     return found;
 }
 
+/*
+ * Safe to call repeatedly, and meant to be.
+ *
+ * This used to return EN_TUNER_OK for every call after the first, on the
+ * strength of having found the sysfs directory once - so a caller that
+ * retried was told the tuner was fine while hci0 was still DOWN, and a caller
+ * that did not retry latched the first answer forever. Both were wrong in the
+ * same way: whether this app can talk to the tuner is not a fact about
+ * startup, it is a fact about right now.
+ *
+ * Two things are therefore separate. Finding the driver's sysfs directory is
+ * done once, because it does not move. The controller's state is re-read on
+ * every call, because it changes - the boot script raises hci0 at about the
+ * same moment this app starts, and which of them wins is a race nobody should
+ * be relying on.
+ *
+ * Raising is asynchronous, so this returns promptly whatever it finds. A
+ * caller that gets EN_TUNER_NOT_READY should call again shortly; the model
+ * does, until it either works or a long time has passed.
+ */
 en_tuner_err_t en_tuner_init(void)
 {
-    if (s_ready) return EN_TUNER_OK;
+    hci_state_t st;
+    const char *why;
 
-    if (!find_dir("/sys/devices", 0)) {
-        snprintf(s_desc, sizeof s_desc,
-                 "no tuner: bcm2078-bt did not bind (no fm_power in /sys)");
-        return EN_TUNER_NO_DEVICE;
+    if (!s_ready) {
+        if (!find_dir("/sys/devices", 0)) {
+            /*
+             * Not final either. The driver is built in and probes early, but
+             * "early" is not "before this app", and a message that says it
+             * did not bind is only true if it never does.
+             */
+            snprintf(s_desc, sizeof s_desc,
+                     "waiting for bcm2078-bt (no fm_power in /sys yet)");
+            return EN_TUNER_NO_DEVICE;
+        }
+        s_ready = true;
     }
-    s_ready = true;
 
-    /*
-     * The controller existing is not the same as it being usable, so bring it
-     * up rather than reporting on it: FM_RDS_Command rides on hci0 and every
-     * later call fails without it. If hci0 is missing entirely the Bluetooth
-     * driver has not bound and there is nothing to do about that from here.
-     *
-     * This call is not instant any more. hci_bcm now sets
-     * HCI_QUIRK_NON_PERSISTENT_SETUP, which is what stops the interrupt storm
-     * a down controller used to cause - but it also means the kernel re-runs
-     * hdev->setup() on every HCIDEVUP, so the ioctl below carries a 31 KB
-     * patchram upload and a baud change and blocks for seconds. It is called
-     * once, from init, and that is the reason to keep it there.
-     */
-    bool present = access("/sys/class/bluetooth/hci0", F_OK) == 0;
-    hci_state_t st = present ? hci_up() : HCI_DOWN;
+    st = hci_state();
 
-    const char *why = "";
-    if (!present)
-        why = "  (no hci0: the Bluetooth driver did not bind)";
-    else if (st == HCI_NO_SOCKETS)
+    /* Down and raiseable is the one case worth acting on. ABSENT means the
+       Bluetooth driver has not bound, and NO_SOCKETS means there is no way to
+       ask - neither is fixed by trying. */
+    if (st == HCI_DOWN)
+        hci_raise_async();
+
+    switch (st) {
+    case HCI_ABSENT:
+        why = "  (no hci0 yet: the Bluetooth driver has not bound)";
+        break;
+    case HCI_NO_SOCKETS:
         why = "  (hci0 is down and this kernel has no AF_BLUETOOTH to raise it)";
-    else if (st == HCI_DOWN)
-        why = "  (hci0 refused to come up)";
+        break;
+    case HCI_DOWN:
+        why = "  (hci0 is down; bringing it up)";
+        break;
+    default:
+        why = "";
+        break;
+    }
 
     snprintf(s_desc, sizeof s_desc, "bcm2078-bt at %s%s", s_dir, why);
 
-    if (st == HCI_IS_UP) return EN_TUNER_OK;
     s_hci_state = st;
-    return EN_TUNER_NOT_READY;
+    return st == HCI_IS_UP ? EN_TUNER_OK : EN_TUNER_NOT_READY;
 }
 
 void en_tuner_shutdown(void)
@@ -512,13 +659,20 @@ const char *en_tuner_strerror(en_tuner_err_t e)
     case EN_TUNER_OK:          return "ok";
     case EN_TUNER_NO_DEVICE:   return "no tuner found";
     case EN_TUNER_NOT_READY:
-        /* The fix differs per case, so the message does too. */
-        if (s_hci_state == 1)
+        /* The fix differs per case, so the message does too. This compared
+           against a bare 1 before, which happened to be HCI_NO_SOCKETS and
+           read as though it meant something else. */
+        switch ((hci_state_t)s_hci_state) {
+        case HCI_NO_SOCKETS:
             return "hci0 is down and this kernel has no Bluetooth sockets to "
                    "raise it. FM rides on hci0, so the tuner cannot answer "
                    "until the driver brings it up or the kernel gains "
                    "AF_BLUETOOTH.";
-        return "Bluetooth is down; FM rides on hci0";
+        case HCI_ABSENT:
+            return "waiting for the Bluetooth driver; FM rides on hci0";
+        default:
+            return "bringing up hci0; FM rides on it";
+        }
     case EN_TUNER_UNSUPPORTED: return "not supported on this platform";
     default:                   return "failed";
     }

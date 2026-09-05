@@ -203,6 +203,173 @@ static void failed(const char *why)
     if (s_prog.failed) s_prog.failed(why);
 }
 
+/* ---- bring-up, which is not a moment -------------------------------------- */
+
+/*
+ * Three things this app needs from the machine, none of which are guaranteed
+ * to exist at the instant it starts.
+ *
+ *   The tuner    bcm2078-bt's sysfs, and hci0 UP underneath it.
+ *   Capture      hw:0,1, which is IIS2 and is what clocks the tuner's audio.
+ *   Playback     hw:0,0, the headphone codec.
+ *
+ * All three arrive from things happening in parallel with this process: the
+ * sound modules are insmod'ed by a script, and hci0 is raised by another one.
+ * This used to be written as though startup were a single instant - one
+ * attempt at each, the answer latched into the model, and a driver that turned
+ * up two seconds later was indistinguishable from one that never would. That
+ * is what "no audio hardware" and then "no Bluetooth" on a machine where both
+ * were about to work actually was.
+ *
+ * So each is a stage that can be attempted repeatedly and is idempotent, and
+ * there are two cadences over them:
+ *
+ *   At startup, on the boot screen, every DEP_POLL_MS for up to DEP_WAIT_MS.
+ *   The screen says which one it is waiting for, and the dots keep moving.
+ *
+ *   Afterwards, quietly, every DEP_RETRY_MS forever. A tuner that appears a
+ *   minute in is configured and tuned exactly as it would have been at
+ *   startup, and the interface simply starts working. Nothing needs restarting
+ *   and nothing has to be latched.
+ *
+ * Both cadences are cheap: en_tuner_init() asks the controller its state with
+ * one ioctl and does any actual bring-up on its own thread, and the two PCM
+ * opens fail immediately when the card is absent.
+ */
+#define DEP_POLL_MS    250u
+#define DEP_WAIT_MS  20000u
+#define DEP_RETRY_MS  4000u
+
+static bool s_tuner_configured;
+static uint32_t s_bringup_ms;      /* when bring_up ran, for the cadence */
+static bool s_bringup_reported;    /* the deadline message, at most once */
+
+/*
+ * Everything the tuner needs told to it once, whenever it first answers.
+ *
+ * This is a separate function precisely because "whenever" is not "at
+ * startup". A controller that comes up late gets the same power-on, region,
+ * overrides, RDS state, stereo preference and remembered frequency as one that
+ * was ready before this app was.
+ */
+static void tuner_configure(void)
+{
+    en_tuner_power(true);
+    en_tuner_set_region(rp_model.region);
+
+    /* After the region, not before: a region write touches the control and
+       audio registers, so replaying first would let it undo a deliberate
+       override of either. */
+    for (uint8_t i = 0; i < s_settings.overrides.count; i++) {
+        const en_override_t *o = &s_settings.overrides.list[i];
+        en_tuner_reg_write(o->addr, o->data, o->len);
+    }
+
+    en_tuner_rds_enable(rp_model.rds_on);
+
+    /* Re-apply the stereo choice: it is a preference about a place - one weak
+       station you always want in mono - so it has to survive a power cycle
+       rather than reverting to auto every time the app starts.
+
+       This ran before rp_model.stereo_mode had been loaded from the settings,
+       so it always saw AUTO and the preference was never actually restored.
+       The settings are applied to the model up in bring_up() now, before
+       anything touches hardware. */
+    if (rp_model.stereo_mode != EN_FM_STEREO_AUTO)
+        rp_act_stereo_mode(rp_model.stereo_mode);
+
+    /* And back to where the listener was. rp_model.khz was decided during
+       bring-up from the settings and the presets, both of which are readable
+       with no hardware at all. */
+    if (rp_model.khz) en_tuner_tune(rp_model.khz);
+}
+
+static bool try_tuner(void)
+{
+    en_tuner_err_t te = en_tuner_init();
+
+    rp_model.backend = en_tuner_backend();
+    rp_model.tuner_note = en_tuner_strerror(te);
+    rp_model.tuner_ok = (te == EN_TUNER_OK);
+
+    if (rp_model.tuner_ok && !s_tuner_configured) {
+        s_tuner_configured = true;
+
+        rp_model.can_raw = en_tuner_can_raw();
+        /* The driver exposes fm_seek, so the chip does the finding. */
+        rp_model.can_seek = true;
+
+        tuner_configure();
+    }
+    return rp_model.tuner_ok;
+}
+
+/* Capture is started with the tuner rather than with the record button: the
+   SoC side of IIS2 is clocked by the capture PCM, so nothing is audible until
+   this is open. It is how the radio makes sound, not just how it is
+   recorded. */
+static bool try_capture(void)
+{
+    if (rp_model.capture_ok) return true;
+
+    rp_model.capture_ok = (en_cap_start(s_settings.live_seconds) == EN_CAP_OK);
+    rp_model.capture_backend = en_cap_backend();
+    return rp_model.capture_ok;
+}
+
+/* And the other half of the audio path. Capture clocks IIS2; the player
+   carries what arrives there to the headphones on IIS0. Without it the radio
+   is silent however well it is tuned. */
+static bool try_play(void)
+{
+    if (rp_model.play_ok) return true;
+
+    rp_model.play_ok = (en_play_start() == EN_PLAY_OK);
+    return rp_model.play_ok;
+}
+
+/*
+ * What is still missing, named the way somebody looking at the screen would
+ * name it. NULL when everything is here.
+ *
+ * Ordered by what blocks what: without the tuner there is nothing to hear,
+ * without capture the tuner's audio is not even clocked, and without playback
+ * it has nowhere to go. Reporting the first of those is reporting the cause
+ * rather than the cascade.
+ */
+static const char *dep_missing(void)
+{
+    if (!rp_model.tuner_ok)   return "waiting for the tuner";
+    if (!rp_model.capture_ok) return "waiting for the sound card";
+    if (!rp_model.play_ok)    return "waiting for audio out";
+    return NULL;
+}
+
+static void try_all(void)
+{
+    try_tuner();
+    try_capture();
+    try_play();
+
+    /*
+     * Whether the card publishes a mute control - asked rather than assumed,
+     * and asked again while the answer is still no.
+     *
+     * It belongs here rather than with the tuner's one-time configuration
+     * because it does not come from the tuner: "FM Tuner Mute" is published by
+     * the machine driver that also provides the PCMs, so it can appear after
+     * bcm2078-bt has answered. Probing it once, at whatever moment the tuner
+     * first replied, would latch a no - which is the same bug as the rest of
+     * this section, in the one place it would be least visible: a mute button
+     * that is simply absent looks like a design decision.
+     *
+     * This stops being asked when the retry stops, which is when everything
+     * else is up - and by then the card is present, so the answer is final.
+     */
+    if (rp_model.tuner_ok && !rp_model.mute_ok)
+        rp_model.mute_ok = en_tuner_muted() >= 0;
+}
+
 static void bring_up(void)
 {
     step("reading settings");
@@ -218,62 +385,16 @@ static void bring_up(void)
     rp_model.rds_on = s_settings.rds_on;
     en_rds_init(&rp_model.rds, rp_model.region ? rp_model.region->rbds : true);
 
-    step("tuner init");
-    en_tuner_err_t te = en_tuner_init();
-    rp_model.backend = en_tuner_backend();
-    rp_model.tuner_ok = (te == EN_TUNER_OK);
-    rp_model.tuner_note = en_tuner_strerror(te);
-    rp_model.can_raw = rp_model.tuner_ok && en_tuner_can_raw();
-
-    /*
-     * Asked rather than assumed. The control comes from the machine driver,
-     * so a card built before it exists answers negative - and the UI is
-     * expected to leave the affordance off rather than offer one that does
-     * nothing.
-     */
-    rp_model.mute_ok = rp_model.tuner_ok && en_tuner_muted() >= 0;
-    /* The driver exposes fm_seek, so the chip does the finding. */
-    rp_model.can_seek = rp_model.tuner_ok;
-
-    if (rp_model.tuner_ok) {
-        en_tuner_power(true);
-        en_tuner_set_region(rp_model.region);
-
-        /* After the region, not before: a region write touches the control and
-           audio registers, so replaying first would let it undo a deliberate
-           override of either. */
-        for (uint8_t i = 0; i < s_settings.overrides.count; i++) {
-            const en_override_t *o = &s_settings.overrides.list[i];
-            en_tuner_reg_write(o->addr, o->data, o->len);
-        }
-
-        en_tuner_rds_enable(rp_model.rds_on);
-        /* Re-apply the stereo choice: it is a preference about a place - one
-           weak station you always want in mono - so it has to survive a power
-           cycle rather than reverting to auto every time the app starts. */
-        if (rp_model.stereo_mode != EN_FM_STEREO_AUTO)
-            rp_act_stereo_mode(rp_model.stereo_mode);
-    }
-
-    /* Capture is started with the tuner rather than with the record button:
-       the SoC side of IIS2 is clocked by the capture PCM, so nothing is
-       audible until this is open. It is how the radio makes sound, not just
-       how it is recorded. */
-    en_cap_err_t ce = en_cap_start(s_settings.live_seconds);
-    rp_model.capture_ok = (ce == EN_CAP_OK);
-    rp_model.capture_backend = en_cap_backend();
-
-    /* And the other half of the audio path. Capture clocks IIS2; the player
-       carries what arrives there to the headphones on IIS0. Without it the
-       radio is silent however well it is tuned. */
-    step("audio out");
-    rp_model.play_ok = (en_play_start() == EN_PLAY_OK);
-    if (!rp_model.play_ok) failed("no playback device");
+    /* Preferences into the model before anything touches hardware, because
+       tuner_configure() reads them back out. */
     rp_model.ta_record = s_settings.ta_record;
     rp_model.stereo_mode = s_settings.stereo_mode;
     rp_model.simple_screen = s_settings.simple_screen;
     rp_model.wide_screen = s_settings.wide_screen;
 
+    /* Files, which need no drivers and no waiting. Doing them first means the
+       screen behind the boot overlay is already furnished when the hardware
+       arrives, and it is what decides the frequency below. */
     presets_load();
     library_scan();
 
@@ -284,9 +405,58 @@ static void bring_up(void)
     if (!start || !en_region_on_grid(rp_model.region, start))
         start = rp_model.presets.count ? rp_model.presets.list[0].khz
                                        : (rp_model.region ? rp_model.region->low_khz : 0);
-
     rp_model.khz = start;
-    if (rp_model.tuner_ok && start) en_tuner_tune(start);
+
+    step("tuner init");
+    s_bringup_ms = now_ms();
+    try_all();
+
+    /*
+     * And that is all bring-up does. It does not wait.
+     *
+     * An earlier version of this sat in a sleep loop here until everything had
+     * arrived, which fixed the race and introduced a worse bug: the caller is
+     * the thread that reads the buttons, so for the length of the wait the
+     * device ignored every one of them. Twenty seconds of a radio that cannot
+     * be quit is not an improvement on a radio that started too early.
+     *
+     * The waiting is the caller's, through rp_model_waiting(). Everything
+     * about how often to retry and how long to keep saying so stays here.
+     */
+}
+
+/*
+ * What the caller should put on the boot screen, or NULL to stop waiting.
+ *
+ * Two ways to stop: everything arrived, or the deadline passed. Past the
+ * deadline this returns NULL and the interface opens anyway - the retry in
+ * rp_model_refresh does not stop, so a tuner that turns up a minute later
+ * still works, and a radio the user can hold is better than a boot screen with
+ * a promise on it.
+ */
+const char *rp_model_waiting(void)
+{
+    const char *missing = dep_missing();
+
+    if (!missing) return NULL;
+
+    if (now_ms() - s_bringup_ms < DEP_WAIT_MS)
+        return missing;
+
+    /*
+     * The deadline. Said once, as a state rather than a verdict: the note
+     * names what is missing, and the retry is still running behind it.
+     */
+    if (!s_bringup_reported) {
+        s_bringup_reported = true;
+        if (!rp_model.tuner_ok && rp_model.tuner_note)
+            failed(rp_model.tuner_note);
+        else if (!rp_model.capture_ok)
+            failed("no sound card yet - still trying");
+        else
+            failed("no audio out yet - still trying");
+    }
+    return NULL;
 }
 
 /* ---- the sidecar ---------------------------------------------------------- */
@@ -323,11 +493,34 @@ static void sidecar_close(uint32_t duration_ms)
 void rp_model_refresh(void)
 {
     static bool up;
-    static uint32_t last_slow, last_rds;
+    static uint32_t last_slow, last_rds, last_dep;
 
     if (!up) { up = true; bring_up(); }
 
     uint32_t t = now_ms();
+
+    /*
+     * Keep trying for anything that was not there at startup.
+     *
+     * This is what makes the startup wait a courtesy rather than a deadline: a
+     * sound card or a controller that turns up a minute in is picked up here,
+     * configured exactly as it would have been, and the interface starts
+     * working with nothing restarted. capture_ok is re-derived from the
+     * capture thread further down, so this also recovers a capture that died
+     * rather than one that never started.
+     */
+    {
+        /* Quick while the boot screen is still waiting on something, and
+           unhurried once the interface is open - the fast cadence exists to
+           make startup feel immediate, and after that a few seconds either way
+           is invisible. */
+        uint32_t every = (t - s_bringup_ms < DEP_WAIT_MS) ? DEP_POLL_MS
+                                                          : DEP_RETRY_MS;
+        if (t - last_dep >= every && dep_missing()) {
+            last_dep = t;
+            try_all();
+        }
+    }
 
     /* Signal and frequency, a few times a second. Each of these is a driver
        round trip and nothing on screen changes faster. */

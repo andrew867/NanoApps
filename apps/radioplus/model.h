@@ -128,6 +128,19 @@ typedef struct {
 
 void rp_model_set_progress(const rp_progress_t *p);
 
+/*
+ * What the platform is still waiting for, or NULL when it has stopped waiting.
+ *
+ * Called from the startup loop while the boot screen is up: as long as this
+ * returns a string, show it and keep pumping. It stops returning one when
+ * everything has arrived or when the platform has decided it has waited long
+ * enough - and in the second case the platform keeps retrying in the
+ * background, so a device that turns up late still works without a restart.
+ *
+ * The string is owned by the platform and is safe to display, not to keep.
+ */
+const char *rp_model_waiting(void);
+
 /* Actions the UI invokes. Implemented per platform. */
 void rp_act_tune(uint32_t khz);
 

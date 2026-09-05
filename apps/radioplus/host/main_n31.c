@@ -260,13 +260,16 @@ int main(int argc, char **argv)
     open_keys();
 
     /*
-     * Something on the screen before the slow part, not after it.
+     * Something on the screen before anything else.
      *
-     * The first rp_model_refresh brings up the tuner and both halves of the
-     * audio path, which takes seconds - and until this was here, none of the
-     * real screens existed yet, so the panel kept whatever the launcher had
-     * left on it for the whole of that. A device that looks like it did not
-     * start is indistinguishable from one that did not.
+     * Until this was here the panel kept whatever the launcher had left on it
+     * until the first real screen existed, and a device that looks like it did
+     * not start is indistinguishable from one that did not.
+     *
+     * The first rp_model_refresh is quick now - it reads the settings and the
+     * presets, then asks the hardware once and returns whatever it finds. The
+     * waiting, if there is any, happens further down where the buttons still
+     * work.
      */
     rp_ui_boot("starting");
 
@@ -275,9 +278,52 @@ int main(int argc, char **argv)
 
     rp_model_refresh();
 
+    /*
+     * The interface is built before the wait, not after it.
+     *
+     * Nothing in rp_ui_init needs hardware - it draws presets and recordings,
+     * both of which came off the filesystem during bring-up - so there is no
+     * reason to make the listener wait for a radio before they can have the
+     * screens. Building first means the buttons do something, every screen is
+     * ready the instant a driver turns up, and the boot screen becomes a cover
+     * over a working interface rather than a substitute for one.
+     */
+    rp_ui_init();
+
+    /*
+     * Then wait on top of it for whatever has not arrived.
+     *
+     * The drivers this needs are loaded by scripts running alongside this
+     * process - the sound modules a few seconds into boot, hci0 raised by
+     * another - so which of us gets there first is a race, and losing it used
+     * to be permanent: one attempt, at the wrong instant, and "no audio
+     * hardware" and "no Bluetooth" latched into a model that never asked
+     * again.
+     *
+     * The platform says what it is still waiting for and decides when to give
+     * up saying it. Three things end this loop: everything arrives, the
+     * platform's deadline passes, or the listener presses something and goes
+     * to a screen of their own - which is why pump_keys is in here. A wait
+     * that ignores the buttons is a device that has hung, and this one can
+     * legitimately last twenty seconds.
+     *
+     * Whatever ends it, the retry inside rp_model_refresh keeps going, so a
+     * tuner that appears a minute from now still works.
+     */
+    if (rp_model_waiting()) rp_ui_boot_show();
+
+    for (const char *what;
+         !s_quit && rp_ui_booting() && (what = rp_model_waiting()) != NULL; ) {
+        pump_keys();
+        rp_ui_boot(what);
+        usleep(120000);
+        rp_model_refresh();
+        rp_ui_tick();
+    }
+
     /* Nothing more to report; the real screens say the rest themselves. */
     rp_model_set_progress(NULL);
-    rp_ui_init();
+    if (rp_ui_booting()) rp_ui_show(RP_SCREEN_NOW);
 
     printf("radioplus: %s\n", rp_model.backend ? rp_model.backend : "?");
     printf("radioplus: %s\n",
