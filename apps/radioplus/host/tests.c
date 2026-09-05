@@ -23,6 +23,8 @@
 #include "../core/scan.h"
 #include "../core/timer.h"
 #include "../core/affollow.h"
+#include "../core/ctscan.h"
+#include "../core/rdsname.h"
 
 static int checks, failures;
 
@@ -1646,6 +1648,223 @@ static uint32_t af_run(en_affollow_t *a, uint32_t ms, uint32_t khz,
     return 0;
 }
 
+
+/* ---- the clock, as a number ----------------------------------------------- */
+
+static void test_rds_ct_unix(void)
+{
+    section("RDS clock time as seconds");
+
+    en_rds_t r;
+    en_rds_init(&r, true);
+
+    /*
+     * MJD 51544 is 1 January 2000, whose Unix time is 946684800 - a number
+     * worth checking against something other than this code, and one everybody
+     * remembers from a different reason.
+     */
+    const uint32_t mjd = 51544;
+    uint16_t b = (uint16_t)(blkb(4, false, false, 0, 0)
+                            | (uint16_t)((mjd >> 15) & 0x03u));
+    uint16_t c = (uint16_t)(((mjd & 0x7FFFu) << 1) | (12u >> 4));
+    uint16_t d = (uint16_t)(((uint16_t)(12u & 0x0Fu) << 12)
+                            | ((uint16_t)34u << 6));
+    uint16_t blk[4] = { 0xC2B5, b, c, d };
+
+    CHECK(en_rds_ct_unix(&r) == 0, "no clock yet should be zero, not a date");
+
+    en_rds_group(&r, blk, EN_RDS_ALL);
+    printf("  MJD %u 12:34 UTC -> %lld\n", mjd, (long long)en_rds_ct_unix(&r));
+    CHECK(en_rds_ct_unix(&r) == 946684800LL + 12 * 3600 + 34 * 60,
+          "2000-01-01 12:34 UTC should be 946684800 plus the time of day");
+
+    CHECK(r.ct_groups == 1, "one clock group should have been counted");
+
+    /*
+     * The offset must NOT reach the epoch value. This is the whole reason the
+     * transmitted fields are kept alongside the localised ones: a hardware
+     * clock holding local time is wrong twice a year, and the same instant
+     * transmitted from two time zones has to produce the same number.
+     */
+    en_rds_t west;
+    en_rds_init(&west, true);
+    uint16_t dw = (uint16_t)(d | 0x0020u | 7u);      /* -3:30 */
+    uint16_t blkw[4] = { 0xC2B5, b, c, dw };
+    en_rds_group(&west, blkw, EN_RDS_ALL);
+    printf("  same instant at -3:30 -> %lld (local %02u:%02u)\n",
+           (long long)en_rds_ct_unix(&west), west.ct_hour, west.ct_minute);
+    CHECK(en_rds_ct_unix(&west) == en_rds_ct_unix(&r),
+          "the local offset must not change the instant");
+    CHECK(west.ct_hour == 9 && west.ct_minute == 4,
+          "and it must still change what is displayed");
+
+    CHECK(en_rds_ct_unix(0) == 0, "a null decoder is not a date");
+}
+
+/* ---- what the numbers mean ------------------------------------------------ */
+
+static void test_rdsname(void)
+{
+    section("RDS field names");
+
+    char buf[64];
+
+    /* Every one of the thirty-two says something. A hole in that table is a
+       blank line on the inspector where a group count should be. */
+    int named = 0;
+    for (uint8_t t = 0; t < 16; t++) {
+        for (uint8_t v = 0; v < 2; v++) {
+            const char *n = en_rds_group_name(t, v != 0);
+            if (n && n[0] && n[0] != '?') named++;
+        }
+    }
+    CHECK(named == 32, "only %d of 32 group types are named", named);
+
+    en_rds_group_label(0, false, buf, sizeof buf);
+    CHECK(strcmp(buf, "0A") == 0, "group 0A labelled \"%s\"", buf);
+    en_rds_group_label(15, true, buf, sizeof buf);
+    CHECK(strcmp(buf, "15B") == 0, "group 15B labelled \"%s\"", buf);
+    en_rds_group_label(4, false, buf, sizeof buf);
+    CHECK(strcmp(buf, "4A") == 0, "group 4A labelled \"%s\"", buf);
+
+    /*
+     * Call signs. The two ranges are each exactly 26^3 wide and butt against
+     * each other, so the boundaries are where an off-by-one would show: 0x1000
+     * is the first K and 0x54A8 is the first W.
+     */
+    CHECK(en_rds_callsign(0x1000, buf, sizeof buf), "0x1000 should be a call");
+    printf("  0x1000 -> %s\n", buf);
+    CHECK(strcmp(buf, "KAAA") == 0, "0x1000 gave \"%s\", expected KAAA", buf);
+
+    CHECK(en_rds_callsign(0x54A8, buf, sizeof buf), "0x54A8 should be a call");
+    printf("  0x54A8 -> %s\n", buf);
+    CHECK(strcmp(buf, "WAAA") == 0, "0x54A8 gave \"%s\", expected WAAA", buf);
+
+    CHECK(en_rds_callsign(0x54A7, buf, sizeof buf), "0x54A7 should be a call");
+    CHECK(buf[0] == 'K' && strcmp(buf, "KZZZ") == 0,
+          "the last K should be KZZZ, got \"%s\"", buf);
+
+    CHECK(!en_rds_callsign(0x0FFF, buf, sizeof buf),
+          "below the K range is not a call sign");
+    CHECK(!en_rds_callsign(0x9950, buf, sizeof buf),
+          "above the W range is not a call sign");
+    CHECK(!en_rds_callsign(0xC2B5, buf, sizeof buf),
+          "a Canadian PI does not encode a call sign");
+    CHECK(!en_rds_callsign(0x1000, buf, 4), "a short buffer must be refused");
+
+    /* PI, taken apart. */
+    CHECK(en_rds_pi_country(0xC2B5) == 0xC, "country nibble");
+    CHECK(en_rds_pi_coverage(0xC2B5) == 0x2, "coverage nibble");
+    CHECK(en_rds_pi_reference(0xC2B5) == 0xB5, "reference byte");
+    CHECK(strcmp(en_rds_coverage_name(0), "Local") == 0, "coverage 0");
+    CHECK(strcmp(en_rds_coverage_name(2), "National") == 0, "coverage 2");
+    CHECK(strcmp(en_rds_coverage_name(4), "Regional 1") == 0, "coverage 4");
+    CHECK(strcmp(en_rds_coverage_name(15), "Regional 12") == 0, "coverage 15");
+
+    /* Decoder identification. Nothing set is a real answer and must not be a
+       blank, which would read as "not decoded yet". */
+    en_rds_di_text(0, buf, sizeof buf);
+    printf("  DI 0 -> %s\n", buf);
+    CHECK(buf[0] != 0, "no DI bits should still say something");
+
+    en_rds_di_text(0x8, buf, sizeof buf);
+    printf("  DI 8 -> %s\n", buf);
+    CHECK(strstr(buf, "Stereo") != 0, "bit 3 is the stereo bit");
+
+    en_rds_di_text(0xF, buf, sizeof buf);
+    printf("  DI F -> %s\n", buf);
+    CHECK(strstr(buf, "Stereo") && strstr(buf, "Dynamic"),
+          "all four bits should all be listed");
+
+    /* A truncating buffer must still terminate. */
+    char tiny[8];
+    en_rds_di_text(0xF, tiny, sizeof tiny);
+    CHECK(tiny[sizeof tiny - 1] == 0, "DI text overran a small buffer");
+
+    CHECK(en_rds_oda_name(0x4BD7) != 0, "RadioText+ should be named");
+    CHECK(en_rds_oda_name(0x0001) == 0, "an unknown AID should not be invented");
+}
+
+/* ---- collecting the time off the band ------------------------------------- */
+
+/* One clock group, built by hand, for whatever station is pretending to be on
+   the air in these tests. */
+static void feed_ct(en_rds_t *r, uint32_t mjd, uint8_t hh, uint8_t mm)
+{
+    uint16_t b = (uint16_t)(blkb(4, false, false, 0, 0)
+                            | (uint16_t)((mjd >> 15) & 0x03u));
+    uint16_t c = (uint16_t)(((mjd & 0x7FFFu) << 1) | (hh >> 4));
+    uint16_t d = (uint16_t)(((uint16_t)(hh & 0x0Fu) << 12)
+                            | ((uint16_t)mm << 6));
+    uint16_t blk[4] = { 0xC2B5, b, c, d };
+    en_rds_group(r, blk, EN_RDS_ALL);
+}
+
+static void test_ctscan(void)
+{
+    section("clock scan");
+
+    en_ctscan_t s;
+    en_rds_t r;
+    uint32_t cand[3] = { 88100, 97500, 102900 };
+    uint32_t khz = 0;
+
+    en_rds_init(&r, true);
+    CHECK(!en_ctscan_start(&s, cand, 0, 98500), "no candidates is not a scan");
+    CHECK(en_ctscan_start(&s, cand, 3, 98500), "three candidates should start");
+    CHECK(s.phase == EN_CTSCAN_RUNNING, "should be running");
+
+    /* Nothing on the first station for ten seconds. */
+    for (int i = 0; i < 100; i++)
+        CHECK(en_ctscan_tick(&s, 100, &r, &khz) == EN_CTSCAN_WAIT,
+              "silence should not move the scan");
+    CHECK(!s.hits[0].got, "nothing was transmitted, so nothing was collected");
+
+    /* Then it speaks. */
+    feed_ct(&r, 51544, 12, 34);
+    CHECK(en_ctscan_tick(&s, 100, &r, &khz) == EN_CTSCAN_TUNE,
+          "an answer should move to the next station");
+    CHECK(khz == 97500, "should have moved to the second candidate");
+    CHECK(s.hits[0].got, "the first station's time was not recorded");
+    printf("  station 1 said %lld, age %u ms\n",
+           (long long)s.hits[0].unix_utc, en_ctscan_age_ms(&s, 0));
+    CHECK(s.hits[0].unix_utc == 946684800LL + 12 * 3600 + 34 * 60,
+          "the recorded instant is wrong");
+
+    /*
+     * The critical one. The decoder still holds the first station's clock, and
+     * ct_valid is still true - so a scan that asked "does it have a time"
+     * would credit station two with station one's answer immediately. Only the
+     * group counter moving means this station spoke.
+     */
+    for (int i = 0; i < 50; i++) en_ctscan_tick(&s, 100, &r, &khz);
+    CHECK(!s.hits[1].got,
+          "station two was credited with station one's clock");
+
+    /* The age keeps growing, and the corrected time grows with it. */
+    int64_t at_first = en_ctscan_now(&s, 0);
+    for (int i = 0; i < 100; i++) en_ctscan_tick(&s, 100, &r, &khz);
+    printf("  ten seconds later it reads %lld (was %lld)\n",
+           (long long)en_ctscan_now(&s, 0), (long long)at_first);
+    CHECK(en_ctscan_now(&s, 0) == at_first + 10,
+          "ten seconds of ticking should add ten seconds to the answer");
+
+    /* A station that never answers is left after the dwell, and the scan ends
+       having gone back where it started. */
+    while (s.phase == EN_CTSCAN_RUNNING) en_ctscan_tick(&s, 1000, &r, &khz);
+    CHECK(s.phase == EN_CTSCAN_DONE, "the scan should finish on its own");
+    CHECK(khz == 98500, "it should end by tuning back");
+    CHECK(!s.hits[1].got && !s.hits[2].got,
+          "silent stations should not have collected anything");
+    CHECK(en_ctscan_percent(&s) == 100, "a finished scan is 100 per cent");
+    CHECK(en_ctscan_now(&s, 1) == 0, "a station with no clock has no time");
+
+    /* And it must survive being asked about rows that do not exist. */
+    CHECK(en_ctscan_now(&s, 99) == 0, "out of range is not a time");
+    CHECK(en_ctscan_age_ms(0, 0) == 0, "a null scan has no age");
+    en_ctscan_stop(0);
+}
+
 static void test_affollow(void)
 {
     static const uint32_t LIST[] = { 89100, 96700 };
@@ -1780,6 +1999,9 @@ int main(void)
     test_reg_coverage();
     test_rtplus();
     test_affollow();
+    test_rds_ct_unix();
+    test_rdsname();
+    test_ctscan();
     test_rectimer();
     test_sidecar();
     test_simple_flags();

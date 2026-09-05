@@ -302,6 +302,12 @@ static uint16_t group4(en_rds_t *r, const uint16_t blk[4], uint8_t valid)
         day = (uint32_t)d;
     }
 
+    /* What was actually sent, kept before the offset is applied. */
+    r->ct_mjd = mjd;
+    r->ct_utc_hour = hour;
+    r->ct_utc_minute = minute;
+    r->ct_groups++;
+
     uint8_t nh = (uint8_t)(total / 60), nm = (uint8_t)(total % 60);
 
     bool changed = !r->ct_valid || r->ct_hour != nh || r->ct_minute != nm
@@ -357,14 +363,51 @@ static uint16_t group10(en_rds_t *r, const uint16_t blk[4], uint8_t valid,
  */
 #define EN_RTP_AID 0x4BD7u
 
+/*
+ * Every application a station announces, not only the one acted on.
+ *
+ * Group 3A says "the application with this identifier is in that group slot".
+ * Only RadioText+ is decoded, but knowing that a station is also running
+ * Alert-C in 8A is exactly the sort of thing the inspector exists to show, and
+ * it costs four bytes each to remember.
+ *
+ * Re-announcements are constant - 3A repeats for as long as the application
+ * does - so an identifier already held is updated in place rather than added
+ * again, which is what stops the list filling up with one application.
+ */
+static void oda_note(en_rds_t *r, uint16_t aid, uint8_t group)
+{
+    uint8_t i;
+
+    if (!aid) return;      /* 0 means "no application", not an application */
+
+    for (i = 0; i < r->oda_count; i++) {
+        if (r->oda[i].aid == aid) {
+            r->oda[i].group = group;
+            return;
+        }
+    }
+    if (r->oda_count >= EN_RDS_ODA_MAX) return;
+    r->oda[r->oda_count].aid = aid;
+    r->oda[r->oda_count].group = group;
+    r->oda_count++;
+}
+
 static uint16_t group3(en_rds_t *r, const uint16_t blk[4], uint8_t valid,
                        bool version_b)
 {
     if (version_b) return 0;
     if (!(valid & EN_RDS_B) || !(valid & EN_RDS_D)) return 0;
-    if (blk[3] != EN_RTP_AID) return 0;
 
     uint8_t g = (uint8_t)(blk[1] & 0x1Fu);
+
+    /* Recorded whatever it is. Only RadioText+ is decoded, but which
+       applications a station is running is worth knowing on its own, and this
+       group is the only place it is ever said. */
+    oda_note(r, blk[3], g);
+
+    if (blk[3] != EN_RTP_AID) return 0;
+
     /* Group 0 would mean "carried in group 0A", which is the basic tuning
        group and cannot also carry markers. A station announcing that is
        announcing nothing. */
@@ -497,6 +540,20 @@ static uint16_t group_rtplus(en_rds_t *r, const uint16_t blk[4], uint8_t valid)
 }
 
 /* ---- the entry point ----------------------------------------------------- */
+
+/*
+ * Modified Julian day 40587 is 1970-01-01, so the whole conversion is one
+ * subtraction. No calendar arithmetic, and therefore nothing here that can be
+ * wrong about a leap year.
+ */
+int64_t en_rds_ct_unix(const en_rds_t *r)
+{
+    if (!r || !r->ct_valid || r->ct_mjd < 40587u) return 0;
+
+    return ((int64_t)r->ct_mjd - 40587) * 86400
+         + (int64_t)r->ct_utc_hour * 3600
+         + (int64_t)r->ct_utc_minute * 60;
+}
 
 uint16_t en_rds_group(en_rds_t *r, const uint16_t blk[4], uint8_t valid)
 {

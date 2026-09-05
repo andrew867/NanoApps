@@ -16,6 +16,7 @@
 #include "../core/fmreg.h"
 #include "tuner.h"
 #include "capture.h"
+#include "clock.h"
 #include "player.h"
 
 #include <dirent.h>
@@ -751,6 +752,14 @@ static void mute_apply(void)
     if (rp_model.mute_ok)
         en_tuner_mute(rp_model.muted || rp_model.squelched);
 }
+
+const char *rp_act_set_clock(int64_t utc)
+{
+    return en_clock_strerror(en_clock_set_unix(utc));
+}
+
+int64_t     rp_model_now(void)           { return en_clock_now(); }
+const char *rp_model_clock_backend(void) { return en_clock_backend(); }
 
 void rp_act_mute(bool on)
 {

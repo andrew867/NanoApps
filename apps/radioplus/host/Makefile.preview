@@ -57,8 +57,8 @@ LV_SRCS := $(shell find $(LVGL_SRC)/src -name '*.c' \
 LV_OBJS := $(patsubst $(LVGL_SRC)/%.c,$(LV_CACHE)/%.o,$(LV_SRCS))
 LVLIB   := $(LV_CACHE)/liblvgl_preview.a
 
-SRCS := preview.c ../ui.c $(PLAT)/model_host.c \
-        $(CORE)/fmcmd.c $(CORE)/fmreg.c $(CORE)/rds.c $(CORE)/region.c \
+SRCS := preview.c ../ui.c $(PLAT)/model_host.c $(PLAT)/clock_stub.c \
+        $(CORE)/fmcmd.c $(CORE)/fmreg.c $(CORE)/rds.c $(CORE)/rdsname.c $(CORE)/ctscan.c $(CORE)/region.c \
         $(CORE)/wav.c $(CORE)/store.c $(CORE)/scan.c $(CORE)/timer.c $(CORE)/affollow.c ../../build_stamp.c
 
 

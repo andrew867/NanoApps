@@ -37,6 +37,8 @@ typedef enum {
     RP_SWIPE_MAX,
     RP_SCREEN_ADVANCED = RP_SWIPE_MAX,     /* the register list */
     RP_SCREEN_REGISTER,                    /* one register, field by field */
+    RP_SCREEN_RDS,                         /* every field RDS carries */
+    RP_SCREEN_CLOCK,                       /* setting the time off the band */
     RP_SCREEN_COUNT
 } rp_screen_t;
 

@@ -27,6 +27,7 @@
  */
 
 #include "../model.h"
+#include "clock.h"
 #include "../core/fmreg.h"
 
 #include "hb_sdk.h"
@@ -283,6 +284,14 @@ void rp_act_step(bool up)
 void rp_act_seek(bool up) { rp_act_step(up); }
 /* Nothing here is brought up, so nothing is ever waited for. */
 const char *rp_model_waiting(void) { return NULL; }
+
+/* And nothing here sets a clock; en_clock's stub says so for both. */
+const char *rp_act_set_clock(int64_t utc)
+{
+    return en_clock_strerror(en_clock_set_unix(utc));
+}
+int64_t     rp_model_now(void)           { return en_clock_now(); }
+const char *rp_model_clock_backend(void) { return en_clock_backend(); }
 
 void rp_act_power(bool on) { rp_model.powered = on; }
 

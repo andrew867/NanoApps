@@ -58,6 +58,16 @@
 #define EN_RDS_PTYN_LEN 8
 #define EN_RDS_AF_MAX   25
 
+/* Open Data Applications announced in group 3A. Eight is more than any
+   broadcaster has ever been observed to run at once, and the ninth is dropped
+   rather than allowed to push out the first. */
+#define EN_RDS_ODA_MAX  8
+
+typedef struct {
+    uint16_t aid;      /* the registered application identifier */
+    uint8_t  group;    /* type << 1 | version - the slot it was given */
+} en_rds_oda_t;
+
 typedef struct {
     /* Programme identification. Also the station's identity across an
        alternate-frequency jump, which is why it is tracked separately from
@@ -125,6 +135,32 @@ typedef struct {
     uint8_t  ct_month, ct_day, ct_hour, ct_minute;
     int8_t   ct_offset;    /* local offset in half hours, as transmitted */
 
+    /*
+     * And the same instant exactly as it came off the air, before the offset
+     * was applied.
+     *
+     * The fields above are local time, which is what a listener should see.
+     * Anything that has to compute with the time wants the other one: a
+     * hardware clock is conventionally UTC, and turning local back into UTC
+     * means redoing the midnight arithmetic above in reverse and getting it
+     * right twice. The modified Julian day and the transmitted hour and minute
+     * are what the station actually sent, and en_rds_ct_unix() turns them into
+     * a count of seconds with no calendar code at all.
+     */
+    uint32_t ct_mjd;
+    uint8_t  ct_utc_hour, ct_utc_minute;
+
+    /*
+     * How many clock-time groups have arrived.
+     *
+     * Not a statistic. Group 4A is transmitted about once a minute, and the
+     * standard puts the minute edge at the start of the group carrying it - so
+     * the time is exact at the instant it lands and drifts from then on. A
+     * caller that wants to set a clock has to know WHEN it arrived, and this
+     * counter changing is the only signal that it just did.
+     */
+    uint32_t ct_groups;
+
     uint8_t  ecc;          /* extended country code, group 1A */
     bool     ecc_valid;
     uint16_t pin;          /* programme item number, group 1A */
@@ -132,6 +168,9 @@ typedef struct {
 
     /* Reception statistics. Useful on their own - a station with groups
        arriving but nothing decoding is a different problem from no signal. */
+    en_rds_oda_t oda[EN_RDS_ODA_MAX];
+    uint8_t  oda_count;
+
     uint32_t groups;
     uint32_t blocks_bad;
     uint32_t group_count[32];   /* indexed by type<<1 | version */
@@ -187,5 +226,18 @@ uint32_t en_rds_af_khz(uint8_t code);
 uint8_t en_rds_unpack_tuples_unverified(const uint8_t *fifo, uint16_t len,
                                         uint16_t (*out)[4], uint8_t *valid,
                                         uint8_t max_groups);
+
+/*
+ * The transmitted clock time as seconds since 1970-01-01 UTC, or 0 when no
+ * usable clock group has arrived.
+ *
+ * Modified Julian day 40587 is the Unix epoch, so this is a subtraction and
+ * two multiplications - no calendar, no leap years, nothing to get wrong. The
+ * value is UTC: the transmitted local offset is reported separately in
+ * ct_offset and is a display matter, not a timekeeping one.
+ *
+ * Exact at the moment the group arrived and not afterwards. See ct_groups.
+ */
+int64_t en_rds_ct_unix(const en_rds_t *r);
 
 #endif /* RADIOPLUS_RDS_H */

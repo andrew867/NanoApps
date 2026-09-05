@@ -34,7 +34,9 @@
 #include "lvgl/lvgl.h"
 
 #include "core/affollow.h"
+#include "core/ctscan.h"
 #include "core/fmreg.h"
+#include "core/rdsname.h"
 #include "core/scan.h"
 #include "core/timer.h"
 
@@ -2011,6 +2013,18 @@ static void on_open_advanced(lv_event_t *e)
     rp_ui_show(RP_SCREEN_ADVANCED);
 }
 
+static void on_open_rds(lv_event_t *e)
+{
+    (void)e;
+    rp_ui_show(RP_SCREEN_RDS);
+}
+
+static void on_open_clock(lv_event_t *e)
+{
+    (void)e;
+    rp_ui_show(RP_SCREEN_CLOCK);
+}
+
 static void on_region_next(lv_event_t *e)
 {
     (void)e;
@@ -2131,6 +2145,30 @@ static void build_settings(void)
     s_set_wide = row_value(r, C_SIGNAL);
     lv_obj_set_pos(s_set_wide, MARGIN, 14);
     y += 48;
+
+    /*
+      * Two screens for the curious, above the register list because both are
+      * safe to open and it is not.
+      */
+    r = setting_row(s, y, 48, "RDS inspector", 0, on_open_rds);
+    lv_obj_t *chev_r = label(r, LV_SYMBOL_RIGHT, F_CAPTION, C_TEXT_MUTE);
+    lv_obj_set_style_text_align(chev_r, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_width(chev_r, CONTENT_W);
+    lv_obj_set_pos(chev_r, MARGIN, 16);
+    y += 48;
+
+    r = setting_row(s, y, 62, "Set clock from FM", 0, on_open_clock);
+    lv_obj_t *chev_c = label(r, LV_SYMBOL_RIGHT, F_CAPTION, C_TEXT_MUTE);
+    lv_obj_set_style_text_align(chev_c, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_width(chev_c, CONTENT_W);
+    lv_obj_set_pos(chev_c, MARGIN, 16);
+    {
+        lv_obj_t *n = para(r, "Broadcasters transmit the time. This device has "
+                              "no other way to learn it.", F_CAPTION,
+                           C_TEXT_MUTE, CONTENT_W);
+        lv_obj_set_pos(n, MARGIN, 32);
+    }
+    y += 62;
 
     r = setting_row(s, y, 48, "Advanced", 0, on_open_advanced);
     lv_obj_t *chev = label(r, LV_SYMBOL_RIGHT, F_CAPTION, C_TEXT_MUTE);
@@ -2596,6 +2634,726 @@ static void build_screen_shell(rp_screen_t which)
     s_screen[which] = s;
 }
 
+/* ---- RDS inspector --------------------------------------------------------
+ *
+ * Every field RDS carries, on a screen, on an iPod.
+ *
+ * The decoder has always held far more than the four things Now Playing shows.
+ * PI is not an opaque number - it is a country, a coverage area and a
+ * programme reference, and in North America it spells the call sign outright.
+ * The decoder identification bits say whether the transmission is stereo and
+ * whether the programme type is being switched dynamically. The group counter
+ * says what a station actually transmits, which is the difference between a
+ * station that is running RadioText+ and one that has been announcing it in
+ * group 3A for six years while sending nothing in the slot.
+ *
+ * None of that helps a listener and all of it helps somebody standing in front
+ * of a transmitter. It costs one screen.
+ *
+ * Built once and updated by text rather than rebuilt each refresh: fifty-odd
+ * labels reconstructed twice a second on this part is visibly slow, and a
+ * value that changes twice an hour does not need its widget thrown away.
+ */
+
+static lv_obj_t *s_rds_body;
+static lv_obj_t *s_rds_pi, *s_rds_call, *s_rds_cc, *s_rds_cov, *s_rds_ref;
+static lv_obj_t *s_rds_ecc, *s_rds_pin, *s_rds_pty, *s_rds_ptyn;
+static lv_obj_t *s_rds_flags, *s_rds_di;
+static lv_obj_t *s_rds_ps, *s_rds_rt, *s_rds_rtp;
+static lv_obj_t *s_rds_ct, *s_rds_ctutc, *s_rds_af;
+static lv_obj_t *s_rds_oda[EN_RDS_ODA_MAX];
+static lv_obj_t *s_rds_totals;
+static lv_obj_t *s_rds_grp[32];
+
+/* 0xC2B5, four digits, always. A PI with leading zeros stripped is a PI
+   somebody has to count the digits of. */
+static void put_hex4(char *out, uint16_t v)
+{
+    static const char H[] = "0123456789ABCDEF";
+    out[0] = '0'; out[1] = 'x';
+    out[2] = H[(v >> 12) & 0xF];
+    out[3] = H[(v >> 8) & 0xF];
+    out[4] = H[(v >> 4) & 0xF];
+    out[5] = H[v & 0xF];
+    out[6] = 0;
+}
+
+static void insp_head(lv_obj_t *p, int *y, const char *text)
+{
+    lv_obj_t *l = label(p, text, F_CAPTION, C_SIGNAL);
+    lv_obj_set_pos(l, MARGIN, *y + 8);
+    *y += 26;
+    hairline(p, *y - 4);
+}
+
+/* Caption on the left, value on the right, one line each. The caption column
+   is wide enough for the longest of them so the values line up, which is what
+   makes a screen like this scannable rather than merely complete. */
+#define INSP_CAP_W 88     /* the caption column; the value starts after it */
+
+static lv_obj_t *insp_row(lv_obj_t *p, int *y, const char *cap)
+{
+    lv_obj_t *c = label(p, cap, F_CAPTION, C_TEXT_MUTE);
+    lv_obj_set_pos(c, MARGIN, *y);
+    /* Bounded, not trusted to be short. A caption is a string in this file and
+       the value beside it starts at a fixed x, so an unbounded label is the
+       same overlap the chip row had - the first long caption writes over its
+       own value. */
+    lv_obj_set_width(c, INSP_CAP_W);
+    lv_label_set_long_mode(c, LV_LABEL_LONG_DOT);
+
+    lv_obj_t *v = label(p, "-", F_CAPTION, C_TEXT);
+    lv_obj_set_pos(v, MARGIN + 92, *y);
+    lv_obj_set_width(v, CONTENT_W - 92);
+    lv_label_set_long_mode(v, LV_LABEL_LONG_DOT);
+    *y += 19;
+    return v;
+}
+
+/* Caption above, value wrapped below, for the things that are text rather than
+   a field: the programme service name, radio text, an alternate frequency
+   list. */
+static lv_obj_t *insp_block(lv_obj_t *p, int *y, const char *cap, int lines)
+{
+    lv_obj_t *c = label(p, cap, F_CAPTION, C_TEXT_MUTE);
+    lv_obj_set_pos(c, MARGIN, *y);
+    *y += 17;
+
+    lv_obj_t *v = para(p, "", F_CAPTION, C_TEXT, CONTENT_W);
+    lv_obj_set_pos(v, MARGIN, *y);
+    lv_label_set_long_mode(v, LV_LABEL_LONG_WRAP);
+    *y += 17 * lines + 4;
+    return v;
+}
+
+static void on_rds_back(lv_event_t *e)
+{
+    (void)e;
+    rp_ui_show(RP_SCREEN_SETTINGS);
+}
+
+static void build_rds(void)
+{
+    lv_obj_t *s = s_screen[RP_SCREEN_RDS];
+    int y = 4;
+    uint8_t i;
+
+    lv_obj_t *back = panel(s, 0, 0, RP_SCREEN_W, 40, C_BG);
+    lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(back, on_rds_back, LV_EVENT_CLICKED, 0);
+    lv_obj_t *b = label(back, LV_SYMBOL_LEFT "  RDS INSPECTOR", F_CAPTION,
+                        C_TEXT_MUTE);
+    lv_obj_set_pos(b, MARGIN, 12);
+    hairline(s, 40);
+
+    s_rds_body = panel(s, 0, 44, RP_SCREEN_W, RP_SCREEN_H - 60, C_BG);
+    lv_obj_add_flag(s_rds_body, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(s_rds_body, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_rds_body, LV_SCROLLBAR_MODE_OFF);
+
+    insp_head(s_rds_body, &y, "IDENTIFICATION");
+    s_rds_pi   = insp_row(s_rds_body, &y, "PI");
+    s_rds_call = insp_row(s_rds_body, &y, "Call sign");
+    s_rds_cc   = insp_row(s_rds_body, &y, "Country");
+    s_rds_cov  = insp_row(s_rds_body, &y, "Coverage");
+    s_rds_ref  = insp_row(s_rds_body, &y, "Reference");
+    s_rds_ecc  = insp_row(s_rds_body, &y, "ECC");
+    s_rds_pin  = insp_row(s_rds_body, &y, "PIN");
+
+    insp_head(s_rds_body, &y, "PROGRAMME");
+    s_rds_pty   = insp_row(s_rds_body, &y, "Type");
+    s_rds_ptyn  = insp_row(s_rds_body, &y, "Type name");
+    s_rds_flags = insp_row(s_rds_body, &y, "Flags");
+    s_rds_di    = insp_row(s_rds_body, &y, "Decoder ID");
+
+    insp_head(s_rds_body, &y, "TEXT");
+    s_rds_ps  = insp_block(s_rds_body, &y, "Programme service", 1);
+    s_rds_rt  = insp_block(s_rds_body, &y, "RadioText", 4);
+    s_rds_rtp = insp_block(s_rds_body, &y, "RadioText+", 2);
+
+    insp_head(s_rds_body, &y, "CLOCK");
+    s_rds_ct    = insp_row(s_rds_body, &y, "Station time");
+    s_rds_ctutc = insp_row(s_rds_body, &y, "UTC / offset");
+
+    insp_head(s_rds_body, &y, "ALTERNATE FREQUENCIES");
+    s_rds_af = insp_block(s_rds_body, &y, "Announced", 4);
+
+    insp_head(s_rds_body, &y, "OPEN DATA APPLICATIONS");
+    for (i = 0; i < EN_RDS_ODA_MAX; i++) {
+        s_rds_oda[i] = label(s_rds_body, "", F_CAPTION, C_TEXT);
+        lv_obj_set_pos(s_rds_oda[i], MARGIN, y);
+        lv_obj_set_width(s_rds_oda[i], CONTENT_W);
+        lv_label_set_long_mode(s_rds_oda[i], LV_LABEL_LONG_DOT);
+        y += 18;
+    }
+
+    insp_head(s_rds_body, &y, "GROUPS RECEIVED");
+    s_rds_totals = para(s_rds_body, "", F_CAPTION, C_TEXT_MUTE, CONTENT_W);
+    lv_obj_set_pos(s_rds_totals, MARGIN, y);
+    y += 36;
+
+    /*
+     * All thirty-two, hidden until one arrives.
+     *
+     * This is the part a broadcast engineer actually wants: what a station
+     * transmits, in what proportion, as against what it claims. Building them
+     * all and hiding the empties keeps the order stable, so a group appearing
+     * for the first time slots into place rather than reshuffling the list
+     * under somebody's finger.
+     */
+    for (i = 0; i < 32; i++) {
+        s_rds_grp[i] = label(s_rds_body, "", F_CAPTION, C_TEXT);
+        lv_obj_set_pos(s_rds_grp[i], MARGIN, y);
+        lv_obj_set_width(s_rds_grp[i], CONTENT_W);
+        lv_label_set_long_mode(s_rds_grp[i], LV_LABEL_LONG_DOT);
+        lv_obj_add_flag(s_rds_grp[i], LV_OBJ_FLAG_HIDDEN);
+        y += 18;
+    }
+}
+
+static void refresh_rds(void)
+{
+    const en_rds_t *r = &rp_model.rds;
+    char buf[160], tmp[40];
+    uint8_t i;
+
+    /* Identification. */
+    if (r->pi_valid) {
+        put_hex4(buf, r->pi);
+        lv_label_set_text(s_rds_pi, buf);
+
+        if (en_rds_callsign(r->pi, buf, sizeof buf))
+            lv_label_set_text(s_rds_call, buf);
+        else
+            lv_label_set_text(s_rds_call, "not encoded");
+
+        put_hex4(buf, (uint16_t)en_rds_pi_country(r->pi));
+        /* Only the nibble matters, so print it as one digit rather than as a
+           four-digit word with three zeros in front of it. */
+        buf[0] = '0'; buf[1] = 'x';
+        buf[2] = "0123456789ABCDEF"[en_rds_pi_country(r->pi)];
+        buf[3] = 0;
+        lv_label_set_text(s_rds_cc, buf);
+
+        lv_label_set_text(s_rds_cov,
+                          en_rds_coverage_name(en_rds_pi_coverage(r->pi)));
+
+        put_uint(buf, en_rds_pi_reference(r->pi), 0);
+        lv_label_set_text(s_rds_ref, buf);
+    } else {
+        lv_label_set_text(s_rds_pi, "-");
+        lv_label_set_text(s_rds_call, "-");
+        lv_label_set_text(s_rds_cc, "-");
+        lv_label_set_text(s_rds_cov, "-");
+        lv_label_set_text(s_rds_ref, "-");
+    }
+
+    if (r->ecc_valid) {
+        buf[0] = '0'; buf[1] = 'x';
+        buf[2] = "0123456789ABCDEF"[(r->ecc >> 4) & 0xF];
+        buf[3] = "0123456789ABCDEF"[r->ecc & 0xF];
+        buf[4] = 0;
+        lv_label_set_text(s_rds_ecc, buf);
+    } else {
+        lv_label_set_text(s_rds_ecc, "-");
+    }
+
+    if (r->pin_valid) {
+        put_hex4(buf, r->pin);
+        lv_label_set_text(s_rds_pin, buf);
+    } else {
+        lv_label_set_text(s_rds_pin, "-");
+    }
+
+    /* Programme. */
+    buf[0] = 0;
+    put_uint(tmp, r->pty, 0);
+    cat(buf, tmp, sizeof buf);
+    cat(buf, "  ", sizeof buf);
+    cat(buf, en_rds_pty_name(r->pty, r->rbds), sizeof buf);
+    lv_label_set_text(s_rds_pty, buf);
+
+    lv_label_set_text(s_rds_ptyn, r->ptyn_valid ? r->ptyn : "-");
+
+    buf[0] = 0;
+    cat(buf, r->tp ? "TP " : "", sizeof buf);
+    cat(buf, r->ta ? "TA " : "", sizeof buf);
+    cat(buf, r->ms ? "Music" : "Speech", sizeof buf);
+    lv_label_set_text(s_rds_flags, buf);
+
+    en_rds_di_text(r->di, buf, sizeof buf);
+    lv_label_set_text(s_rds_di, buf);
+
+    /* Text. */
+    lv_label_set_text(s_rds_ps, r->ps_valid ? r->ps : "-");
+    lv_label_set_text(s_rds_rt, r->rt_valid ? r->rt : "-");
+
+    if (r->rt_title_valid || r->rt_artist_valid) {
+        buf[0] = 0;
+        cat(buf, r->rt_title_valid ? r->rt_title : "?", sizeof buf);
+        cat(buf, "\n", sizeof buf);
+        cat(buf, r->rt_artist_valid ? r->rt_artist : "?", sizeof buf);
+        lv_label_set_text(s_rds_rtp, buf);
+    } else if (r->rtplus_known) {
+        /* Announced and silent is a distinct and interesting state - it is the
+           commonest RadioText+ fault there is. */
+        buf[0] = 0;
+        cat(buf, "announced in group ", sizeof buf);
+        en_rds_group_label((uint8_t)(r->rtplus_group >> 1),
+                           (r->rtplus_group & 1u) != 0, tmp, sizeof tmp);
+        cat(buf, tmp, sizeof buf);
+        cat(buf, ", nothing received", sizeof buf);
+        lv_label_set_text(s_rds_rtp, buf);
+    } else {
+        lv_label_set_text(s_rds_rtp, "-");
+    }
+
+    /* Clock. */
+    if (r->ct_valid) {
+        buf[0] = 0;
+        put_uint(tmp, r->ct_year, 4);      cat(buf, tmp, sizeof buf);
+        cat(buf, "-", sizeof buf);
+        put_uint(tmp, r->ct_month, 2);     cat(buf, tmp, sizeof buf);
+        cat(buf, "-", sizeof buf);
+        put_uint(tmp, r->ct_day, 2);       cat(buf, tmp, sizeof buf);
+        cat(buf, " ", sizeof buf);
+        put_uint(tmp, r->ct_hour, 2);      cat(buf, tmp, sizeof buf);
+        cat(buf, ":", sizeof buf);
+        put_uint(tmp, r->ct_minute, 2);    cat(buf, tmp, sizeof buf);
+        lv_label_set_text(s_rds_ct, buf);
+
+        buf[0] = 0;
+        put_uint(tmp, r->ct_utc_hour, 2);  cat(buf, tmp, sizeof buf);
+        cat(buf, ":", sizeof buf);
+        put_uint(tmp, r->ct_utc_minute, 2); cat(buf, tmp, sizeof buf);
+        cat(buf, r->ct_offset < 0 ? "  -" : "  +", sizeof buf);
+        {
+            int8_t half = r->ct_offset < 0 ? (int8_t)-r->ct_offset : r->ct_offset;
+            put_uint(tmp, (uint32_t)(half / 2), 0);  cat(buf, tmp, sizeof buf);
+            cat(buf, (half & 1) ? ":30" : ":00", sizeof buf);
+        }
+        cat(buf, "  x", sizeof buf);
+        put_uint(tmp, r->ct_groups, 0);    cat(buf, tmp, sizeof buf);
+        lv_label_set_text(s_rds_ctutc, buf);
+    } else {
+        lv_label_set_text(s_rds_ct, "-");
+        lv_label_set_text(s_rds_ctutc, "-");
+    }
+
+    /* Alternate frequencies. */
+    if (r->af_count) {
+        buf[0] = 0;
+        for (i = 0; i < r->af_count && i < EN_RDS_AF_MAX; i++) {
+            fmt_mhz(tmp, (int)sizeof tmp, r->af[i]);
+            cat(buf, tmp, sizeof buf);
+            cat(buf, i + 1 < r->af_count ? "  " : "", sizeof buf);
+        }
+        lv_label_set_text(s_rds_af, buf);
+    } else if (r->af_expected) {
+        lv_label_set_text(s_rds_af, "a list was announced, none decoded yet");
+    } else {
+        lv_label_set_text(s_rds_af, "-");
+    }
+
+    /* Open data applications. */
+    for (i = 0; i < EN_RDS_ODA_MAX; i++) {
+        if (i >= r->oda_count) {
+            show(s_rds_oda[i], false);
+            continue;
+        }
+        show(s_rds_oda[i], true);
+
+        buf[0] = 0;
+        put_hex4(tmp, r->oda[i].aid);
+        cat(buf, tmp, sizeof buf);
+        cat(buf, "  ", sizeof buf);
+        en_rds_group_label((uint8_t)(r->oda[i].group >> 1),
+                           (r->oda[i].group & 1u) != 0, tmp, sizeof tmp);
+        cat(buf, tmp, sizeof buf);
+        cat(buf, "  ", sizeof buf);
+        {
+            const char *name = en_rds_oda_name(r->oda[i].aid);
+            cat(buf, name ? name : "unregistered here", sizeof buf);
+        }
+        lv_label_set_text(s_rds_oda[i], buf);
+    }
+    if (!r->oda_count && s_rds_oda[0]) {
+        show(s_rds_oda[0], true);
+        lv_label_set_text(s_rds_oda[0], "none announced");
+    }
+
+    /* Totals, then the histogram. */
+    buf[0] = 0;
+    put_uint(tmp, r->groups, 0);
+    cat(buf, tmp, sizeof buf);
+    cat(buf, " groups, ", sizeof buf);
+    put_uint(tmp, r->blocks_bad, 0);
+    cat(buf, tmp, sizeof buf);
+    cat(buf, " bad blocks", sizeof buf);
+    if (r->groups) {
+        /* Per mille rather than per cent: on a good signal the rate is well
+           under one per cent and a rounded percentage reads as zero, which
+           looks like the counter is broken. */
+        uint32_t permille = (r->blocks_bad * 1000u) / (r->groups * 4u);
+        cat(buf, "  (", sizeof buf);
+        put_uint(tmp, permille / 10u, 0);
+        cat(buf, tmp, sizeof buf);
+        cat(buf, ".", sizeof buf);
+        put_uint(tmp, permille % 10u, 0);
+        cat(buf, tmp, sizeof buf);
+        cat(buf, "%)", sizeof buf);
+    }
+    lv_label_set_text(s_rds_totals, buf);
+
+    for (i = 0; i < 32; i++) {
+        uint32_t n = r->group_count[i];
+
+        if (!n) { show(s_rds_grp[i], false); continue; }
+        show(s_rds_grp[i], true);
+
+        buf[0] = 0;
+        en_rds_group_label((uint8_t)(i >> 1), (i & 1u) != 0, tmp, sizeof tmp);
+        cat(buf, tmp, sizeof buf);
+        cat(buf, "  ", sizeof buf);
+        put_uint(tmp, n, 0);
+        cat(buf, tmp, sizeof buf);
+        if (r->groups) {
+            cat(buf, "  ", sizeof buf);
+            put_uint(tmp, (n * 100u) / r->groups, 0);
+            cat(buf, tmp, sizeof buf);
+            cat(buf, "%  ", sizeof buf);
+        } else {
+            cat(buf, "  ", sizeof buf);
+        }
+        cat(buf, en_rds_group_name((uint8_t)(i >> 1), (i & 1u) != 0),
+            sizeof buf);
+        lv_label_set_text(s_rds_grp[i], buf);
+    }
+}
+
+/* ---- setting the clock off the band ---------------------------------------
+ *
+ * This device has no network, no cell radio, and a hardware clock that has
+ * never been set - so it boots into 1970 and every recording is filed under a
+ * date that is off by fifty-odd years. There is no NTP here to fix it with.
+ *
+ * There is, however, a band full of broadcasters transmitting the date and the
+ * time as part of their normal output, fed in most cases from the same
+ * reference that times the transmitter. So: listen to them, show what each one
+ * says, and let the listener pick which to believe.
+ *
+ * The part that makes this correct rather than approximate is the age. The
+ * specification puts the minute edge at the start of the group carrying the
+ * time, so a station's answer is exact when it lands and stale from then on -
+ * a reading taken forty seconds ago sets the clock forty seconds slow. ctscan
+ * timestamps every result and en_ctscan_now adds the elapsed time back, which
+ * is why the list keeps updating while it is being read.
+ */
+
+static en_ctscan_t s_ct;
+static lv_obj_t *s_ct_status, *s_ct_bar, *s_ct_fill, *s_ct_note;
+static lv_obj_t *s_ct_rows[EN_CTSCAN_MAX];
+static lv_obj_t *s_ct_btn_lbl;
+static uint32_t s_ct_last_ms;
+static char s_ct_result[64];
+static uint8_t s_ct_result_for;
+
+static bool ct_running(void)
+{
+    return s_ct.phase == EN_CTSCAN_RUNNING;
+}
+
+/* Seconds since the epoch, split into a printable local date and time using
+   the offset the station transmitted. No timezone database, no environment,
+   and nothing inferred from the device's own clock - which is the point, since
+   the device's clock is the thing being corrected. */
+static void fmt_stamp(char *out, int cap, int64_t utc, int8_t half_hours)
+{
+    int64_t local = utc + (int64_t)half_hours * 1800;
+    int64_t days = local / 86400;
+    int32_t rem = (int32_t)(local % 86400);
+    uint32_t y = 1970, m;
+    static const uint8_t MD[13] = { 0,31,28,31,30,31,30,31,31,30,31,30,31 };
+    char t[12];
+
+    if (rem < 0) { rem += 86400; days--; }
+
+    for (;;) {
+        uint32_t len = (y % 4u == 0u && (y % 100u != 0u || y % 400u == 0u))
+                       ? 366u : 365u;
+        if (days < (int64_t)len) break;
+        days -= (int64_t)len;
+        y++;
+    }
+    for (m = 1; m <= 12; m++) {
+        uint32_t len = MD[m];
+        if (m == 2 && (y % 4u == 0u && (y % 100u != 0u || y % 400u == 0u)))
+            len = 29;
+        if (days < (int64_t)len) break;
+        days -= (int64_t)len;
+    }
+
+    out[0] = 0;
+    put_uint(t, y, 4);                     cat(out, t, cap);
+    cat(out, "-", cap);
+    put_uint(t, m, 2);                     cat(out, t, cap);
+    cat(out, "-", cap);
+    put_uint(t, (uint32_t)days + 1u, 2);   cat(out, t, cap);
+    cat(out, "  ", cap);
+    put_uint(t, (uint32_t)(rem / 3600), 2); cat(out, t, cap);
+    cat(out, ":", cap);
+    put_uint(t, (uint32_t)((rem / 60) % 60), 2); cat(out, t, cap);
+    cat(out, ":", cap);
+    put_uint(t, (uint32_t)(rem % 60), 2);  cat(out, t, cap);
+}
+
+/*
+ * Which stations to try, strongest first.
+ *
+ * A band scan run this session is by far the best source: it has measured
+ * signal strengths, and strength is what decides whether a station answers
+ * inside the dwell or wastes seventy seconds of it. Failing that the presets,
+ * which at least are stations somebody found worth keeping. Failing that,
+ * whatever is tuned - one candidate is a perfectly good clock scan if it
+ * happens to answer.
+ */
+static uint8_t ct_candidates(uint32_t *out, uint8_t max)
+{
+    uint8_t n = 0, i, j;
+
+    if (s_scan.n_hits) {
+        /* Selection sort by peak strength. Forty entries at most, once per
+           scan, so the simplest thing that is obviously right. */
+        uint8_t order[EN_SCAN_MAX_HITS];
+        uint8_t cnt = s_scan.n_hits;
+        if (cnt > EN_SCAN_MAX_HITS) cnt = EN_SCAN_MAX_HITS;
+        for (i = 0; i < cnt; i++) order[i] = i;
+        for (i = 0; i < cnt; i++) {
+            for (j = (uint8_t)(i + 1); j < cnt; j++) {
+                if (s_scan.hits[order[j]].rssi > s_scan.hits[order[i]].rssi) {
+                    uint8_t t = order[i]; order[i] = order[j]; order[j] = t;
+                }
+            }
+        }
+        for (i = 0; i < cnt && n < max; i++)
+            out[n++] = s_scan.hits[order[i]].khz;
+        return n;
+    }
+
+    for (i = 0; i < rp_model.presets.count && n < max; i++)
+        out[n++] = rp_model.presets.list[i].khz;
+
+    if (!n && rp_model.khz) out[n++] = rp_model.khz;
+    return n;
+}
+
+static void ct_pump(void)
+{
+    uint32_t now = lv_tick_get();
+    uint32_t dt = now - s_ct_last_ms;
+    uint32_t khz = 0;
+
+    if (s_ct.phase == EN_CTSCAN_IDLE) { s_ct_last_ms = now; return; }
+
+    s_ct_last_ms = now;
+    if (dt > 1000) dt = 0;
+
+    if (en_ctscan_tick(&s_ct, dt, &rp_model.rds, &khz) == EN_CTSCAN_TUNE) {
+        rp_act_tune_quiet(khz);
+        /* The decoder belongs to whatever is tuned. Carrying one station's
+           name or clock into the next one's row would be worse than a blank
+           row, because it would look like an answer. */
+        en_rds_init(&rp_model.rds,
+                    rp_model.region ? rp_model.region->rbds : true);
+    }
+
+    if (s_ct_result_for) s_ct_result_for--;
+}
+
+static void on_clock_back(lv_event_t *e)
+{
+    (void)e;
+    rp_ui_show(RP_SCREEN_SETTINGS);
+}
+
+static void on_clock_scan(lv_event_t *e)
+{
+    (void)e;
+
+    if (ct_running()) {
+        en_ctscan_stop(&s_ct);
+        rp_act_tune(s_ct.resume_khz);
+        return;
+    }
+
+    {
+        uint32_t cand[EN_CTSCAN_MAX];
+        uint8_t n = ct_candidates(cand, EN_CTSCAN_MAX);
+
+        if (!n) return;
+        s_ct_last_ms = lv_tick_get();
+        s_ct_result[0] = 0;
+        if (en_ctscan_start(&s_ct, cand, n, rp_model.khz)) {
+            rp_act_tune_quiet(cand[0]);
+            en_rds_init(&rp_model.rds,
+                        rp_model.region ? rp_model.region->rbds : true);
+        }
+    }
+}
+
+/* Tapping a station sets the clock to what that station said, plus however
+   long ago it said it. */
+static void on_clock_pick(lv_event_t *e)
+{
+    uint8_t i = (uint8_t)(uintptr_t)lv_event_get_user_data(e);
+    int64_t when;
+
+    if (i >= s_ct.n_hits || !s_ct.hits[i].got) return;
+
+    when = en_ctscan_now(&s_ct, i);
+    if (!when) return;
+
+    s_ct_result[0] = 0;
+    cat(s_ct_result, rp_act_set_clock(when), (int)sizeof s_ct_result);
+    s_ct_result_for = 120;      /* refreshes, not seconds; long enough to read */
+}
+
+static void build_clock(void)
+{
+    lv_obj_t *s = s_screen[RP_SCREEN_CLOCK];
+    uint8_t i;
+    int y;
+
+    lv_obj_t *back = panel(s, 0, 0, RP_SCREEN_W, 40, C_BG);
+    lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(back, on_clock_back, LV_EVENT_CLICKED, 0);
+    lv_obj_t *b = label(back, LV_SYMBOL_LEFT "  CLOCK FROM FM", F_CAPTION,
+                        C_TEXT_MUTE);
+    lv_obj_set_pos(b, MARGIN, 12);
+    hairline(s, 40);
+
+    s_ct_status = para(s, "", F_CAPTION, C_TEXT, CONTENT_W);
+    lv_obj_set_pos(s_ct_status, MARGIN, 50);
+
+    s_ct_bar = panel(s, MARGIN, 88, CONTENT_W, 3, C_SURFACE_2);
+    s_ct_fill = panel(s_ct_bar, 0, 0, 0, 3, C_SIGNAL);
+
+    lv_obj_t *btn = panel(s, MARGIN, 100, CONTENT_W, 38, C_SURFACE);
+    lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(btn, on_clock_scan, LV_EVENT_CLICKED, 0);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(C_SURFACE_2), LV_STATE_PRESSED);
+    s_ct_btn_lbl = label(btn, "Listen for the time", F_BODY, C_SIGNAL);
+    lv_obj_center(s_ct_btn_lbl);
+
+    s_ct_note = para(s, "", F_CAPTION, C_TEXT_MUTE, CONTENT_W);
+    lv_obj_set_pos(s_ct_note, MARGIN, 144);
+
+    y = 186;
+    for (i = 0; i < EN_CTSCAN_MAX; i++) {
+        s_ct_rows[i] = row(s, y, 40, on_clock_pick, (void *)(uintptr_t)i);
+        lv_obj_t *l = label(s_ct_rows[i], "", F_CAPTION, C_TEXT);
+        lv_obj_set_pos(l, MARGIN, 4);
+        lv_obj_set_width(l, CONTENT_W);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+
+        lv_obj_t *v = label(s_ct_rows[i], "", F_CAPTION, C_TEXT_MUTE);
+        lv_obj_set_pos(v, MARGIN, 21);
+        lv_obj_set_width(v, CONTENT_W);
+        lv_label_set_long_mode(v, LV_LABEL_LONG_DOT);
+
+        lv_obj_add_flag(s_ct_rows[i], LV_OBJ_FLAG_HIDDEN);
+        y += 40;
+    }
+}
+
+static void refresh_clock(void)
+{
+    char buf[96], tmp[40];
+    uint8_t i;
+
+    lv_label_set_text(s_ct_btn_lbl,
+                      ct_running() ? "Stop" : "Listen for the time");
+
+    /* The device's own clock, which is the thing being judged. */
+    buf[0] = 0;
+    cat(buf, "Now: ", sizeof buf);
+    fmt_stamp(tmp, (int)sizeof tmp, rp_model_now(), 0);
+    cat(buf, tmp, sizeof buf);
+    cat(buf, " UTC", sizeof buf);
+    lv_label_set_text(s_ct_status, buf);
+
+    lv_obj_set_width(s_ct_fill,
+                     (CONTENT_W * en_ctscan_percent(&s_ct)) / 100);
+
+    if (s_ct_result[0] && s_ct_result_for) {
+        lv_label_set_text(s_ct_note, s_ct_result);
+        lv_obj_set_style_text_color(s_ct_note, lv_color_hex(C_LIVE), 0);
+    } else if (ct_running()) {
+        buf[0] = 0;
+        cat(buf, "Listening to ", sizeof buf);
+        fmt_mhz(tmp, (int)sizeof tmp, s_ct.cand[s_ct.at]);
+        cat(buf, tmp, sizeof buf);
+        cat(buf, " - station ", sizeof buf);
+        put_uint(tmp, (uint32_t)s_ct.at + 1u, 0);
+        cat(buf, tmp, sizeof buf);
+        cat(buf, " of ", sizeof buf);
+        put_uint(tmp, s_ct.n_cand, 0);
+        cat(buf, tmp, sizeof buf);
+        cat(buf, ". The time comes about once a minute.", sizeof buf);
+        lv_label_set_text(s_ct_note, buf);
+        lv_obj_set_style_text_color(s_ct_note, lv_color_hex(C_TEXT_MUTE), 0);
+    } else if (s_ct.phase == EN_CTSCAN_DONE) {
+        lv_label_set_text(s_ct_note,
+            "Tap a station to set the clock to its time.");
+        lv_obj_set_style_text_color(s_ct_note, lv_color_hex(C_TEXT_MUTE), 0);
+    } else {
+        lv_label_set_text(s_ct_note,
+            s_scan.n_hits
+                ? "Stations from the last band scan, strongest first."
+                : "Run a band scan first for the best results; otherwise this "
+                  "uses your presets.");
+        lv_obj_set_style_text_color(s_ct_note, lv_color_hex(C_TEXT_MUTE), 0);
+    }
+
+    for (i = 0; i < EN_CTSCAN_MAX; i++) {
+        lv_obj_t *l, *v;
+
+        if (i >= s_ct.n_hits) { show(s_ct_rows[i], false); continue; }
+        show(s_ct_rows[i], true);
+
+        l = lv_obj_get_child(s_ct_rows[i], 0);
+        v = lv_obj_get_child(s_ct_rows[i], 1);
+
+        buf[0] = 0;
+        fmt_mhz(tmp, (int)sizeof tmp, s_ct.hits[i].khz);
+        cat(buf, tmp, sizeof buf);
+        cat(buf, "  ", sizeof buf);
+        cat(buf, s_ct.hits[i].name[0] ? s_ct.hits[i].name : "", sizeof buf);
+        lv_label_set_text(l, buf);
+
+        if (s_ct.hits[i].got) {
+            fmt_stamp(buf, (int)sizeof buf, en_ctscan_now(&s_ct, i),
+                      s_ct.hits[i].offset);
+            lv_label_set_text(v, buf);
+            lv_obj_set_style_text_color(v, lv_color_hex(C_LIVE), 0);
+        } else if (ct_running() && i == s_ct.at) {
+            buf[0] = 0;
+            cat(buf, "listening, ", sizeof buf);
+            put_uint(tmp, s_ct.waited_ms / 1000u, 0);
+            cat(buf, tmp, sizeof buf);
+            cat(buf, "s", sizeof buf);
+            lv_label_set_text(v, buf);
+            lv_obj_set_style_text_color(v, lv_color_hex(C_SIGNAL), 0);
+        } else if (ct_running() && i > s_ct.at) {
+            lv_label_set_text(v, "waiting");
+            lv_obj_set_style_text_color(v, lv_color_hex(C_TEXT_MUTE), 0);
+        } else {
+            lv_label_set_text(v, "no clock transmitted");
+            lv_obj_set_style_text_color(v, lv_color_hex(C_TEXT_MUTE), 0);
+        }
+    }
+}
+
 void rp_ui_build_all(void)
 {
     for (int i = 0; i < RP_SCREEN_COUNT; i++) build_screen_shell((rp_screen_t)i);
@@ -2609,6 +3367,8 @@ void rp_ui_build_all(void)
     build_settings();
     build_advanced();
     build_register();
+    build_rds();
+    build_clock();
 
     rebuild_order();
 
@@ -2835,6 +3595,7 @@ void rp_ui_tick(void)
        recording both have to keep running when the user swipes away from the
        screen that set them going. */
     scan_pump();
+    ct_pump();
     rectimer_pump();
     af_pump();
 
@@ -2847,6 +3608,8 @@ void rp_ui_tick(void)
     case RP_SCREEN_LIBRARY:  refresh_library();  break;
     case RP_SCREEN_SETTINGS: refresh_settings(); break;
     case RP_SCREEN_ADVANCED: break;   /* static once built */
+    case RP_SCREEN_RDS:      refresh_rds();     break;
+    case RP_SCREEN_CLOCK:    refresh_clock();   break;
     default: break;
     }
 }

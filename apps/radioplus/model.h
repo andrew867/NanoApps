@@ -172,6 +172,21 @@ void rp_act_power(bool on);
 void rp_act_mute(bool on);
 void rp_act_squelch(bool on);
 
+/*
+ * Set the clock, from a time collected off the band.
+ *
+ * Takes UTC, because that is what a hardware clock holds and what a station
+ * transmits; the local offset is a display matter. Returns a short phrase
+ * saying what happened, never NULL, because "set" and "set until you reboot"
+ * are different outcomes and the difference is the whole point of the
+ * feature.
+ */
+const char *rp_act_set_clock(int64_t utc);
+
+/* Seconds since the epoch, and what hardware clock is behind it. */
+int64_t     rp_model_now(void);
+const char *rp_model_clock_backend(void);
+
 /* Auto, forced mono, or forced stereo. Forced mono is the useful one: a weak
    station is steadier in mono than blending in and out of it. */
 void rp_act_stereo_mode(uint8_t mode);

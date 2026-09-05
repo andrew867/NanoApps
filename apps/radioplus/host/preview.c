@@ -212,6 +212,8 @@ int main(int argc, char **argv)
         { RP_SCREEN_LIBRARY,  "4-recordings" },
         { RP_SCREEN_SETTINGS, "5-settings" },
         { RP_SCREEN_ADVANCED, "6-advanced" },
+        { RP_SCREEN_RDS,      "7-rds" },
+        { RP_SCREEN_CLOCK,    "8-clock" },
     };
 
     char path[512];
