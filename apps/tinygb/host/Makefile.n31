@@ -247,11 +247,22 @@ $(BUILD)/build_stamp.o: ../../build_stamp.c | $(BUILD)
 $(BUILD)/tg_palette.o: ../platform/tg_palette.c | $(BUILD)
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
+# Staged into artifacts/linux-n31 like every other N31 app.
+#
+# This one is not in the initramfs - it lives on the volume beside its roms/
+# folder, because it reads /proc/self/exe and looks for cartridges next to
+# itself - so for a while it was the only app whose binary never reached the
+# shared artifacts directory. mk-release-zip.sh reads from there and only
+# there, which is how TinyGB came to be missing from the release entirely
+# while being perfectly built.
 $(APP): $(OBJS) $(LINK_TA) $(LVLIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 	$(STRIP) $@
 	@echo "  $(APP)  $$(stat -c%s $(APP)) bytes"
 	@$(MAKE) -s -f Makefile.n31 check
+	@mkdir -p $(IPOD_ROOT)
+	@cp -f $@ $(IPOD_ROOT)/tinygb
+	@echo "  staged -> $(IPOD_ROOT)/tinygb"
 
 # The two ways this binary can be wrong without failing to build: a float ABI
 # the libc does not share, and a dynamic binary looking for a loader that is
