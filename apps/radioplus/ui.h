@@ -65,6 +65,23 @@ void rp_ui_boot(const char *step);
    because the first thing that went wrong is the useful one. */
 void rp_ui_boot_failed(const char *what);
 
+/* Bring the boot screen back in front after rp_ui_init() has built and shown
+   the real ones, and ask whether it is still there. The startup loop uses both
+   to wait for late hardware without taking the interface away. */
+void rp_ui_boot_show(void);
+bool rp_ui_booting(void);
+
+/*
+ * Spare pixels on the Now Playing chip row with every chip at its longest
+ * label, or negative if that row would run off the screen.
+ *
+ * Exposed for the preview, which fails its run on a negative answer. The chips
+ * are laid out by flex and so can no longer overlap one another, but three
+ * variable-width things in a fixed width can still overflow together, and that
+ * width is decided by strings in three different files.
+ */
+int rp_ui_pill_row_slack(void);
+
 void rp_ui_init(void);
 void rp_ui_tick(void);           /* call from the frame callback */
 void rp_ui_show(rp_screen_t s);

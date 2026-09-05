@@ -65,6 +65,11 @@
 #define CONTENT_W (RP_SCREEN_W - 2 * MARGIN)
 #define TAP_MIN   44
 
+/* The chip row's two magic numbers, named because rp_ui_pill_row_slack()
+   has to use exactly the same ones the layout does. */
+#define PILL_PAD_H 7
+#define PILL_GAP   6
+
 /* ---- state ---------------------------------------------------------------- */
 
 static lv_obj_t *s_screen[RP_SCREEN_COUNT];
@@ -200,7 +205,7 @@ static lv_obj_t *pill(lv_obj_t *parent, int x, int y, const char *text,
     lv_obj_set_style_radius(p, 3, 0);
     lv_obj_set_pos(p, x, y);
     lv_obj_set_size(p, LV_SIZE_CONTENT, 20);
-    lv_obj_set_style_pad_hor(p, 7, 0);
+    lv_obj_set_style_pad_hor(p, PILL_PAD_H, 0);
 
     lv_obj_t *l = label(p, text, F_CAPTION, colour);
     lv_obj_center(l);
@@ -823,11 +828,22 @@ static void on_stereo_tap(lv_event_t *e)
     rp_act_stereo_mode((uint8_t)((rp_model.stereo_mode + 1u) % 3u));
 }
 
+/*
+ * What the pill says, which is what was asked for rather than what is
+ * happening - the colour and the on/off state carry the second question.
+ *
+ * "ST HOLD" and not "ST FORCED": forced stereo tells the chip to hold the
+ * stereo decoder open instead of blending down to mono as the signal weakens,
+ * which is what the shorter name actually describes. Two characters shorter
+ * also keeps the widest possible row - this, TRAFFIC, and "AF WEAK" - inside
+ * the content width, which the flex row above would otherwise push off the
+ * right edge instead of overlapping.
+ */
 static const char *stereo_mode_text(uint8_t mode)
 {
     switch (mode) {
     case EN_FM_STEREO_MONO:   return "MONO";
-    case EN_FM_STEREO_STEREO: return "ST FORCED";
+    case EN_FM_STEREO_STEREO: return "ST HOLD";
     default:                  return "STEREO";
     }
 }
@@ -926,26 +942,62 @@ static void build_now(void)
     lv_obj_set_style_text_line_space(s_rt, 4, 0);
     lv_label_set_long_mode(s_rt, LV_LABEL_LONG_WRAP);
 
-    /* Signal. A segmented meter rather than a number, because the number means
-       nothing to anyone and the shape means everything - you can see at a
-       glance whether moving the headphone cable helped. */
-    /* Pills first, on their own row. They were beside the meter and overlapped
-       it - the meter is 176 px wide and TRAFFIC ran off the right edge - which
-       is the sort of thing only a rendered screen shows you. */
-    s_af_badge = pill(s, MARGIN + 150, 258, "AF", C_RDS);
-    lv_obj_add_flag(s_af_badge, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(s_af_badge, on_af_tap, LV_EVENT_CLICKED, 0);
-    lv_obj_set_style_bg_color(s_af_badge, lv_color_hex(C_SURFACE_2),
-                              LV_STATE_PRESSED);
+    /*
+     * The three chips, laid out rather than placed.
+     *
+     * They used to sit at MARGIN, MARGIN + 76 and MARGIN + 150, which works
+     * for exactly the strings that were there when those numbers were chosen.
+     * All three are LV_SIZE_CONTENT and all three change text: the stereo pill
+     * has three modes, the AF badge has five states, and hand-placed x
+     * coordinates are a promise about string widths that nobody can keep.
+     * "ST FORCED" reached into TRAFFIC, which is the second time something on
+     * this row has overlapped.
+     *
+     * A flex row makes the overlap unrepresentable - each chip starts where
+     * the last one ended, whatever it says. Position is now the layout's job,
+     * and the only thing left to get right is that the widest combination
+     * still fits inside CONTENT_W, which the preview now renders as its own
+     * shot so it is checked rather than estimated.
+     */
+    lv_obj_t *pills = panel(s, MARGIN, 256, CONTENT_W, 24, C_BG);
+    lv_obj_set_flex_flow(pills, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(pills, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    /* After panel(), because flat() zeroes every pad. */
+    lv_obj_set_style_pad_column(pills, PILL_GAP, 0);
 
-    s_stereo = pill(s, MARGIN, 258, "STEREO", C_SIGNAL);
+    /* Added in reading order; flex keeps them in it. */
+    s_stereo = pill(pills, 0, 0, "STEREO", C_SIGNAL);
     /* A pill is normally a readout. This one is also a control, so it gets a
        target the size of the chip rather than the size of the text. */
     lv_obj_add_flag(s_stereo, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_stereo, on_stereo_tap, LV_EVENT_CLICKED, 0);
     lv_obj_set_style_bg_color(s_stereo, lv_color_hex(C_SURFACE_2),
                               LV_STATE_PRESSED);
-    s_ta_badge = pill(s, MARGIN + 76, 258, "TRAFFIC", C_TA);
+
+    /*
+     * "TA" and not "TRAFFIC".
+     *
+     * This is the chip with slack to give, and something had to give: the
+     * widest row is forced stereo plus a traffic announcement plus the AF
+     * follower reporting a weak signal, and with "TRAFFIC" in it that row is
+     * wider than the screen. TA is what the RDS flag is called, it is what
+     * every other radio labels it, and the landscape readout still spells out
+     * TRAFFIC where there is room for it.
+     *
+     * rp_ui_pill_row_slack() is what says whether this was enough.
+     */
+    s_ta_badge = pill(pills, 0, 0, "TA", C_TA);
+
+    s_af_badge = pill(pills, 0, 0, "AF", C_RDS);
+    lv_obj_add_flag(s_af_badge, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_af_badge, on_af_tap, LV_EVENT_CLICKED, 0);
+    lv_obj_set_style_bg_color(s_af_badge, lv_color_hex(C_SURFACE_2),
+                              LV_STATE_PRESSED);
+
+    /* Signal. A segmented meter rather than a number, because the number means
+       nothing to anyone and the shape means everything - you can see at a
+       glance whether moving the headphone cable helped. */
 
     for (int i = 0; i < 14; i++) {
         s_seg[i] = panel(s, MARGIN + i * 12, 288, 8, 14, C_SURFACE_2);
@@ -2630,7 +2682,11 @@ void rp_ui_boot(const char *step)
 
     if (step) lv_label_set_text(s_boot_step, step);
 
-    if (s_boot_n < 12) s_boot_n++;
+    /* Wraps rather than saturating. It used to stop at twelve, which was
+       fine when the boot screen lasted a second or two and reads as a hung
+       machine now that it can legitimately wait twenty. */
+    s_boot_n = (uint8_t)(s_boot_n % 12u + 1u);
+
     char dots[16];
     uint8_t i = 0;
     for (; i < s_boot_n && i < 12; i++) dots[i] = '.';
@@ -2642,6 +2698,30 @@ void rp_ui_boot(const char *step)
     lv_refr_now(NULL);
 }
 
+/*
+ * Put the boot screen back in front, once.
+ *
+ * rp_ui_init() ends by loading Now Playing, which is right when startup is
+ * over and wrong while it is still going on. The startup loop builds the
+ * interface first - so the buttons work and the screens are ready the instant
+ * the hardware arrives - and then calls this to cover it while it waits.
+ *
+ * Deliberately not called from rp_ui_boot(): once the listener has pressed
+ * something and gone somewhere, the boot screen must not come clawing back on
+ * the next progress update.
+ */
+void rp_ui_boot_show(void)
+{
+    if (s_boot) lv_screen_load(s_boot);
+}
+
+/* Whether the boot screen is still the one being looked at. False as soon as
+   the listener navigates away, which is what lets a press end the wait. */
+bool rp_ui_booting(void)
+{
+    return s_boot && lv_screen_active() == s_boot;
+}
+
 void rp_ui_boot_failed(const char *what)
 {
     if (!s_boot_fail || !what) return;
@@ -2650,6 +2730,74 @@ void rp_ui_boot_failed(const char *what)
     if (lv_label_get_text(s_boot_fail)[0]) return;
     lv_label_set_text(s_boot_fail, what);
     lv_refr_now(NULL);
+}
+
+/* ---- the one measurement this layout depends on --------------------------- */
+
+/*
+ * How much room is left over when every chip on the Now Playing row is showing
+ * the longest thing it can show.
+ *
+ * The row is a flex container, so the chips cannot overlap each other any
+ * more - but they can still run off the right-hand edge together, and that is
+ * a function of six strings scattered across three files. Twice now this row
+ * has broken because somebody lengthened one of them, and both times it was
+ * found by looking at a picture of a case that happened to be rendered.
+ *
+ * So it is measured instead of estimated, and measured by building the actual
+ * widget with the actual font rather than by counting characters: whatever
+ * LVGL is going to draw is what gets weighed. The strings come from the same
+ * functions the screen calls, so adding a stereo mode or an AF state is
+ * automatically included.
+ *
+ * Positive is spare pixels. Negative means the row overflows and somebody has
+ * to shorten something. The preview calls this and fails the run.
+ */
+static int measure_pill(const char *text)
+{
+    lv_obj_t *scr = lv_obj_create(NULL);
+    lv_obj_t *p = pill(scr, 0, 0, text, C_TEXT);
+    int w;
+
+    lv_obj_update_layout(scr);
+    w = lv_obj_get_width(p);
+    lv_obj_delete(scr);
+    return w;
+}
+
+int rp_ui_pill_row_slack(void)
+{
+    /* Zeroed by initialiser rather than memset: this file has no <string.h>
+       and does not need one for this. */
+    en_affollow_t a = { 0 };
+    int total = 2 * PILL_GAP;
+    int best;
+    uint8_t i;
+
+    /* Stereo, whichever of its three labels is longest. */
+    best = 0;
+    for (i = 0; i < 3; i++) {
+        int w = measure_pill(stereo_mode_text(i));
+        if (w > best) best = w;
+    }
+    total += best;
+
+    /* The traffic flag, which has only ever said one thing. */
+    total += measure_pill("TA");
+
+    /* AF, across every state it reports - including disabled, which is the
+       short one, so this is a maximum rather than a sample. */
+    best = measure_pill(en_af_state_text(&a));
+    a.enabled = true;
+    for (i = EN_AF_IDLE; i <= EN_AF_COOLDOWN; i++) {
+        int w;
+        a.phase = (en_af_phase_t)i;
+        w = measure_pill(en_af_state_text(&a));
+        if (w > best) best = w;
+    }
+    total += best;
+
+    return CONTENT_W - total;
 }
 
 void rp_ui_init(void)

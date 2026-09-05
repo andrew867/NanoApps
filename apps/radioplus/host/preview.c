@@ -152,6 +152,57 @@ int main(int argc, char **argv)
     rp_act_set_rec_limit(60);
     rp_act_set_rec_at((int16_t)(7 * 60 + 45));
 
+    /*
+     * The row that has broken twice, measured rather than looked at.
+     *
+     * A screenshot only ever shows the combination that happened to be
+     * rendered, and both times this row overflowed it was a combination
+     * nobody had shot. This weighs every label each chip can display, so it
+     * fails on the widest case whether or not anyone thought to draw it.
+     */
+    {
+        int slack = rp_ui_pill_row_slack();
+
+        printf("  pill row: %d px spare at its widest\n", slack);
+        if (slack < 0) {
+            printf("  FAILED the Now Playing chip row overflows by %d px\n",
+                   -slack);
+            return 1;
+        }
+    }
+
+    /*
+     * And a picture of it, because the number does not show alignment.
+     *
+     * Forced stereo, a traffic announcement in progress, and the AF follower
+     * reporting a weak signal - three chips at their longest strings at the
+     * same time. That combination is rare in use and is exactly the one that
+     * has broken this row twice, so it gets a picture rather than an estimate.
+     */
+    {
+        /* Its own buffer: the shared one is declared below, with the loop. */
+        char wpath[512];
+        uint8_t save_mode = rp_model.stereo_mode;
+        bool save_ta = rp_model.rds.ta;
+        en_affollow_t save_af = rp_model.af;
+
+        rp_act_stereo_mode(EN_FM_STEREO_STEREO);
+        rp_model.rds.ta = true;
+        rp_model.af.enabled = true;
+        rp_model.af.phase = EN_AF_WEAK;
+
+        rp_ui_show(RP_SCREEN_NOW);
+        rp_ui_tick();
+        settle();
+        snprintf(wpath, sizeof wpath, "%s/1c-now-widest.bmp", out);
+        if (write_bmp(wpath, s_fb, RP_SCREEN_W, RP_SCREEN_H))
+            printf("  %s\n", wpath);
+
+        rp_model.af = save_af;
+        rp_model.rds.ta = save_ta;
+        rp_act_stereo_mode(save_mode);
+    }
+
     static const struct { rp_screen_t s; const char *name; } shots[] = {
         { RP_SCREEN_SIMPLE,   "0-simple" },
         { RP_SCREEN_NOW,      "1-now" },
