@@ -8,19 +8,34 @@ RetailOS shows you a frequency. This shows you the station's name, what it is
 broadcasting, its programme type, its alternate frequencies, its own clock —
 and lets you record any of it, including the part that already happened.
 
+It will also take the whole of RDS apart on screen for you, and set the
+device's hardware clock from a broadcaster's time signal, because there is no
+network here and the band is right there.
+
 ## Screenshots
 
 | | | |
 | --- | --- | --- |
 | ![Now Playing](screenshots/now.png) | ![Landscape](screenshots/wide.png) | ![Simple](screenshots/simple.png) |
-| Now Playing | Landscape readout | Simple screen |
+| **Now Playing** — the station, what it is playing, and the buffer behind it | **Landscape** — radio text the long way round | **Simple** — six buttons, for when you are not reading |
+| ![RDS inspector](screenshots/rds.png) | ![Clock from FM](screenshots/clock.png) | ![Recording](screenshots/recording.png) |
+| **RDS inspector** — every field the broadcast carries | **Clock from FM** — setting the time off a transmitter | **Recording**, with the live buffer behind it |
 | ![Dial](screenshots/dial.png) | ![Presets](screenshots/presets.png) | ![Recordings](screenshots/recordings.png) |
-| Dial | Presets | Recordings |
+| **Dial** — the band, with the scan's own measurements under it | **Presets**, named by RDS | **Recordings**, named by when and what |
 | ![Settings](screenshots/settings.png) | ![Registers](screenshots/advanced.png) | ![One register](screenshots/register.png) |
-| Settings | Register explorer | One register |
+| **Settings** | **Register explorer** — all 39, field by field | **One register** — the stereo blend curve |
 
-Rendered from the host build at the device's exact 240×432 with
-`cd host && make -f Makefile.preview shots` — no display, no hardware.
+All of it rendered from the host build at the device's exact 240×432, with no
+display and no hardware:
+
+```bash
+cd host && make -f Makefile.preview publish
+```
+
+`shots` renders every screen; `publish` copies the subset above into
+`screenshots/` under the names this file uses. The rename table lives in the
+makefile so the pictures here cannot quietly fall behind the app — which they
+had, by three weeks and two screens, before it existed.
 
 ## What it does
 
@@ -58,6 +73,99 @@ half-filled name reads as a glitch rather than as a station. Radio text clears
 on the A/B flag toggle, or the old message shows through the gaps in the new
 one.
 
+### The RDS inspector
+
+Settings → **RDS inspector**. Everything the decoder holds, which has always
+been considerably more than four lines on Now Playing.
+
+![RDS inspector](screenshots/rds.png)
+
+- **PI taken apart.** It is not an opaque number: the top nibble is a country,
+  the next is how far the programme reaches, and the bottom byte distinguishes
+  programmes within it. A listener sees a station; this is how you see whether
+  two frequencies are carrying the same one.
+- **The call sign**, where the PI spells one. NRSC-4-B gives K stations the
+  range from `0x1000` and W stations the range from `0x54A8`, each exactly
+  26³ wide, so the three letters come straight back out by division. Outside
+  those two ranges it says so rather than inventing something — Canadian PI
+  codes are allocated centrally and do not encode the call at all.
+- **The decoder identification bits**, spelled out. Whether the transmission is
+  actually stereo, whether it is compressed, whether the programme type is
+  being switched dynamically. Four bits, arriving one per group, that nothing
+  else in the app was reading.
+- **RadioText+ including the interesting failure.** A station that announced
+  RT+ in group 3A and transmits nothing in the slot it named is the commonest
+  RT+ fault there is, and it looks identical to "no RT+" unless something tells
+  you the announcement happened.
+- **Every Open Data Application announced**, not only the one this decodes.
+  Knowing a station is also running Alert-C in 8A is exactly what this screen
+  is for.
+- **The group histogram.** All thirty-two types, with counts and proportions —
+  what the station actually transmits, as against what it claims. Underneath
+  it, the block error rate, in **per mille**: on a good signal a percentage
+  rounds to zero and reads as a broken counter.
+
+The tables behind it are `core/rdsname.c`, deliberately separate from
+`core/rds.c`. That file has to be right about bits and is tested against
+hand-built groups; this one is transcribed from IEC 62106 and NRSC-4-B, where a
+wrong string is a cosmetic bug and a wrong shift would be a corrupt decode.
+Different risk, different file.
+
+### Setting the clock off the band
+
+Settings → **Set clock from FM**.
+
+![Clock from FM](screenshots/clock.png)
+
+This device has no network, no cell radio, and a hardware clock nobody has ever
+set, so it boots believing it is some time in 1970 and files every recording
+fifty-six years early. There is no NTP to fix that with. There is, however, a
+band full of broadcasters transmitting the date and the time as part of their
+normal output, usually from the same reference that times the transmitter.
+
+So listen to them, show what each one says, and let the listener pick.
+
+Three things had to be right for this to be a feature rather than a party
+trick.
+
+**The instant, not the display.** The decoder's `ct_hour` and `ct_minute` are
+local time, which is what a listener should see and the wrong thing to set a
+clock from — a hardware clock holding local time is wrong twice a year. So the
+decoder also keeps the modified Julian day and the transmitted UTC exactly as
+they came off the air, and `en_rds_ct_unix()` turns them into seconds with one
+subtraction: MJD 40587 is the Unix epoch, so there is no calendar arithmetic in
+the path at all and therefore nothing in it that can be wrong about a leap
+year. A test asserts that the same instant transmitted from two time zones
+produces the same number.
+
+**The answer has an age.** The specification puts the minute edge at the start
+of the group carrying the time, so a station's answer is exact when it lands
+and stale immediately afterwards. A reading taken forty seconds ago sets the
+clock forty seconds slow, which is a lot to be wrong by when the source was
+accurate to the millisecond. Every result is timestamped and the elapsed time
+is added back — rounded rather than truncated, because this is the one number
+in the app where half a second of systematic bias would accumulate into
+hardware. It is also why the list keeps updating while you read it.
+
+**Whose answer it is.** `ct_valid` stays true from the first group onwards and
+the decoder belongs to whatever is tuned, so asking "does it have a time?"
+after retuning is answered by the *previous* station within a millisecond. Only
+the group counter moving means this station spoke. There is a test for exactly
+that case, because it is a wrong answer that looks like a very fast right one.
+
+It is its own state machine (`core/ctscan.c`) rather than a mode of the band
+scan, and unavoidably slow: group 4A comes about once a minute, where the band
+scan leaves each station as soon as the name arrives — usually under a
+second — so it would never see one. Candidates come from the last band scan
+sorted by signal strength, which is what decides whether this takes thirty
+seconds or six minutes; failing that the presets; failing that whatever is
+tuned.
+
+Both clocks get set, and they are not the same clock. `settimeofday` fixes the
+running system and every timestamp from that moment on; `RTC_SET_TIME` on the
+first RTC that opens is what makes it survive a reboot. "Set" and "set until
+you reboot" are reported as different outcomes, because they are. UTC in both.
+
 ### Recording
 
 - **Record what is playing**, to WAV, with an RDS sidecar beside it.
@@ -84,6 +192,50 @@ afterwards.
 It is written streaming — opened, appended to, closed — so an hour-long
 recording does not have to be held in memory, and each append is a complete
 line that stands on its own if the file is truncated.
+
+### Mute, and a silent scan
+
+The speaker in the corner of the frequency mutes at the tuner's own
+`MANUAL_MUTE` bit, through the `FM Tuner Mute` control the machine driver
+publishes on the sound card.
+
+The place matters. Muting by closing the capture PCM would also stop the IIS2
+clock and take RDS down with it — and RDS is precisely what you want to keep
+while the audio is off, because the band scan's naming pass is nothing but RDS.
+So a scan runs silent: two hundred channels of hiss on the way to twenty
+stations is not something anybody wants to listen to, and the names still
+arrive.
+
+The scan's squelch and your mute are separate flags over the same bit in the
+chip. A scan that ended by unmuting would have overridden a decision you made
+before you started it.
+
+There is deliberately no volume here. No FM volume register appears anywhere in
+the recovered `FM_RDS_Command` map; level on this path is the codec's playback
+volume once the audio reaches the headphones, which is already a control. A
+software gain would be a second volume corresponding to nothing.
+
+### FM into Bluetooth headphones
+
+```bash
+RADIOPLUS_PCM_OUT=1,0 radioplus     # write to hw:Loopback,0
+```
+
+With `snd-aloop` loaded, that puts the radio where `tinybtd`'s SBC encoder
+reads it from `hw:Loopback,1`, and FM comes out of a pair of Bluetooth
+headphones. This was assumed for a long time to need audio routing the SoC does
+not have; with the encoder in software it is two PCMs and a kernel module, and
+was never a hardware limit.
+
+Doing it in the player rather than with an `arecord` pipe off the capture
+device keeps the parts that make this app worth using — the live ring, the
+scrubbing and the recording all sit between the tuner and that write, and a
+pipe bypasses every one of them.
+
+Two things to know before setting it: the loopback takes its rate from
+whichever side opens first, so start the encoder end first; and a loopback with
+nothing reading it fills and stops, which sounds exactly like the radio having
+died.
 
 ### Two optional screens
 
@@ -129,8 +281,13 @@ core/          pure C99, no allocation, no I/O — testable with no hardware
   fmcmd.c        HCI command framing for the tuner
   fmreg.c        the register table, transcribed from the specification
   rds.c          IEC 62106 / RBDS group decoding
+  rdsname.c      what those numbers mean, in words
+  ctscan.c       collecting the time of day from the band
   region.c       band plans
+  scan.c         sweeping the band for stations
   store.c        presets, settings and the sidecar, as JSON
+  timer.c        the recording timer
+  affollow.c     following a station across transmitters
   wav.c          WAV headers, including repairing a streamed one
 platform/      one file per target, behind a header core/ never sees
 ui.c           every screen, shared by the device and the host preview
@@ -139,6 +296,29 @@ ui.c           every screen, shared by the device and the host preview
 The screens read `rp_model` and nothing else. That is what lets the whole
 interface be rendered on a desktop with no tuner: the host preview fills the
 same struct with a plausible station and every screen believes it.
+
+### Starting up is a race, and losing it is not fatal
+
+The drivers this app needs arrive from scripts running alongside it — the sound
+modules a few seconds into boot, `hci0` raised by another — so which of us gets
+there first is a race that nobody should be relying on. It used to be written
+as though start-up were an instant: one attempt at the tuner, at capture and at
+playback, the answers latched into the model, and a driver that turned up two
+seconds later was indistinguishable from one that never would.
+
+Now each is a stage that can be retried and is idempotent. The interface is
+built *before* the wait, so the boot screen is a cover over a working
+application rather than a substitute for one, the buttons answer throughout,
+and pressing anything ends the wait early. Anything still missing is retried
+every four seconds indefinitely, so a tuner that appears a minute in is powered
+up, given its region, its overrides and its remembered frequency, and simply
+starts working.
+
+Asking the controller its state is one cheap ioctl. *Raising* it is not —
+`hci_bcm` carries `HCI_QUIRK_NON_PERSISTENT_SETUP`, so every `HCIDEVUP` re-runs
+a 31 KB firmware patch upload over a 115200 baud UART — so that happens on a
+thread of its own and the screen keeps drawing while the radio comes up
+underneath it.
 
 ### Rotating without rotating
 
@@ -336,6 +516,19 @@ four.
 - **Storage is optional and that is deliberate.** Settings, presets and
   recordings live under `RADIOPLUS_HOME`; with no volume mounted the app starts
   anyway and simply has nothing saved to load.
+- **Setting the clock needs privilege.** `settimeofday` and `RTC_SET_TIME` both
+  do; unprivileged, the screen says "not permitted" rather than appearing to
+  work.
+- **The clock scan is slow and cannot not be.** Group 4A comes about once a
+  minute, so a station that is going to answer takes up to seventy seconds and
+  one that is not takes exactly seventy. Run a band scan first — the ordering
+  by signal strength is the difference between half a minute and six.
+- **The mute button needs the machine driver.** `FM Tuner Mute` is published by
+  `nano7-audio`; on a card built before it exists the control is absent and the
+  button hides itself rather than sitting there doing nothing.
+- **Nothing here decodes TMC or EON.** Both are counted in the group histogram
+  and named in the inspector, and neither is interpreted. Alert-C in
+  particular is a whole protocol with its own location tables.
 
 ## Licence
 

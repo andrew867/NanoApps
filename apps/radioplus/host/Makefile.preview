@@ -71,7 +71,7 @@ BUILD_STAMP := $(shell date -u +%Y%m%d.%H%M)
 BUILD_GIT   := $(shell git rev-parse --short=7 HEAD 2>/dev/null || echo nogit)
 CFLAGS += -DEN_BUILD_STAMP='"$(BUILD_STAMP)"' -DEN_BUILD_GIT='"$(BUILD_GIT)"'
 
-.PHONY: shots clean clean-lvgl
+.PHONY: shots publish clean clean-lvgl
 
 # Stated rather than implied: adding a rule above the first target silently
 # makes THAT what a bare `make` builds.
@@ -82,6 +82,32 @@ shots: $(BUILD)/preview
 	@./$(BUILD)/preview shots
 	@python3 tobmp.py shots && rm -f shots/*.bmp
 	@ls shots/
+
+# The subset the README embeds, under the names it embeds them by.
+#
+# These used to be copied across by hand, which meant the pictures in the
+# README were whatever somebody last remembered to copy: the set committed to
+# the repository was three weeks and two screens out of date before anyone
+# noticed. A rename table is the whole difference between documentation that
+# drifts and documentation that cannot.
+#
+# Numbered on the left because the shot list is ordered by screen and reads
+# better that way. Plain on the right because a README should not have to know.
+PUBLISH := \
+	0a-boot:boot 0-simple:simple 1-now:now 7-now-recording:recording \
+	1b-wide:wide 2-dial:dial 3-presets:presets \
+	3b-presets-scanning:scanning 4-recordings:recordings \
+	5-settings:settings 6-advanced:advanced 10-reg-blend:register \
+	6b-rds:rds 6c-clock:clock
+
+publish: shots
+	@mkdir -p ../screenshots
+	@for m in $(PUBLISH); do \
+	   src=shots/$${m%%:*}.png; dst=../screenshots/$${m##*:}.png; \
+	   if [ -f "$$src" ]; then cp -f "$$src" "$$dst"; \
+	   else echo "  MISSING $$src" >&2; exit 1; fi; \
+	 done
+	@echo "  published to ../screenshots"
 
 # No lv_conf prerequisite: the cache directory name already carries that file's
 # hash, so a config change selects different objects rather than invalidating
