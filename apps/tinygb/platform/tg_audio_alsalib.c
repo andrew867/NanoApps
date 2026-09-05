@@ -35,6 +35,27 @@
 /* Card 0, device 0 - "nano7gaudio", playback cs42l81-hifi-0. */
 #define TG_PCM_HW "hw:0,0"
 
+/*
+ * Somewhere else, when asked.
+ *
+ * TINYGB_ALSA_DEVICE takes an alsa-lib device name and is tried before
+ * anything below. The reason it exists is snd-aloop: writing "hw:1,0" puts the
+ * emulator where tinybtd's SBC encoder reads it from hw:1,1, and the Game Boy
+ * comes out of a pair of Bluetooth headphones. Radio+, TinyPod and fbdoom all
+ * already had a way to say this and this was the one that did not.
+ *
+ * A name rather than a card and device number, unlike TinyPod's pair of
+ * integers, because this backend is alsa-lib and its whole advantage is that
+ * it understands names - "plug:hw:1,0" is a perfectly reasonable thing to want
+ * here and cannot be spelled as two integers.
+ *
+ * No fallback when it is set. An override that silently plays somewhere else
+ * because the place you asked for was busy is worse than a failure: the
+ * loopback's commonest fault is exactly that, and falling back to the
+ * headphones would look like Bluetooth working badly rather than not at all.
+ */
+#define TG_PCM_ENV "TINYGB_ALSA_DEVICE"
+
 struct tg_audio {
     snd_pcm_t *pcm;
     unsigned   rate;
@@ -78,9 +99,19 @@ static int try_open(tg_audio *a, unsigned rate)
      * middle is work the device does not need to do. "plug" is the fallback
      * for a card that will not take S16 stereo directly.
      */
-    static const char *names[] = { TG_PCM_HW, "plug:" TG_PCM_HW, "default" };
+    const char *names[3] = { TG_PCM_HW, "plug:" TG_PCM_HW, "default" };
+    unsigned n_names = 3;
 
-    for (unsigned i = 0; i < sizeof names / sizeof names[0]; i++) {
+    /* Asked for by name: that one, and only that one. */
+    {
+        const char *env = getenv(TG_PCM_ENV);
+        if (env && *env) {
+            names[0] = env;
+            n_names = 1;
+        }
+    }
+
+    for (unsigned i = 0; i < n_names; i++) {
         snd_pcm_t *h = NULL;
         int rc;
 
