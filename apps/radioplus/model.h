@@ -135,6 +135,18 @@ typedef struct {
     bool     can_seek;
     const char *backend;
     const char *capture_backend;
+
+    /*
+     * And the same for the output, which had nowhere to say so.
+     *
+     * The capture row on the settings screen has always carried the reason it
+     * could not open - "n31fm unavailable: No such file or directory" is a
+     * different fault from "n31fm unavailable: Invalid argument", and one of
+     * them is a missing card and the other a missing /etc/asound.conf. The
+     * playback side had no such row, so "no audio out" was the whole of what a
+     * person could learn about half the audio path.
+     */
+    const char *play_backend;
 } rp_model_t;
 
 extern rp_model_t rp_model;

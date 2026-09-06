@@ -177,6 +177,27 @@ bool en_play_out_ready(uint8_t i)
    while somebody is still looking at the screen. */
 #define FAIL_LIMIT 300u
 
+/*
+ * How long the writer waits for room before it decides the stream is dead.
+ *
+ * This exists because of the shape of a blocking write. snd_pcm_writei on a
+ * full buffer waits for the hardware to consume some of it, and a device that
+ * is open but not clocking never does - so the write does not fail, it simply
+ * never returns. The thread is then unkillable: en_play_stop sets the flag and
+ * joins, and the join waits on a thread that is inside the kernel with no
+ * reason to come out. Radio+ stops responding to SIGTERM, which is what the
+ * launcher sends for HOME, and the only way out of the app is the hard
+ * power-off.
+ *
+ * So nothing here waits without a deadline. snd_pcm_wait carries one; 200 ms
+ * is far longer than a period and short enough that quitting feels immediate.
+ * Twenty-five of them in a row - five seconds with no room at all - is a
+ * stream that is not going to move, and it is closed and reopened rather than
+ * waited on.
+ */
+#define WAIT_MS      200
+#define STALL_WAITS  25u
+
 static snd_pcm_t  *s_pcm;
 static pthread_t   s_thread;
 static bool        s_running;
@@ -388,6 +409,7 @@ static void *writer(void *arg)
         uint32_t got = 0;
         snd_pcm_uframes_t left;
         uint8_t *at_bytes;
+        unsigned stalled;
 
         if (!ensure_open()) {
             /* Nothing to write to. Waiting rather than spinning, and still
@@ -466,8 +488,42 @@ static void *writer(void *arg)
          */
         left = PERIOD_FRAMES;
         at_bytes = buf;
+        stalled = 0;
         while (left && s_running) {
-            snd_pcm_sframes_t put = snd_pcm_writei(s_pcm, at_bytes, left);
+            snd_pcm_sframes_t put;
+            int w = snd_pcm_wait(s_pcm, WAIT_MS);
+
+            if (w == 0) {
+                /*
+                 * No room yet. Going round again is the whole point: it is
+                 * where s_running is re-read, so a stop that arrives while the
+                 * sink is full is acted on within a fifth of a second instead
+                 * of never.
+                 */
+                if (++stalled < STALL_WAITS)
+                    continue;
+
+                /* Five seconds without room. Not a slow sink - a dead one. */
+                snprintf(s_desc, sizeof s_desc, "%s stopped accepting audio",
+                         k_out[s_out_open < OUT_N ? s_out_open : 0].label);
+                close_pcm();
+                pthread_mutex_lock(&s_lock);
+                s_fails++;
+                if (s_fails > FAIL_LIMIT) s_failed = true;
+                pthread_mutex_unlock(&s_lock);
+                break;
+            }
+            stalled = 0;
+
+            if (w < 0) {
+                if (recover(s_pcm, w) < 0) {
+                    close_pcm();
+                    break;
+                }
+                continue;
+            }
+
+            put = snd_pcm_writei(s_pcm, at_bytes, left);
 
             if (put < 0) {
                 pthread_mutex_lock(&s_lock);

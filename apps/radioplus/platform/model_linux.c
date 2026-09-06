@@ -257,6 +257,34 @@ static void failed(const char *why)
 static void mute_apply(void);
 
 static bool s_tuner_configured;
+
+/*
+ * Whether the tuner has had its turn - which is NOT whether it worked.
+ *
+ * The audio path must not open before a station has been tuned, because the
+ * driver holds the audio route off until then and a capture opened early
+ * carries silence that looks exactly like a broken card. That is an ordering
+ * rule and this file briefly turned it into a dependency: capture and playback
+ * were gated on the tune having RETURNED OK, so a device whose controller was
+ * down - no hci0, no FM, nothing to tune - opened no sound card at all and
+ * reported that it could not find one. The card was fine. Radio+ never asked
+ * it.
+ *
+ * So there are two flags. s_tuner_configured means the tuner is set up and is
+ * what the retry watches. This one means "we are past the point where opening
+ * audio could beat the tune to it", and it is what the audio waits on: set as
+ * soon as a tune has been ATTEMPTED, or once we have waited long enough for a
+ * tuner that is never going to answer. A machine with no tuner still gets its
+ * sound card, which is what lets it play back recordings.
+ */
+static bool s_tuner_settled;
+
+/* How long a tuner that has not answered at all gets before the audio stops
+   waiting for it. Short: there is nothing to be early for on a machine with no
+   tuner, and the only cost of being wrong is a moment of silence on a machine
+   where one turns up late. */
+#define TUNE_GRACE_MS 3000u
+
 static uint32_t s_bringup_ms;      /* when bring_up ran, for the cadence */
 static bool s_bringup_reported;    /* the deadline message, at most once */
 
@@ -348,6 +376,9 @@ static bool try_tuner(void)
            idempotent, so a retry costs a few sysfs writes and buys a machine
            whose controller answered a moment before it was ready. */
         s_tuner_configured = tuner_configure();
+
+        /* Attempted, which is all the audio path needs to know. */
+        s_tuner_settled = true;
     }
     return rp_model.tuner_ok;
 }
@@ -409,14 +440,27 @@ static void volume_apply(void)
  * silence, which is indistinguishable from a broken audio path and has been
  * mistaken for one.
  *
- * s_tuner_configured is the gate, because it is set only once the tune has
- * gone through. Nothing here has to know the ordering; it cannot be got wrong
- * from this side.
+ * audio_may_open() is the gate. Nothing here has to know the ordering; it
+ * cannot be got wrong from this side.
  */
+static bool audio_may_open(void)
+{
+    /* A tune has been attempted. Whether it worked is the tuner's problem. */
+    if (s_tuner_settled)
+        return true;
+
+    /*
+     * Or the tuner never turned up at all. Waiting forever for one would mean
+     * a device with a broken controller has no sound card either, which is how
+     * this went wrong the first time: there is nothing to be early for when
+     * there is no tuner, and a recording still deserves somewhere to play.
+     */
+    return now_ms() - s_bringup_ms >= TUNE_GRACE_MS;
+}
 static bool try_capture(void)
 {
     if (rp_model.capture_ok) return true;
-    if (!s_tuner_configured) return false;
+    if (!audio_may_open()) return false;
 
     rp_model.capture_ok = (en_cap_start(s_settings.live_seconds) == EN_CAP_OK);
     rp_model.capture_backend = en_cap_backend();
@@ -429,7 +473,7 @@ static bool try_capture(void)
 static bool try_play(void)
 {
     if (rp_model.play_ok) return true;
-    if (!s_tuner_configured) return false;
+    if (!audio_may_open()) return false;
 
     rp_model.play_ok = (en_play_start() == EN_PLAY_OK);
     return rp_model.play_ok;
@@ -496,8 +540,12 @@ static const char *dep_missing(void)
        gap - the region write, the overrides and the tune itself are several
        round trips through HCI - and during it the audio deliberately has not
        been opened. Saying so beats "waiting for the sound card" on a machine
-       whose sound card is fine. */
-    if (!s_tuner_configured)  return "tuning";
+       whose sound card is fine.
+
+       Reported on the ATTEMPT, not on success: a tune that keeps failing is a
+       tuner fault and is reported as one below, not as a permanent "tuning"
+       that never resolves. */
+    if (!s_tuner_settled)     return "tuning";
     if (!rp_model.capture_ok) return "waiting for the sound card";
     if (!rp_model.play_ok)    return "waiting for audio out";
     return NULL;
@@ -557,6 +605,11 @@ static void try_all(void)
 
 static void bring_up(void)
 {
+    /* Before anything opens a PCM or a control: alsa-lib reports through a
+       global handler that writes to stderr, and this app owns the screen the
+       console may be pointed at. */
+    en_alsa_quiet();
+
     step("reading settings");
     paths_init();
 
@@ -807,6 +860,7 @@ void rp_model_refresh(void)
     rp_model.play_file = (ps.source == EN_SRC_FILE);
     rp_model.output = ps.output;
     rp_model.output_open = ps.output_open;
+    rp_model.play_backend = en_play_backend();
     rp_model.play_paused = ps.paused;
     rp_model.play_pos_ms = ps.pos_ms;
     rp_model.play_len_ms = ps.len_ms;

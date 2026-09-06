@@ -119,6 +119,26 @@ bool en_mix_defaults(void);
 #define EN_MIX_CODEC_SAFE 75
 #define EN_MIX_CODEC_MAX  88
 
+/*
+ * Take alsa-lib's own diagnostics off stderr, and keep the last one.
+ *
+ * alsa-lib reports through a global handler that writes to stderr by default,
+ * and it is chatty about a device it cannot resolve - several lines per failed
+ * open. That is fine for a command line tool and wrong here twice over: this
+ * app owns the framebuffer while it runs and the console may be pointed at the
+ * same screen, and the retry loops mean a device that stays missing produces
+ * those lines for as long as the app is running.
+ *
+ * snd_lib_error_set_handler is the interface for exactly this. Nothing is
+ * thrown away - the last message is kept and is worth showing on the settings
+ * screen, where "n31fm: Invalid argument" is the difference between a card
+ * that is missing and an /etc/asound.conf that is.
+ *
+ * Call once, before anything else here opens anything.
+ */
+void        en_alsa_quiet(void);
+const char *en_alsa_last_error(void);
+
 const char *en_mix_backend(void);
 
 #endif /* RADIOPLUS_MIXER_H */

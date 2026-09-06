@@ -176,6 +176,9 @@ void rp_model_refresh(void)
         rp_model.hp_level = 75;
         rp_model.hp_level_ok = true;
 
+        rp_model.play_backend =
+            "alsa-lib n31both (Both)  32000 Hz 2 ch  8192 frames, starts full";
+        rp_model.output_open = true;
         rp_model.backend = "bcm2078-bt at /sys/devices/platform/soc/bcm2078";
         rp_model.capture_backend =
             "alsa-lib n31fm  32000 Hz 2 ch  2048 frame buffer  30s live";

@@ -141,6 +141,7 @@ static lv_obj_t *s_vol_overlay, *s_vol_bar, *s_vol_txt;
 static uint8_t   s_vol_last = 0xFF;    /* 0xFF: nothing seen yet */
 static uint32_t  s_vol_until;
 #define VOL_SHOW_MS 1500u
+static lv_obj_t *s_set_play;
 static lv_obj_t *s_set_region, *s_set_std, *s_set_backend, *s_set_capture,
                 *s_set_ta;
 static lv_obj_t *s_adv_list;
@@ -2281,6 +2282,9 @@ static void build_settings(void)
     r = setting_row(s, y, 62, "Output", 0, on_output_next);
     s_set_output = row_value(r, C_SIGNAL);
     lv_obj_set_pos(s_set_output, MARGIN, 14);
+    /* Only ever a reason, never a description: this row is a control, and the
+       device it resolved to is on the Playback row below with the other two
+       backends, which are sized for a string that wraps. */
     s_set_output_note = para(r, "", F_CAPTION, C_TEXT_MUTE, CONTENT_W);
     lv_obj_set_pos(s_set_output_note, MARGIN, 32);
     y += 62;
@@ -2320,6 +2324,14 @@ static void build_settings(void)
     r = setting_row(s, y, 88, "Capture", 0, 0);
     s_set_capture = para(r, "", F_CAPTION, C_TEXT_MUTE, CONTENT_W);
     lv_obj_set_pos(s_set_capture, MARGIN, 30);
+    y += 88;
+
+    /* The other half of the audio path, which had no row at all - so "no audio
+       out" was the whole of what could be learned about it, and a missing card
+       and a missing /etc/asound.conf looked identical. */
+    r = setting_row(s, y, 88, "Playback", 0, 0);
+    s_set_play = para(r, "", F_CAPTION, C_TEXT_MUTE, CONTENT_W);
+    lv_obj_set_pos(s_set_play, MARGIN, 30);
     y += 88;
 
     r = setting_row(s, y, 48, "Record traffic", 0, on_ta_toggle);
@@ -2417,7 +2429,13 @@ static void refresh_settings(void)
         s_out_why[0] = 0;
         lv_label_set_text(s_set_output_note,
                           rp_model.output_open ? "" : "not receiving audio");
+        lv_obj_set_style_text_color(s_set_output_note,
+            lv_color_hex(rp_model.output_open ? C_TEXT_MUTE : C_TA), 0);
     }
+
+    lv_label_set_text(s_set_play,
+                      rp_model.play_backend ? rp_model.play_backend
+                                            : "not started");
 
     {
         char b[16];

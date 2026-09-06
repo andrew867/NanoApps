@@ -71,6 +71,18 @@
 #define PERIOD_FRAMES 512u
 #define PERIOD_COUNT  4u
 
+/*
+ * The reader waits with a deadline, for the same reason the player writes with
+ * one: snd_pcm_readi on a device that is open but not clocking blocks forever,
+ * and en_cap_stop() joins this thread on the way out of the app. A capture
+ * that never produces a sample would make Radio+ unquittable - the process
+ * would sit in pthread_join through SIGTERM, which is what HOME sends.
+ *
+ * 200 ms is several periods at 32 kHz and is short enough that quitting is
+ * immediate to a person.
+ */
+#define WAIT_MS 200
+
 static snd_pcm_t  *s_pcm;
 static pthread_t   s_thread;
 static bool        s_running;
@@ -229,7 +241,27 @@ static void *reader(void *arg)
     if (!buf) return 0;
 
     while (s_running) {
-        snd_pcm_sframes_t got = snd_pcm_readi(s_pcm, buf, PERIOD_FRAMES);
+        snd_pcm_sframes_t got;
+        int w = snd_pcm_wait(s_pcm, WAIT_MS);
+
+        /*
+         * Nothing arrived. Not an overrun and not counted as one - a silent
+         * tuner is a normal thing to be pointed at. Going round again is where
+         * s_running is re-read, which is what makes this thread joinable.
+         */
+        if (w == 0)
+            continue;
+
+        if (w < 0) {
+            pthread_mutex_lock(&s_lock);
+            s_overruns++;
+            pthread_mutex_unlock(&s_lock);
+            if (recover(s_pcm, w) < 0)
+                usleep(50000);
+            continue;
+        }
+
+        got = snd_pcm_readi(s_pcm, buf, PERIOD_FRAMES);
 
         if (got < 0) {
             /*

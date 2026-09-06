@@ -22,6 +22,7 @@
 
 #include "mixer.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,6 +46,44 @@ static const char *const k_name[EN_MIX_N] = {
 
 static snd_ctl_t *s_ctl;
 static char       s_desc[96];
+static char       s_alsa_err[160];
+
+/*
+ * alsa-lib's diagnostics, captured rather than printed.
+ *
+ * The signature is fixed by snd_lib_error_set_handler. `file` and `line` are
+ * alsa-lib's own source position and are no use to anybody here; the function
+ * name and the message are, and so is the errno it was reporting.
+ */
+static void alsa_error(const char *file, int line, const char *fn, int err,
+                       const char *fmt, ...)
+{
+    char msg[112];
+    va_list ap;
+
+    (void)file;
+    (void)line;
+
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof msg, fmt, ap);
+    va_end(ap);
+
+    if (err)
+        snprintf(s_alsa_err, sizeof s_alsa_err, "%s: %s (%s)",
+                 fn ? fn : "alsa", msg, snd_strerror(err));
+    else
+        snprintf(s_alsa_err, sizeof s_alsa_err, "%s: %s", fn ? fn : "alsa", msg);
+}
+
+void en_alsa_quiet(void)
+{
+    snd_lib_error_set_handler(alsa_error);
+}
+
+const char *en_alsa_last_error(void)
+{
+    return s_alsa_err[0] ? s_alsa_err : "";
+}
 
 /* The card, as a control name. Overridable for a machine where the audio card
    is not the first one, which costs nothing here and saves a rebuild there. */
