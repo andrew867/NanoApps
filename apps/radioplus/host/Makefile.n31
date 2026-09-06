@@ -1,8 +1,17 @@
 # Radio+ for the N31 Linux port.
 #
 # Control goes through the bcm2078-bt driver sysfs interface and audio through
-# tinyalsa on hw:0,1. Nothing here opens a UART or builds an HCI packet - that
-# is the driver's job.
+# alsa-lib. Nothing here opens a UART or builds an HCI packet - that is the
+# driver's job.
+#
+# alsa-lib and not tinyalsa, which this linked until the audio path was
+# finished. Everything the app needs from the sound system on this device is an
+# alsa-lib plugin defined in /etc/asound.conf: the softvol that gives the tuner
+# and the Bluetooth leg a volume neither has a register for, the rate converter
+# in front of the codec, and the tee that reaches the headphones and Bluetooth
+# at once. tinyalsa talks to /dev/snd directly and cannot see a plugin at all,
+# so with it there is no volume, no mute, no conversion and no simultaneous
+# output. It is smaller and it was the right choice while none of that existed.
 #
 #   cd host && make -f Makefile.n31            build the app
 #   cd host && make -f Makefile.n31 objs       compile-check only
@@ -15,20 +24,50 @@
 # builds its own, which also means the app builds from a clone of itself rather
 # than requiring a sibling app to have been built first.
 #
-# tinyalsa is still borrowed. It is eight files with no configuration at all, so
-# there is nothing for the two builds to disagree about.
+# libasound.a is built once in the ipod repo, by build-n31-mpg123-alsa.sh, and
+# staged where every app that needs it can find it. Its config tree goes into
+# the image separately - alsa-lib resolves even "hw:0" through /usr/share/alsa,
+# so a binary linked against it needs those files present on the device.
 
 IPOD_ROOT ?= /mnt/c/src/ipod/artifacts/linux-n31
 TOOLCHAIN ?= $(IPOD_ROOT)/tinyalsa-build/arm-linux-musleabi-cross
-TINYALSA  ?= $(IPOD_ROOT)/tinyalsa-build/tinyalsa-2.0.0
+
+# Which toolchain, and which float ABI.
+#
+# Overridable so a hard-float build can be made without disturbing this one.
+# The default is unchanged and stays unchanged until hard float has been shown
+# to work on hardware: this is what currently boots.
+#
+# softfp is not soft float. The FPU does the arithmetic either way; what the
+# ABI decides is whether a float crossing a function boundary travels in a VFP
+# register or in a pair of integer ones. Hard float cannot simply be switched
+# on here, because musleabi's own libc is built the other way and the link
+# fails with "uses VFP register arguments" - it needs the whole parallel
+# toolchain, and every vendored library rebuilt against it.
+#
+#   make -f Makefile.n31 \
+#     TOOLCHAIN=$(IPOD_ROOT)/toolchain-hf/arm-linux-musleabihf-cross \
+#     TRIPLE=arm-linux-musleabihf FLOAT_ABI=hard BUILD=build-n31-hf
+#
+# BUILD has to differ too. Objects of the two ABIs cannot be linked together -
+# which at least fails loudly rather than quietly - but they would happily
+# share an object directory and confuse every later build.
+TRIPLE    ?= arm-linux-musleabi
+FLOAT_ABI ?= softfp
+
+# Hard-float builds stage under a different name. The soft-float
+# artifact is what mk-initramfs.sh packs, and a parallel ABI
+# experiment must not quietly become the thing that boots.
+STAGE_SUFFIX := $(if $(filter-out softfp,$(FLOAT_ABI)),-$(FLOAT_ABI),)
+ALSA      ?= $(IPOD_ROOT)/alsa
 SSH_KEY   ?= $(IPOD_ROOT)/n31_id
 DEVICE    ?= root@192.168.7.2
 
 CCACHE := $(shell command -v ccache 2>/dev/null)
-CC     := $(CCACHE) $(TOOLCHAIN)/bin/arm-linux-musleabi-gcc
-AR     := $(TOOLCHAIN)/bin/arm-linux-musleabi-ar
-STRIP  := $(TOOLCHAIN)/bin/arm-linux-musleabi-strip
-BUILD  := build-n31
+CC     := $(CCACHE) $(TOOLCHAIN)/bin/$(TRIPLE)-gcc
+AR     := $(TOOLCHAIN)/bin/$(TRIPLE)-ar
+STRIP  := $(TOOLCHAIN)/bin/$(TRIPLE)-strip
+BUILD  ?= build-n31
 CORE   := ../core
 PLAT   := ../platform
 LVGL   ?= ../../../lvgl
@@ -42,9 +81,11 @@ include ../../lvgl-mirror.mk
 # time than the compiler costs in CPU, and lv_conf is a tracked file whose mtime
 # moves on every branch switch even when not one byte of it changed.
 LV_CONF    := lv_conf_n31.h
+# The float ABI is part of the key, not just the config: objects of the
+# two ABIs cannot be linked together, and a cache that ignored the
+# difference would hand a hard-float build its soft-float objects.
 LV_CONF_ID := $(shell md5sum $(LV_CONF) 2>/dev/null | cut -c1-12)
-LV_CACHE   ?= $(HOME)/.cache/n31-lvgl/radioplus-n31-$(LV_CONF_ID)
-
+LV_CACHE   ?= $(HOME)/.cache/n31-lvgl/radioplus-n31-$(LV_CONF_ID)-$(FLOAT_ABI)
 # LVGL, minus every platform this target will never be.
 LV_SRCS := $(shell find $(LVGL_SRC)/src -name '*.c' \
              -not -name 'lv_freertos.c' -not -name 'lv_cmsis_rtos2.c' \
@@ -60,15 +101,12 @@ LV_SRCS := $(shell find $(LVGL_SRC)/src -name '*.c' \
 LV_OBJS := $(patsubst $(LVGL_SRC)/%.c,$(LV_CACHE)/%.o,$(LV_SRCS))
 LVLIB   := $(LV_CACHE)/liblvgl_n31.a
 
-# Still borrowed: eight files, no configuration, nothing to disagree about.
-TALIB  ?= ../../entrain/host/build-n31/libtinyalsa_n31.a
-
-ARCH_FLAGS := -mcpu=cortex-a5 -mthumb -mfpu=vfpv4 -mfloat-abi=softfp
+ARCH_FLAGS := -mcpu=cortex-a5 -mthumb -mfpu=vfpv4 -mfloat-abi=$(FLOAT_ABI)
 
 CFLAGS := -O2 -g0 -std=gnu99 $(ARCH_FLAGS) \
           -ffunction-sections -fdata-sections \
           -Wall -Wextra -Wshadow -Wno-unused-parameter \
-          -I$(TINYALSA)/include
+          -I$(ALSA)/include
 
 LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_n31.h\" \
              -I$(LVGL_SRC) -I$(LVGL_SRC)/src -I$(LVGL_SRC)/include -I$(LVGL_SRC)/.. -I..
@@ -78,7 +116,7 @@ CORE_SRCS := $(CORE)/fmcmd.c $(CORE)/fmreg.c $(CORE)/rds.c $(CORE)/rdsname.c \
              $(CORE)/wav.c $(CORE)/store.c $(CORE)/scan.c $(CORE)/timer.c $(CORE)/affollow.c ../../build_stamp.c
 
 PLAT_SRCS := $(PLAT)/tuner_linux.c $(PLAT)/capture_linux.c \
-             $(PLAT)/clock_linux.c \
+             $(PLAT)/clock_linux.c $(PLAT)/mixer_linux.c \
              $(PLAT)/player_linux.c $(PLAT)/model_linux.c
 
 APP      := $(BUILD)/radioplus
@@ -120,17 +158,22 @@ $(LVLIB): $(LV_OBJS)
 
 # Static, so it needs nothing on the device but a kernel.
 $(APP): $(APP_SRCS) $(HDRS) $(LVLIB) | $(BUILD)
-	@test -f $(TALIB) || { echo "no ARM tinyalsa at $(TALIB)"; \
-	  echo "build it once from the entrain n31 target"; exit 1; }
+	@test -f $(ALSA)/lib/libasound.a || { \
+	  echo "no ARM alsa-lib at $(ALSA)/lib/libasound.a"; \
+	  echo "build it once with build-n31-mpg123-alsa.sh in the ipod repo"; \
+	  exit 1; }
+	@# -ldl because alsa-lib calls dlopen for its plugins. Statically linked
+	@# against musl those are stubs, which is correct here: every plugin this
+	@# app names is one of the built-ins.
 	$(CC) $(CFLAGS) $(LV_CFLAGS) -static -Wl,--gc-sections \
-	      -o $@ $(APP_SRCS) $(LVLIB) $(TALIB) -lm -lpthread
+	      -o $@ $(APP_SRCS) $(LVLIB) $(ALSA)/lib/libasound.a -ldl -lm -lpthread
 	@$(STRIP) $@
 	@# Stage where the image builder looks, every time, so an image packed
 	@# from the other repo can never be older than the last build here. See
 	@# STAGING in the app READMEs.
 	@mkdir -p $(IPOD_ROOT)
-	@cp -f $@ $(IPOD_ROOT)/radioplus
-	@echo "  staged -> $(IPOD_ROOT)/radioplus"
+	@cp -f $@ $(IPOD_ROOT)/radioplus$(STAGE_SUFFIX)
+	@echo "  staged -> $(IPOD_ROOT)/radioplus$(STAGE_SUFFIX)"
 	@ls -l $@
 
 objs: $(OBJS)
@@ -138,7 +181,7 @@ objs: $(OBJS)
 
 toolchain-check:
 	@test -x $(CC) || { echo "no cross gcc at $(CC)"; exit 1; }
-	@test -d $(TINYALSA)/include || { echo "no tinyalsa at $(TINYALSA)"; exit 1; }
+	@test -d $(ALSA)/include || { echo "no alsa-lib headers at $(ALSA)"; exit 1; }
 	@$(CC) -dumpmachine
 
 $(BUILD):

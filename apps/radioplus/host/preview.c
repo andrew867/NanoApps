@@ -268,6 +268,28 @@ int main(int argc, char **argv)
         made++;
     }
 
+    /*
+      * Now Playing with the volume overlay up.
+      *
+      * It only appears when the volume changes and only for a second and a
+      * half, so without a shot of its own the one thing on this screen that
+      * covers other content is the one thing never rendered here. The nudge
+      * has to come after a refresh that has already seen a volume, because the
+      * first value observed is deliberately not treated as a change.
+      */
+    rp_act_record_toggle();          /* back out of the recording state */
+    rp_ui_show(RP_SCREEN_NOW);
+    rp_ui_tick();
+    rp_act_nudge_volume(-6);
+    rp_model_refresh();
+    rp_ui_tick();
+    settle();
+    snprintf(path, sizeof path, "%s/1d-now-volume.bmp", out);
+    if (write_bmp(path, s_fb, RP_SCREEN_W, RP_SCREEN_H)) {
+        printf("  %s\n", path);
+        made++;
+    }
+
     /* And the Presets screen mid-scan. rp_ui_tick is what pumps the scan, so
        running it repeatedly is what advances it; the preview has no tuner, so
        the RSSI the model reports is whatever it was seeded with and the scan

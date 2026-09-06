@@ -300,6 +300,63 @@ void rp_act_power(bool on) { rp_model.powered = on; }
 void rp_act_mute(bool on)    { rp_model.muted = on; }
 void rp_act_squelch(bool on) { rp_model.squelched = on; }
 
+/* ---- where the audio goes, and how loud ---------------------------------- */
+
+/*
+ * The same three the device offers, so the preview draws the real thing.
+ *
+ * Named here rather than shared with the Linux player because there is nothing
+ * to share: on the device these are alsa-lib device names, and this build has
+ * no ALSA at all. What the two have in common is the words on the screen,
+ * which is exactly what this list is.
+ */
+static const char *const k_out_label[] = { "Headphones", "Bluetooth", "Both" };
+#define OUT_N ((uint8_t)(sizeof k_out_label / sizeof k_out_label[0]))
+
+uint8_t rp_out_count(void) { return OUT_N; }
+
+const char *rp_out_label(uint8_t i)
+{
+    return i < OUT_N ? k_out_label[i] : "";
+}
+
+/*
+ * Everything is available here, which is the honest answer for a build with no
+ * hardware: the reason an output can be unavailable on the device is that
+ * nothing is reading the Bluetooth fifo, and there is no fifo.
+ */
+bool rp_out_ready(uint8_t i) { return i < OUT_N; }
+
+const char *rp_act_set_output(uint8_t i)
+{
+    if (i >= OUT_N) return "no such output";
+    rp_model.output = i;
+    rp_model.output_open = true;
+    return NULL;
+}
+
+void rp_act_set_volume(uint8_t percent)
+{
+    rp_model.volume = percent > 100 ? 100 : percent;
+    rp_model.volume_ok = true;
+}
+
+void rp_act_nudge_volume(int delta)
+{
+    int v = (int)rp_model.volume + delta;
+
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    rp_act_set_volume((uint8_t)v);
+}
+
+void rp_act_set_hp_level(uint8_t level)
+{
+    rp_model.hp_level = level > 88 ? 88 : level;
+    rp_model.hp_level_ok = true;
+}
+
+
 void rp_act_set_region(const en_region_t *rg)
 {
     if (!rg) return;

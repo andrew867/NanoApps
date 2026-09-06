@@ -1,17 +1,34 @@
 /*
- * capture_linux.c — capture.h on the N31 Linux port, through tinyalsa.
+ * capture_linux.c — capture.h on the N31 Linux port, through alsa-lib.
  *
- * hw:0,1 is IIS2, which is where the BCM2078 puts tuner audio; hw:0,0 is IIS0
- * driving the headphone codec. They are separate devices, so capture does not
+ * The tuner's digital audio arrives on IIS2, which is hw:0,1; the headphones
+ * are on IIS0, which is hw:0,0. They are separate devices, so capture does not
  * contend with playback and a recording can run while listening.
  *
- * One detail from the n31-fm helper is load-bearing, and easy to half-remember.
- * The SoC side of IIS2 is clocked by the capture PCM, so tuner audio is not
- * merely unrecorded but inaudible until something opens the capture device.
- * That is necessary and not sufficient: the audio then has to be carried from
- * IIS2 to IIS0, which n31-fm does with arecord piped into aplay and this app
- * does in the player. Capture starts with the tuner rather than with the record
- * button because of the first half; the radio is silent without the second.
+ * Three things about this path are load-bearing and each of them looks like
+ * something else when it is wrong.
+ *
+ *   THE RATE IS 32000 AND NOTHING ELSE. The DAI advertises 32000 and 16000.
+ *   This file asked for 44100 for a long time, which the port cannot be
+ *   clocked at. Stock picks a different PCM bit clock per station - 8 MHz,
+ *   1.6 MHz, 4.8 MHz - but always sets CLKDIV to bitclk/32000, so the frame
+ *   rate is the same on every station and the PCM never has to be reopened
+ *   because somebody retuned.
+ *
+ *   THE DEVICE IS OPENED BY NAME. n31fm, from /etc/asound.conf, is a softvol
+ *   over a plug over hw:0,1. Opening it rather than the hardware device is
+ *   what makes "FM Capture Volume" a real control over this source and what
+ *   lets a reader ask for a rate the port cannot produce. tinyalsa, which this
+ *   used before, talks to /dev/snd directly and cannot see an alsa-lib plugin
+ *   at all - so with it there is no source gain, no mute and no conversion.
+ *
+ *   OPENING THIS IS NECESSARY FOR AUDIO AND NOT SUFFICIENT. The SoC side of
+ *   IIS2 is clocked by the capture PCM, so tuner audio is inaudible until
+ *   something opens it; and the audio then still has to be carried from IIS2
+ *   to IIS0, which is the player's job. Capture starts with the tuner rather
+ *   than with the record button because of the first half. It also must not be
+ *   opened before a station has been tuned, because the driver leaves the
+ *   audio route off until then - see the ordering note in model_linux.c.
  *
  * The reader runs on its own thread, feeding a ring in memory and, when one is
  * running, a WAV file. Neither consumer can stall the other: a file write that
@@ -28,25 +45,36 @@
 #include <string.h>
 #include <unistd.h>
 
-#include <tinyalsa/asoundlib.h>
+#include <alsa/asoundlib.h>
 
 #include "../core/wav.h"
 
-#define CAP_CARD   0
-#define CAP_DEVICE 1        /* IIS2, the tuner's digital audio */
+/*
+ * The plugin device, and a way past it.
+ *
+ * n31fm is what should be opened. RADIOPLUS_PCM_IN exists for a machine whose
+ * /etc/asound.conf is missing or older than this app: "hw:0,1" still works,
+ * with no source volume and no conversion, which is worth having as a fallback
+ * and is not worth making the default.
+ */
+#define CAP_PCM_DEFAULT "n31fm"
 
-#define CAP_RATE     44100u
+/*
+ * 32000 because that is what the port is clocked at. See the note above; this
+ * is not a preference and there is no other value that works.
+ */
+#define CAP_RATE     32000u
 #define CAP_CHANNELS 2u
 #define CAP_BITS     16u
 #define CAP_FRAME    (CAP_CHANNELS * (CAP_BITS / 8u))
 
-#define PERIOD_FRAMES 1024u
+#define PERIOD_FRAMES 512u
 #define PERIOD_COUNT  4u
 
-static struct pcm *s_pcm;
+static snd_pcm_t  *s_pcm;
 static pthread_t   s_thread;
 static bool        s_running;
-static char        s_desc[96];
+static char        s_desc[128];
 
 /* The ring, and everything the reader thread shares with the callers. */
 static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -59,6 +87,12 @@ static uint64_t  s_total;     /* frames captured since the stream began */
 
 static FILE     *s_rec;
 static uint32_t  s_rec_bytes;
+
+static const char *cap_pcm_name(void)
+{
+    const char *e = getenv("RADIOPLUS_PCM_IN");
+    return (e && *e) ? e : CAP_PCM_DEFAULT;
+}
 
 static uint32_t bytes_to_ms(uint32_t b)
 {
@@ -109,6 +143,82 @@ static uint32_t ring_tail(uint8_t *out, uint32_t want)
     return want;
 }
 
+/* ---- the device ---------------------------------------------------------- */
+
+/*
+ * -EPIPE on a capture is an overrun: the reader lost the race and audio is
+ * genuinely gone. -ESTRPIPE is a suspend, which has to be resumed or, failing
+ * that, prepared again. Both are recoverable and neither is a reason to stop
+ * the radio; anything else is real.
+ */
+static int recover(snd_pcm_t *pcm, int err)
+{
+    if (err == -EPIPE)
+        return snd_pcm_prepare(pcm);
+
+    if (err == -ESTRPIPE) {
+        int r;
+        while ((r = snd_pcm_resume(pcm)) == -EAGAIN)
+            usleep(10000);
+        if (r < 0)
+            r = snd_pcm_prepare(pcm);
+        return r;
+    }
+    return err;
+}
+
+static int configure(snd_pcm_t *pcm, snd_pcm_uframes_t *buffer_out)
+{
+    snd_pcm_hw_params_t *hw;
+    snd_pcm_sw_params_t *sw;
+    unsigned int rate = CAP_RATE;
+    unsigned int periods = PERIOD_COUNT;
+    snd_pcm_uframes_t period = PERIOD_FRAMES;
+    snd_pcm_uframes_t buffer = 0, got_period = 0;
+    int err;
+
+    snd_pcm_hw_params_alloca(&hw);
+    snd_pcm_sw_params_alloca(&sw);
+
+    if ((err = snd_pcm_hw_params_any(pcm, hw)) < 0) return err;
+    if ((err = snd_pcm_hw_params_set_access(pcm, hw,
+                    SND_PCM_ACCESS_RW_INTERLEAVED)) < 0) return err;
+    if ((err = snd_pcm_hw_params_set_format(pcm, hw,
+                    SND_PCM_FORMAT_S16_LE)) < 0) return err;
+    if ((err = snd_pcm_hw_params_set_channels(pcm, hw, CAP_CHANNELS)) < 0)
+        return err;
+    /* _near rather than exact: the plugin will hand back what it can give, and
+       a stream at a rate this file did not ask for is a fault worth reporting
+       rather than an open that fails with nothing said. */
+    if ((err = snd_pcm_hw_params_set_rate_near(pcm, hw, &rate, NULL)) < 0)
+        return err;
+    if ((err = snd_pcm_hw_params_set_period_size_near(pcm, hw, &period,
+                                                      NULL)) < 0) return err;
+    if ((err = snd_pcm_hw_params_set_periods_near(pcm, hw, &periods,
+                                                  NULL)) < 0) return err;
+    if ((err = snd_pcm_hw_params(pcm, hw)) < 0) return err;
+
+    if ((err = snd_pcm_sw_params_current(pcm, sw)) < 0) return err;
+    /* Capture starts as soon as there is anything at all; the reader is what
+       decides when to take it. This is the opposite of the playback side, and
+       for the same reason - see the start-threshold note in player_linux.c. */
+    if ((err = snd_pcm_sw_params_set_start_threshold(pcm, sw, 1)) < 0)
+        return err;
+    if ((err = snd_pcm_sw_params_set_avail_min(pcm, sw, period)) < 0)
+        return err;
+    if ((err = snd_pcm_sw_params(pcm, sw)) < 0) return err;
+
+    if ((err = snd_pcm_get_params(pcm, &buffer, &got_period)) < 0) return err;
+
+    if (rate != CAP_RATE)
+        fprintf(stderr, "radioplus: capture opened at %u Hz, not %u - "
+                        "timings and recordings will be wrong\n",
+                rate, CAP_RATE);
+
+    if (buffer_out) *buffer_out = buffer;
+    return 0;
+}
+
 /* ---- the reader ---------------------------------------------------------- */
 
 static void *reader(void *arg)
@@ -119,27 +229,36 @@ static void *reader(void *arg)
     if (!buf) return 0;
 
     while (s_running) {
-        /* pcm_readi counts frames rather than bytes and is what tinyalsa
-           wants now; pcm_read is deprecated. It returns frames read, or a
-           negative error. */
-        int r = pcm_readi(s_pcm, buf, PERIOD_FRAMES);
-        if (r != (int)PERIOD_FRAMES) {
-            /* A read error is usually an overrun, which means the thread lost
-               the race and audio is genuinely gone. Counting them matters: a
-               recording with a non-zero count has holes in it and the user
-               should be told rather than left to notice. */
+        snd_pcm_sframes_t got = snd_pcm_readi(s_pcm, buf, PERIOD_FRAMES);
+
+        if (got < 0) {
+            /*
+             * An overrun means the thread lost the race and audio is gone.
+             * Counting them matters: a recording with a non-zero count has
+             * holes in it and the user should be told rather than left to
+             * notice.
+             */
             pthread_mutex_lock(&s_lock);
             s_overruns++;
             pthread_mutex_unlock(&s_lock);
-            usleep(1000);
+
+            if (recover(s_pcm, (int)got) < 0) {
+                /* Not an xrun. The device has gone, and spinning on it would
+                   burn the battery to no purpose. */
+                usleep(50000);
+            }
             continue;
         }
 
+        if (got == 0)
+            continue;
+
         pthread_mutex_lock(&s_lock);
-        ring_write(buf, chunk);
+        ring_write(buf, (uint32_t)got * CAP_FRAME);
 
         if (s_rec) {
-            if (fwrite(buf, 1, chunk, s_rec) != chunk) {
+            size_t want = (size_t)got * CAP_FRAME;
+            if (fwrite(buf, 1, want, s_rec) != want) {
                 /* Out of space, or the card went away. Close the recording so
                    what was captured stays playable, and leave the live buffer
                    running - losing the radio because a write failed would be
@@ -147,7 +266,7 @@ static void *reader(void *arg)
                 fclose(s_rec);
                 s_rec = 0;
             } else {
-                s_rec_bytes += chunk;
+                s_rec_bytes += (uint32_t)want;
             }
         }
         pthread_mutex_unlock(&s_lock);
@@ -160,26 +279,27 @@ static void *reader(void *arg)
 
 en_cap_err_t en_cap_start(uint32_t live_seconds)
 {
+    const char *name = cap_pcm_name();
+    snd_pcm_uframes_t buffer = 0;
+    int err;
+
     if (s_running) return EN_CAP_OK;
     if (!live_seconds) live_seconds = 30;
 
-    struct pcm_config cfg;
-    memset(&cfg, 0, sizeof cfg);
-    cfg.channels = CAP_CHANNELS;
-    cfg.rate = CAP_RATE;
-    cfg.period_size = PERIOD_FRAMES;
-    cfg.period_count = PERIOD_COUNT;
-    cfg.format = PCM_FORMAT_S16_LE;
-    cfg.start_threshold = 0;
-    cfg.stop_threshold = 0;
-    cfg.silence_threshold = 0;
+    err = snd_pcm_open(&s_pcm, name, SND_PCM_STREAM_CAPTURE, 0);
+    if (err < 0) {
+        snprintf(s_desc, sizeof s_desc, "%s unavailable: %s",
+                 name, snd_strerror(err));
+        s_pcm = 0;
+        return EN_CAP_NO_DEVICE;
+    }
 
-    s_pcm = pcm_open(CAP_CARD, CAP_DEVICE, PCM_IN, &cfg);
-    if (!s_pcm || !pcm_is_ready(s_pcm)) {
-        snprintf(s_desc, sizeof s_desc, "hw:%u,%u unavailable: %s",
-                 CAP_CARD, CAP_DEVICE,
-                 s_pcm ? pcm_get_error(s_pcm) : "no device");
-        if (s_pcm) { pcm_close(s_pcm); s_pcm = 0; }
+    err = configure(s_pcm, &buffer);
+    if (err < 0) {
+        snprintf(s_desc, sizeof s_desc, "%s cannot be configured: %s",
+                 name, snd_strerror(err));
+        snd_pcm_close(s_pcm);
+        s_pcm = 0;
         return EN_CAP_NO_DEVICE;
     }
 
@@ -188,7 +308,7 @@ en_cap_err_t en_cap_start(uint32_t live_seconds)
     s_ring_bytes = live_seconds * CAP_RATE * CAP_FRAME;
     s_ring = malloc(s_ring_bytes);
     if (!s_ring) {
-        pcm_close(s_pcm);
+        snd_pcm_close(s_pcm);
         s_pcm = 0;
         s_ring_bytes = 0;
         return EN_CAP_NO_MEMORY;
@@ -196,16 +316,25 @@ en_cap_err_t en_cap_start(uint32_t live_seconds)
     s_ring_used = s_ring_head = s_overruns = 0;
     s_total = 0;
 
+    /* Explicit rather than relying on the first read to trigger it, so the
+       stream is running before the thread exists and the first period is not
+       also the first thing that could go wrong. */
+    err = snd_pcm_start(s_pcm);
+    if (err < 0)
+        fprintf(stderr, "radioplus: capture start: %s\n", snd_strerror(err));
+
     s_running = true;
     if (pthread_create(&s_thread, 0, reader, 0) != 0) {
         s_running = false;
         free(s_ring); s_ring = 0; s_ring_bytes = 0;
-        pcm_close(s_pcm); s_pcm = 0;
+        snd_pcm_close(s_pcm); s_pcm = 0;
         return EN_CAP_FAILED;
     }
 
-    snprintf(s_desc, sizeof s_desc, "tinyalsa hw:%u,%u  %u Hz %u ch  %us buffer",
-             CAP_CARD, CAP_DEVICE, CAP_RATE, CAP_CHANNELS, live_seconds);
+    snprintf(s_desc, sizeof s_desc,
+             "alsa-lib %s  %u Hz %u ch  %lu frame buffer  %us live",
+             name, CAP_RATE, CAP_CHANNELS, (unsigned long)buffer,
+             live_seconds);
     return EN_CAP_OK;
 }
 
@@ -223,7 +352,7 @@ void en_cap_stop(void)
     s_ring_bytes = s_ring_used = s_ring_head = 0;
     pthread_mutex_unlock(&s_lock);
 
-    if (s_pcm) { pcm_close(s_pcm); s_pcm = 0; }
+    if (s_pcm) { snd_pcm_close(s_pcm); s_pcm = 0; }
 }
 
 void en_cap_state(en_cap_state_t *out)
@@ -294,7 +423,7 @@ uint32_t en_cap_read_from(uint64_t at, void *buf, uint32_t frames)
 
 const char *en_cap_backend(void)
 {
-    return s_desc[0] ? s_desc : "tinyalsa (not started)";
+    return s_desc[0] ? s_desc : "alsa-lib (not started)";
 }
 
 /* Write a header and, optionally, a prefill from the ring. Caller holds the

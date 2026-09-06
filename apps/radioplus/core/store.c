@@ -434,6 +434,19 @@ void en_settings_default(en_settings_t *s)
     s->live_seconds = 30;
     en_rectimer_init(&s->rectimer);
     s->ta_record = false;
+
+    /* Empty means the platform's first output, which is the headphones -
+       the one destination that is always there, since the jack is also the
+       antenna. */
+    s->output[0] = 0;
+
+    /* Full on the software volume, and the codec below where it clips. This
+       pair was measured: at 100 and 75 the output reads about -20 dBFS RMS
+       and -9 dBFS peak on FM, against RetailOS at roughly -12. At 88 the peak
+       pins at 0.0 with a flat crest factor, which is audible as fuzz - so the
+       top of the codec's range is not a default. */
+    s->volume = 100;
+    s->hp_level = 75;
 }
 
 uint32_t en_settings_save(const en_settings_t *s, char *buf, uint32_t cap)
@@ -453,6 +466,9 @@ uint32_t en_settings_save(const en_settings_t *s, char *buf, uint32_t cap)
     en_json_bool(&j, "af_follow", s->af_follow);
     en_json_bool(&j, "simple_screen", s->simple_screen);
     en_json_bool(&j, "wide_screen", s->wide_screen);
+    en_json_str(&j, "output", s->output);
+    en_json_uint(&j, "volume", s->volume);
+    en_json_uint(&j, "hp_level", s->hp_level);
     en_json_uint(&j, "rec_limit_min", s->rectimer.limit_min);
     /* Written only when there is one. A start time of "none" is the absence
        of the key rather than a sentinel, so nothing has to agree on what the
@@ -525,6 +541,19 @@ bool en_settings_load(en_settings_t *s, const char *json, uint32_t len)
 
     v = find_key(json, end, "wide_screen");
     if (v) s->wide_screen = (*v == 't');
+
+    v = find_key(json, end, "output");
+    if (v) read_str(v, end, s->output, sizeof s->output);
+
+    /* Clamped rather than trusted. A hand-edited file with 500 in it should
+       come back as full volume, not as whatever 500 does to the control. */
+    v = find_key(json, end, "volume");
+    if (v && read_uint(v, end, &n)) s->volume = (uint8_t)(n > 100u ? 100u : n);
+
+    /* The codec's range, and no further: above this it clips, and a settings
+       file is not a good enough reason to let it. */
+    v = find_key(json, end, "hp_level");
+    if (v && read_uint(v, end, &n)) s->hp_level = (uint8_t)(n > 88u ? 88u : n);
 
     v = find_key(json, end, "rec_limit_min");
     if (v && read_uint(v, end, &n) && n <= 24u * 60u)

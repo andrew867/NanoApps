@@ -24,8 +24,8 @@
  * sysfs at all: bcm2078-bt exports it and the nano7-audio machine driver
  * publishes it as the "FM Tuner Mute" control on card 0. That is the proper
  * interface for it - a mixer control is how everything else on this card is
- * turned down - so this file reaches it through tinyalsa's mixer rather than
- * asking for a sysfs attribute that deliberately does not exist.
+ * turned down - so this file reaches it through the card's control interface
+ * rather than asking for a sysfs attribute that deliberately does not exist.
  *
  * Note what fm_reg buys beyond convenience: register 0x80 is the RDS FIFO, so
  * reading it gives raw tuples that this app can decode itself with core/rds.c
@@ -48,7 +48,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <tinyalsa/asoundlib.h>
+#include "mixer.h"
 
 #include "../core/fmreg.h"
 
@@ -393,64 +393,33 @@ en_tuner_err_t en_tuner_power(bool on)
 /* ---- mute ---------------------------------------------------------------- */
 
 /*
- * The mixer is opened for each call and closed again.
+ * "FM Tuner Mute" is a control on card 0 like any other, so this goes through
+ * mixer.h rather than reaching for the card itself. Nothing is cached: a
+ * control that is absent now can be present a moment later, and the card is
+ * looked up by name every time for the same reason - an index shifts as
+ * controls are added.
  *
- * Mute is pressed by hand or bracketed around a sweep - tens of times in a
- * session, not thousands - and a control handle held open across the life of
- * the app is a handle to be invalidated when the card goes away. Opening it per
- * call costs an ioctl and cannot go stale.
+ * Mute is pressed by hand or bracketed around a sweep, tens of times in a
+ * session and not thousands, so the cost of asking each time is not worth
+ * avoiding.
  */
-#define FM_MUTE_CARD 0
-#define FM_MUTE_CTL  "FM Tuner Mute"
-
-static struct mixer_ctl *mute_ctl(struct mixer **out)
-{
-    struct mixer *m = mixer_open(FM_MUTE_CARD);
-    struct mixer_ctl *c;
-
-    if (!m)
-        return NULL;
-
-    c = mixer_get_ctl_by_name(m, FM_MUTE_CTL);
-    if (!c) {
-        mixer_close(m);
-        return NULL;
-    }
-    *out = m;
-    return c;
-}
-
 en_tuner_err_t en_tuner_mute(bool on)
 {
-    struct mixer *m = NULL;
-    struct mixer_ctl *c = mute_ctl(&m);
-    int rc;
-
     /*
      * A card without the control is a machine driver that predates it, not a
      * failure of this app. Reported as unsupported so a caller can leave the
      * affordance off rather than showing one that does nothing.
      */
-    if (!c)
+    if (!en_mix_present(EN_MIX_SW_FM_MUTE))
         return EN_TUNER_UNSUPPORTED;
 
-    rc = mixer_ctl_set_value(c, 0, on ? 1 : 0);
-    mixer_close(m);
-    return rc == 0 ? EN_TUNER_OK : EN_TUNER_FAILED;
+    return en_mix_set_bool(EN_MIX_SW_FM_MUTE, on) ? EN_TUNER_OK
+                                                  : EN_TUNER_FAILED;
 }
 
 int en_tuner_muted(void)
 {
-    struct mixer *m = NULL;
-    struct mixer_ctl *c = mute_ctl(&m);
-    int v;
-
-    if (!c)
-        return -1;
-
-    v = mixer_ctl_get_value(c, 0);
-    mixer_close(m);
-    return v < 0 ? -1 : (v ? 1 : 0);
+    return en_mix_get_bool(EN_MIX_SW_FM_MUTE);
 }
 
 /* ---- tuning -------------------------------------------------------------- */

@@ -95,6 +95,7 @@ shots: $(BUILD)/preview
 # better that way. Plain on the right because a README should not have to know.
 PUBLISH := \
 	0a-boot:boot 0-simple:simple 1-now:now 7-now-recording:recording \
+	1d-now-volume:volume \
 	1b-wide:wide 2-dial:dial 3-presets:presets \
 	3b-presets-scanning:scanning 4-recordings:recordings \
 	5-settings:settings 6-advanced:advanced 10-reg-blend:register \

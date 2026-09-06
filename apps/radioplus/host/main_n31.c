@@ -137,9 +137,44 @@ static void pump_keys(void)
 
     for (int i = 0; i < s_key_fds; i++) {
         while (read(s_key_fd[i], &ev, sizeof ev) == (ssize_t)sizeof ev) {
-            if (ev.type != 1 || ev.value != 1) continue;   /* presses only */
+            if (ev.type != 1) continue;                  /* EV_KEY only */
+
+            /*
+             * Presses, and repeats for the volume alone.
+             *
+             * evdev sends 1 for a press and 2 for each autorepeat. Every other
+             * key here does something a repeat should not do twenty times a
+             * second - paging through screens, starting a recording - so they
+             * take presses only. Volume is the one control where holding the
+             * button down and watching the level move is the expected way to
+             * use it.
+             */
+            {
+                bool vol = (ev.code == KEY_VOLUMEUP
+                            || ev.code == KEY_VOLUMEDOWN);
+                if (ev.value != 1 && !(vol && ev.value == 2)) continue;
+            }
 
             switch (ev.code) {
+            /*
+             * The two buttons on this device that are labelled for a job.
+             *
+             * They used to page through the screens, because until now there
+             * was nothing on this hardware for them to turn down: the tuner
+             * has no volume register, and the codec's own was not reachable
+             * from here. There is one now - a softvol per output, applied in
+             * the plugin the player writes to - so they do what they say.
+             *
+             * Paging is still on the transport keys beside them, and on the
+             * swipe, so nothing has been taken away.
+             */
+            case KEY_VOLUMEUP:
+                rp_act_nudge_volume(+4);
+                break;
+            case KEY_VOLUMEDOWN:
+                rp_act_nudge_volume(-4);
+                break;
+
             /*
              * Step through the swipe sequence, not through the enum.
              *
@@ -149,11 +184,9 @@ static void pump_keys(void)
              * enum would land on a screen that is turned off and skip the
              * dots' idea of where you are.
              */
-            case KEY_VOLUMEUP:
             case KEY_NEXTSONG:
                 rp_ui_show(rp_ui_swipe_at(swipe_step(+1)));
                 break;
-            case KEY_VOLUMEDOWN:
             case KEY_PREVIOUSSONG:
                 rp_ui_show(rp_ui_swipe_at(swipe_step(-1)));
                 break;

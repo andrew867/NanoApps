@@ -71,6 +71,37 @@ typedef struct {
     uint32_t behind_max_ms;      /* how far back the buffer allows */
     bool     play_ok;
 
+    /*
+     * Where the audio is going, and how loud.
+     *
+     * `output` indexes the platform's own list rather than naming a device,
+     * because the screens have no business knowing that "n31both" is a tee
+     * over a rate converter. rp_out_label() turns it into words.
+     *
+     * `output_open` is not the same question as `play_ok`: the player can be
+     * running with a destination it cannot currently open - Bluetooth with
+     * nothing listening is exactly that - and an interface that showed those
+     * as one state would claim audio was reaching somewhere it is not.
+     *
+     * `volume` is a percentage of whichever output's own control, which is a
+     * different control per output. That is a property of how the audio graph
+     * is built and not a complication invented here: each output has its own
+     * softvol, and "Both" has one over the pair.
+     */
+    uint8_t  output;
+    bool     output_open;
+    uint8_t  volume;             /* 0..100 on the current output */
+    bool     volume_ok;          /* the control exists to move */
+
+    /*
+     * The codec's own analog volume, 0..88, which is a calibration and not a
+     * knob - the top of its range clips. Shown on the advanced screen only,
+     * because somebody who has gone looking for it is the only person who
+     * should find it.
+     */
+    uint8_t  hp_level;
+    bool     hp_level_ok;
+
     bool     ta_record;          /* auto-record traffic announcements */
 
     /* The recording timer: stop after so long, start at a time of day. Here
@@ -171,6 +202,45 @@ void rp_act_power(bool on);
  */
 void rp_act_mute(bool on);
 void rp_act_squelch(bool on);
+
+/*
+ * Where the audio goes.
+ *
+ * The list is the platform's, because what a machine can do with sound is not
+ * something the screens can work out. rp_out_ready() is asked before offering
+ * one: the Bluetooth legs need an encoder running at the far end, and an
+ * option that cannot work should be visibly unavailable rather than silently
+ * ineffective.
+ *
+ * rp_act_set_output returns NULL when it worked, or a short phrase saying why
+ * not, which the interface shows. A control that refuses without saying why is
+ * indistinguishable from one that is broken.
+ */
+uint8_t     rp_out_count(void);
+const char *rp_out_label(uint8_t i);
+bool        rp_out_ready(uint8_t i);
+const char *rp_act_set_output(uint8_t i);
+
+/*
+ * Volume, 0..100, on whichever output is selected.
+ *
+ * Persisted, unlike mute: coming back at the level you left it is what every
+ * other radio does, and unlike silence a level is visible on the screen the
+ * moment you look at it.
+ */
+void rp_act_set_volume(uint8_t percent);
+void rp_act_nudge_volume(int delta);
+
+/*
+ * The codec's analog volume, 0..88.
+ *
+ * Separate from the volume above because it is a different kind of thing: it
+ * decides whether the output clips rather than how loud it is, it applies to
+ * the headphone leg only, and the top of its range is measurably wrong. The
+ * app sets it once to a safe value at start-up and this exists so somebody
+ * calibrating against a meter can move it.
+ */
+void rp_act_set_hp_level(uint8_t level);
 
 /*
  * Set the clock, from a time collected off the band.

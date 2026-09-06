@@ -179,6 +179,30 @@ typedef struct {
     bool     simple_screen;
     bool     wide_screen;
 
+    /*
+     * Where the audio goes, by name rather than by position.
+     *
+     * A name because the list of outputs can grow: storing "the second one"
+     * means adding a device silently moves somebody's choice to a different
+     * one, and the failure would be a radio that comes back playing to
+     * Bluetooth for no reason anybody could explain. An empty name means
+     * whatever the platform's first output is.
+     */
+    char     output[16];
+
+    /*
+     * Volume, 0..100, on whichever output that is - and the codec's own
+     * analog level, 0..88, which is a different thing.
+     *
+     * The first is a preference and is restored on every start. The second is
+     * a calibration against the physical output: the top of the codec's range
+     * clips outright, so the default is deliberately below it and is worth
+     * persisting only because somebody who has measured their own unit should
+     * not have to do it twice.
+     */
+    uint8_t  volume;
+    uint8_t  hp_level;
+
     /* Stop a recording after so long, and start one at a time of day. See
        timer.h for why those are two fields and not one feature. */
     en_rectimer_t rectimer;

@@ -17,6 +17,7 @@
 #include "tuner.h"
 #include "capture.h"
 #include "clock.h"
+#include "mixer.h"
 #include "player.h"
 
 #include <dirent.h>
@@ -130,6 +131,16 @@ static void settings_save(void)
     s_settings.stereo_mode = rp_model.stereo_mode;
     s_settings.simple_screen = rp_model.simple_screen;
     s_settings.wide_screen = rp_model.wide_screen;
+    s_settings.volume = rp_model.volume;
+    s_settings.hp_level = rp_model.hp_level;
+
+    /* Stored by name, so adding an output later cannot move somebody's
+       choice to a different one. */
+    {
+        const en_play_out_t *o = en_play_out(rp_model.output);
+        snprintf(s_settings.output, sizeof s_settings.output, "%s",
+                 o ? o->pcm : "");
+    }
 
     char buf[2048];
     uint32_t n = en_settings_save(&s_settings, buf, sizeof buf);
@@ -241,9 +252,34 @@ static void failed(const char *why)
 #define DEP_WAIT_MS  20000u
 #define DEP_RETRY_MS  4000u
 
+/* Defined with the actions, because that is where mute belongs. Declared
+   here because bringing the mixer up has to reassert it - see try_mixer. */
+static void mute_apply(void);
+
 static bool s_tuner_configured;
 static uint32_t s_bringup_ms;      /* when bring_up ran, for the cadence */
 static bool s_bringup_reported;    /* the deadline message, at most once */
+
+/*
+ * The output the settings asked for, and whether that question is closed.
+ *
+ * Restoring it is not a single act, because the Bluetooth legs need an encoder
+ * running at the far end and that can arrive after this app does. So a saved
+ * choice of Bluetooth is retried through the startup window and then given up
+ * on, rather than either failing immediately or switching the audio out from
+ * under somebody a minute into listening.
+ *
+ * Anything the user does closes the question at once. A restore that overrode
+ * a deliberate choice would be the worst of both.
+ */
+static uint8_t s_out_saved;
+static bool    s_out_restored;
+
+/* Volume changes are written to the settings lazily. A key held down produces
+   twenty of them a second and each one would otherwise be a file write; this
+   is when the pending one is due, or zero for none. */
+static uint32_t s_save_due;
+#define SAVE_DELAY_MS 1500u
 
 /*
  * Everything the tuner needs told to it once, whenever it first answers.
@@ -253,7 +289,7 @@ static bool s_bringup_reported;    /* the deadline message, at most once */
  * overrides, RDS state, stereo preference and remembered frequency as one that
  * was ready before this app was.
  */
-static void tuner_configure(void)
+static bool tuner_configure(void)
 {
     en_tuner_power(true);
     en_tuner_set_region(rp_model.region);
@@ -279,10 +315,20 @@ static void tuner_configure(void)
     if (rp_model.stereo_mode != EN_FM_STEREO_AUTO)
         rp_act_stereo_mode(rp_model.stereo_mode);
 
-    /* And back to where the listener was. rp_model.khz was decided during
-       bring-up from the settings and the presets, both of which are readable
-       with no hardware at all. */
-    if (rp_model.khz) en_tuner_tune(rp_model.khz);
+    /*
+     * And back to where the listener was. rp_model.khz was decided during
+     * bring-up from the settings and the presets, both of which are readable
+     * with no hardware at all.
+     *
+     * Whether this worked is the return value, and it is the return value
+     * because the audio path waits on it. The driver holds the audio route off
+     * until a station is tuned, so a tune that did not go through means the
+     * capture would open onto silence - and a tune that did not go through is
+     * exactly the sort of thing that happens once while hci0 is settling and
+     * works on the next attempt. Reporting it lets the caller try again
+     * instead of latching a half-configured tuner.
+     */
+    return rp_model.khz && en_tuner_tune(rp_model.khz) == EN_TUNER_OK;
 }
 
 static bool try_tuner(void)
@@ -294,24 +340,83 @@ static bool try_tuner(void)
     rp_model.tuner_ok = (te == EN_TUNER_OK);
 
     if (rp_model.tuner_ok && !s_tuner_configured) {
-        s_tuner_configured = true;
-
         rp_model.can_raw = en_tuner_can_raw();
         /* The driver exposes fm_seek, so the chip does the finding. */
         rp_model.can_seek = true;
 
-        tuner_configure();
+        /* Set only when the tune landed. Everything in tuner_configure is
+           idempotent, so a retry costs a few sysfs writes and buys a machine
+           whose controller answered a moment before it was ready. */
+        s_tuner_configured = tuner_configure();
     }
     return rp_model.tuner_ok;
 }
 
-/* Capture is started with the tuner rather than with the record button: the
-   SoC side of IIS2 is clocked by the capture PCM, so nothing is audible until
-   this is open. It is how the radio makes sound, not just how it is
-   recorded. */
+/*
+ * A saved output name, turned back into a position in the platform's list.
+ *
+ * Names rather than positions is what makes adding an output later harmless:
+ * a settings file that says "n31both" still means the same thing after the
+ * list grows, where "the third one" would quietly become something else. A
+ * name that is no longer offered falls back to the first output, which is the
+ * headphones - the one destination that is always there.
+ */
+static uint8_t out_index(const char *pcm)
+{
+    if (pcm && *pcm) {
+        for (uint8_t i = 0; i < en_play_out_count(); i++) {
+            const en_play_out_t *o = en_play_out(i);
+            if (o && strcmp(o->pcm, pcm) == 0) return i;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Put the volume where the model says it should be.
+ *
+ * Which control that is depends on where the audio is going: each output has
+ * its own softvol and "Both" has one over the pair. The output table names it,
+ * so this does not have to know anything about the devices themselves.
+ *
+ * Silently doing nothing when the control is absent is deliberate. softvol
+ * registers its control the first time its PCM is opened, so on a machine that
+ * has not yet played to Bluetooth the Bluetooth volume genuinely does not
+ * exist - and will, later, at which point try_mixer calls this again.
+ */
+static void volume_apply(void)
+{
+    const en_play_out_t *o = en_play_out(rp_model.output);
+
+    if (!o) return;
+
+    rp_model.volume_ok = en_mix_present(o->volume);
+    if (rp_model.volume_ok)
+        en_mix_set(o->volume, rp_model.volume);
+}
+
+/*
+ * Capture is started with the tuner rather than with the record button: the
+ * SoC side of IIS2 is clocked by the capture PCM, so nothing is audible until
+ * this is open. It is how the radio makes sound, not just how it is recorded.
+ *
+ * And it is started AFTER the tuner has been tuned, which is the ordering the
+ * whole audio path depends on and the one that is easiest to get wrong. The
+ * driver deliberately leaves the audio route off until a station is tuned -
+ * it logs "route off until tune" - because routing to a station the front end
+ * has not reached yet puts noise on the PCM port. So a start that powers the
+ * tuner on and opens the capture gets a perfectly working stream carrying pure
+ * silence, which is indistinguishable from a broken audio path and has been
+ * mistaken for one.
+ *
+ * s_tuner_configured is the gate, because it is set only once the tune has
+ * gone through. Nothing here has to know the ordering; it cannot be got wrong
+ * from this side.
+ */
 static bool try_capture(void)
 {
     if (rp_model.capture_ok) return true;
+    if (!s_tuner_configured) return false;
 
     rp_model.capture_ok = (en_cap_start(s_settings.live_seconds) == EN_CAP_OK);
     rp_model.capture_backend = en_cap_backend();
@@ -319,14 +424,60 @@ static bool try_capture(void)
 }
 
 /* And the other half of the audio path. Capture clocks IIS2; the player
-   carries what arrives there to the headphones on IIS0. Without it the radio
-   is silent however well it is tuned. */
+   carries what arrives there to the codec, the Bluetooth fifo, or both.
+   Without it the radio is silent however well it is tuned. */
 static bool try_play(void)
 {
     if (rp_model.play_ok) return true;
+    if (!s_tuner_configured) return false;
 
     rp_model.play_ok = (en_play_start() == EN_PLAY_OK);
     return rp_model.play_ok;
+}
+
+/*
+ * The card's controls, which are neither the tuner's nor the PCM's.
+ *
+ * Kept apart from both because they arrive on their own schedule. The codec's
+ * controls appear with the machine driver; the softvols appear when something
+ * first opens the plugin that defines them, which for Bluetooth may be much
+ * later or never. So this is attempted on every pass until it reports that
+ * everything it wanted was there, and the volume is re-applied each time -
+ * a control that appears late must still end up where the user left it.
+ */
+static bool s_mixer_ready;
+
+static void try_mixer(void)
+{
+    if (s_mixer_ready) return;
+
+    if (!en_mix_open()) return;
+
+    s_mixer_ready = en_mix_defaults();
+
+    /* The codec level from the settings rather than the safe default, for
+       anyone who has calibrated their own unit against a meter. In its own
+       0..88 rather than as a percentage, or it would land a step away from
+       wherever it was left. */
+    if (en_mix_present(EN_MIX_VOL_CODEC)) {
+        rp_model.hp_level_ok = true;
+        en_mix_set_raw(EN_MIX_VOL_CODEC, rp_model.hp_level);
+    }
+
+    volume_apply();
+
+    /*
+     * And the model's mute back over the top of it.
+     *
+     * en_mix_defaults() unmutes the tuner, deliberately: MANUAL_MUTE survives
+     * a run of this app that was killed mid-sweep, and a radio that starts
+     * silent for a reason nobody can see is the worst failure it can cause.
+     * But this function runs until every control it wants has appeared, which
+     * can be several seconds - long enough for somebody to press mute and have
+     * it undone under them. The model is the authority on that, so it is
+     * applied last.
+     */
+    mute_apply();
 }
 
 /*
@@ -341,6 +492,12 @@ static bool try_play(void)
 static const char *dep_missing(void)
 {
     if (!rp_model.tuner_ok)   return "waiting for the tuner";
+    /* Between the tuner answering and the tuner being tuned there is a real
+       gap - the region write, the overrides and the tune itself are several
+       round trips through HCI - and during it the audio deliberately has not
+       been opened. Saying so beats "waiting for the sound card" on a machine
+       whose sound card is fine. */
+    if (!s_tuner_configured)  return "tuning";
     if (!rp_model.capture_ok) return "waiting for the sound card";
     if (!rp_model.play_ok)    return "waiting for audio out";
     return NULL;
@@ -348,9 +505,36 @@ static const char *dep_missing(void)
 
 static void try_all(void)
 {
+    /*
+     * In this order and not another. The tuner has to answer and be tuned
+     * before the capture is opened - see try_capture - and the mixer is asked
+     * last only because nothing else waits on it.
+     */
     try_tuner();
     try_capture();
     try_play();
+    try_mixer();
+
+    /*
+     * The saved output, once there is a player to give it to.
+     *
+     * Bounded to the startup window on purpose: a Bluetooth encoder that
+     * appears in the first few seconds was almost certainly started for this,
+     * and one that appears two minutes later was not - moving the audio then
+     * would be the app overruling somebody who is already listening.
+     */
+    if (!s_out_restored && rp_model.play_ok) {
+        if (s_out_saved == rp_model.output) {
+            s_out_restored = true;
+        } else if (rp_out_ready(s_out_saved)
+                   && en_play_set_output(s_out_saved) == NULL) {
+            rp_model.output = s_out_saved;
+            volume_apply();
+            s_out_restored = true;
+        } else if (now_ms() - s_bringup_ms >= DEP_WAIT_MS) {
+            s_out_restored = true;
+        }
+    }
 
     /*
      * Whether the card publishes a mute control - asked rather than assumed,
@@ -392,6 +576,16 @@ static void bring_up(void)
     rp_model.stereo_mode = s_settings.stereo_mode;
     rp_model.simple_screen = s_settings.simple_screen;
     rp_model.wide_screen = s_settings.wide_screen;
+
+    /* Audio, before the player exists, so the first device it opens is
+       already the right one. The name is resolved against the platform's own
+       list: one that is no longer offered falls back to the first output
+       rather than to nothing. */
+    rp_model.volume = s_settings.volume;
+    rp_model.hp_level = s_settings.hp_level;
+    s_out_saved = out_index(s_settings.output);
+    rp_model.output = 0;
+    en_play_set_output(0);
 
     /* Files, which need no drivers and no waiting. Doing them first means the
        screen behind the boot overlay is already furnished when the hardware
@@ -494,7 +688,7 @@ static void sidecar_close(uint32_t duration_ms)
 void rp_model_refresh(void)
 {
     static bool up;
-    static uint32_t last_slow, last_rds, last_dep;
+    static uint32_t last_slow, last_rds, last_dep, last_mix;
 
     if (!up) { up = true; bring_up(); }
 
@@ -517,7 +711,22 @@ void rp_model_refresh(void)
            is invisible. */
         uint32_t every = (t - s_bringup_ms < DEP_WAIT_MS) ? DEP_POLL_MS
                                                           : DEP_RETRY_MS;
-        if (t - last_dep >= every && dep_missing()) {
+
+        /*
+         * Three reasons to keep trying, not one.
+         *
+         * This used to stop the moment dep_missing() went quiet, which is the
+         * moment the tuner, the capture and the player are all up - and that
+         * is earlier than the other two are settled. The card's softvol
+         * controls do not exist until something has opened the plugin that
+         * defines them, so on a fast start the volume was still unrestored
+         * when the retry stopped; the next read then took the control's own
+         * default, which is full scale, and the saved level was replaced by
+         * the loudest one. The saved output has the same shape of problem,
+         * with an encoder that may not have started yet.
+         */
+        if (t - last_dep >= every
+            && (dep_missing() || !s_mixer_ready || !s_out_restored)) {
             last_dep = t;
             try_all();
         }
@@ -562,9 +771,42 @@ void rp_model_refresh(void)
         }
     }
 
+    /*
+     * The card's controls, a few times a second and independently of the
+     * tuner: the volume can be moved from a serial console with tinymix while
+     * this is running, and a readout that only changed when this app changed
+     * it would be a readout of its own intentions.
+     */
+    if (t - last_mix >= 400u) {
+        const en_play_out_t *o = en_play_out(rp_model.output);
+        int v;
+
+        last_mix = t;
+
+        if (o) {
+            v = en_mix_get(o->volume);
+            rp_model.volume_ok = (v >= 0);
+            if (v >= 0) rp_model.volume = (uint8_t)v;
+        }
+
+        v = en_mix_get_raw(EN_MIX_VOL_CODEC);
+        rp_model.hp_level_ok = (v >= 0);
+        if (v >= 0) rp_model.hp_level = (uint8_t)v;
+    }
+
+    /* A volume change that has settled gets written out. Deferred rather than
+       written on every step so that holding a key down is one file write and
+       not forty. */
+    if (s_save_due && (int32_t)(t - s_save_due) >= 0) {
+        s_save_due = 0;
+        settings_save();
+    }
+
     en_play_state_t ps;
     en_play_state(&ps);
     rp_model.play_file = (ps.source == EN_SRC_FILE);
+    rp_model.output = ps.output;
+    rp_model.output_open = ps.output_open;
     rp_model.play_paused = ps.paused;
     rp_model.play_pos_ms = ps.pos_ms;
     rp_model.play_len_ms = ps.len_ms;
@@ -765,6 +1007,72 @@ void rp_act_mute(bool on)
 {
     rp_model.muted = on;
     mute_apply();
+}
+
+/* ---- where the audio goes, and how loud ---------------------------------- */
+
+uint8_t rp_out_count(void) { return en_play_out_count(); }
+
+const char *rp_out_label(uint8_t i)
+{
+    const en_play_out_t *o = en_play_out(i);
+    return o ? o->label : "";
+}
+
+bool rp_out_ready(uint8_t i) { return en_play_out_ready(i); }
+
+const char *rp_act_set_output(uint8_t i)
+{
+    const char *why;
+
+    /* Whatever the settings wanted, the user has now said otherwise. */
+    s_out_restored = true;
+
+    why = en_play_set_output(i);
+    if (why) return why;
+
+    rp_model.output = i;
+
+    /* The new output has its own volume control, which may be at a different
+       level or may not exist yet - so the level the user is looking at is
+       pushed onto it rather than read from it. Arriving at a different volume
+       because the destination changed would be a surprise, and on this
+       hardware it would be a loud one. */
+    volume_apply();
+    settings_save();
+    return NULL;
+}
+
+void rp_act_set_volume(uint8_t percent)
+{
+    if (percent > 100) percent = 100;
+    rp_model.volume = percent;
+    volume_apply();
+
+    /* Deferred: see s_save_due. */
+    s_save_due = now_ms() + SAVE_DELAY_MS;
+    if (!s_save_due) s_save_due = 1;      /* 0 means "nothing pending" */
+}
+
+void rp_act_nudge_volume(int delta)
+{
+    int v = (int)rp_model.volume + delta;
+
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    rp_act_set_volume((uint8_t)v);
+}
+
+void rp_act_set_hp_level(uint8_t level)
+{
+    if (level > EN_MIX_CODEC_MAX) level = EN_MIX_CODEC_MAX;
+    rp_model.hp_level = level;
+
+    if (en_mix_present(EN_MIX_VOL_CODEC)) {
+        rp_model.hp_level_ok = true;
+        en_mix_set_raw(EN_MIX_VOL_CODEC, level);
+    }
+    settings_save();
 }
 
 void rp_act_squelch(bool on)

@@ -134,6 +134,13 @@ static lv_obj_t *s_dial_freq, *s_dial_grid, *s_dial_note;
 /* Presets, library, settings */
 static lv_obj_t *s_preset_list, *s_library_list;
 static lv_obj_t *s_set_af, *s_set_af_note, *s_set_af_save;
+static lv_obj_t *s_set_output, *s_set_output_note;
+static lv_obj_t *s_set_vol, *s_set_vol_val;
+static lv_obj_t *s_set_hp, *s_set_hp_val;
+static lv_obj_t *s_vol_overlay, *s_vol_bar, *s_vol_txt;
+static uint8_t   s_vol_last = 0xFF;    /* 0xFF: nothing seen yet */
+static uint32_t  s_vol_until;
+#define VOL_SHOW_MS 1500u
 static lv_obj_t *s_set_region, *s_set_std, *s_set_backend, *s_set_capture,
                 *s_set_ta;
 static lv_obj_t *s_adv_list;
@@ -923,6 +930,38 @@ static void build_now(void)
     s_mute_lbl = label(s_mute_btn, LV_SYMBOL_VOLUME_MAX, F_BODY, C_TEXT_DIM);
     lv_obj_center(s_mute_lbl);
 
+    /*
+     * The volume, shown only while it is being changed.
+     *
+     * The volume keys are the two buttons on this device that are labelled for
+     * a job, and until now they tuned the radio. They set the volume instead,
+     * which needs no explaining to anybody - but a control with no readout is
+     * a control you have to guess at, and there is no room on this screen for
+     * a permanent one.
+     *
+     * So it appears over the station name for a moment and goes away. Over the
+     * station name deliberately: that is the least useful thing to cover for a
+     * second and a half, and it puts the readout where the eye already is
+     * rather than in a corner.
+     *
+     * Hidden at rest, so this costs the layout nothing and the screen looks
+     * exactly as it did when nobody is touching the volume.
+     */
+    /* 142 to 188, which is the programme type and the rule under it. Chosen
+       by what it covers: the station name above ends at 152 and the radio
+       text below starts at 190, so this is the one band on the screen where
+       a second and a half of cover costs nothing anybody was reading. */
+    s_vol_overlay = panel(s, MARGIN + 14, 142, CONTENT_W - 28, 46, C_SURFACE);
+    lv_obj_set_style_radius(s_vol_overlay, 4, 0);
+    lv_obj_add_flag(s_vol_overlay, LV_OBJ_FLAG_HIDDEN);
+
+    s_vol_txt = label(s_vol_overlay, "", F_CAPTION, C_TEXT_DIM);
+    lv_obj_set_pos(s_vol_txt, 12, 8);
+
+    /* Track first, fill second: the fill has to be drawn over it. */
+    panel(s_vol_overlay, 12, 30, CONTENT_W - 52, 6, C_SURFACE_2);
+    s_vol_bar = panel(s_vol_overlay, 12, 30, 1, 6, C_SIGNAL);
+
     /* Station name, from RDS. Falls back to nothing rather than to a
        placeholder: an empty line reads as "not yet", where "Unknown" reads as
        a decode that failed. */
@@ -1085,6 +1124,17 @@ static void build_now(void)
     lv_obj_set_style_bg_color(up, lv_color_hex(C_SURFACE_2), LV_STATE_PRESSED);
     s_tr_lbl = label(up, LV_SYMBOL_NEXT, F_BODY, C_TEXT);
     lv_obj_center(s_tr_lbl);
+
+    /*
+     * The volume overlay, in front of everything.
+     *
+     * Last, and it has to be last: z order here is creation order, and the
+     * overlay is created up beside the mute button it belongs with. Without
+     * this the station name and the programme type draw straight through it,
+     * which reads as a transparency bug and is really a question of which
+     * sibling came second.
+     */
+    lv_obj_move_foreground(s_vol_overlay);
 }
 
 static void refresh_now(void)
@@ -1187,6 +1237,43 @@ static void refresh_now(void)
      * on this screen for forced mono. Red on this screen means a recording is
      * running and should keep meaning only that.
      */
+    /*
+     * The overlay follows the value rather than the button, so it appears
+     * whichever way the volume was changed - the keys, the settings slider, or
+     * tinymix on a serial console. The first value seen is not a change, or
+     * the overlay would greet everybody at startup.
+     */
+    if (s_vol_last != rp_model.volume) {
+        if (s_vol_last != 0xFF)
+            s_vol_until = lv_tick_get() + VOL_SHOW_MS;
+        s_vol_last = rp_model.volume;
+    }
+    if (s_vol_overlay) {
+        bool on = rp_model.volume_ok
+               && (int32_t)(lv_tick_get() - s_vol_until) < 0;
+
+        show(s_vol_overlay, on);
+        if (on) {
+            const int track = CONTENT_W - 52;
+            int w = track * (int)rp_model.volume / 100;
+            char b[40], pct[8];
+
+            pct[0] = 0;
+            put_uint(pct, rp_model.volume, 0);
+
+            b[0] = 0;
+            cat(b, rp_out_label(rp_model.output), sizeof b);
+            cat(b, "  ", sizeof b);
+            cat(b, pct, sizeof b);
+            cat(b, "%", sizeof b);
+            lv_label_set_text(s_vol_txt, b);
+
+            /* At least one pixel at zero: a bar that vanishes entirely reads
+               as a missing control rather than as silence. */
+            lv_obj_set_width(s_vol_bar, w < 1 ? 1 : w);
+        }
+    }
+
     if (s_mute_btn) {
         show(s_mute_btn, rp_model.mute_ok);
         if (rp_model.mute_ok && s_mute_lbl) {
@@ -2025,6 +2112,94 @@ static void on_open_clock(lv_event_t *e)
     rp_ui_show(RP_SCREEN_CLOCK);
 }
 
+/*
+ * Cycling the output.
+ *
+ * It moves to the next output that will actually take the audio rather than to
+ * the next one in the list, because the Bluetooth legs can be unavailable -
+ * they need an encoder reading the fifo at the far end - and stepping onto one
+ * that cannot work, only to be told so, is a control that makes the user do
+ * the searching.
+ *
+ * When nothing else will take it, the reason the first candidate refused is
+ * shown under the row and left there for a few seconds. "Switching failed" is
+ * no better than a button that does nothing; "nothing is listening on
+ * Bluetooth" tells somebody what to go and start.
+ */
+static char     s_out_why[64];
+static uint32_t s_out_why_until;
+#define OUT_WHY_MS 4000u
+
+static void on_output_next(lv_event_t *e)
+{
+    uint8_t n = rp_out_count();
+    const char *first_why = NULL;
+    uint8_t k;
+
+    (void)e;
+    if (n < 2) return;
+
+    for (k = 1; k < n; k++) {
+        uint8_t i = (uint8_t)((rp_model.output + k) % n);
+        const char *why = rp_act_set_output(i);
+
+        if (!why) {
+            s_out_why[0] = 0;
+            return;
+        }
+        if (!first_why) first_why = why;
+    }
+
+    s_out_why[0] = 0;
+    cat(s_out_why, first_why ? first_why : "no other output",
+        sizeof s_out_why);
+    s_out_why_until = lv_tick_get() + OUT_WHY_MS;
+}
+
+static void on_volume_slider(lv_event_t *e)
+{
+    lv_obj_t *sl = lv_event_get_target(e);
+    rp_act_set_volume((uint8_t)lv_slider_get_value(sl));
+}
+
+/*
+ * The codec's own level, which is not the volume above it.
+ *
+ * It is here rather than hidden away because it is the control that decides
+ * whether the output clips, and it is a slider that stops at 88 rather than at
+ * 100 because 88 is where the range ends - the top of it pins the peak at
+ * 0.0 dBFS and is audible as fuzz. The caption says so; the slider still lets
+ * anybody go there, because somebody measuring their own unit may want to.
+ */
+static void on_hp_slider(lv_event_t *e)
+{
+    lv_obj_t *sl = lv_event_get_target(e);
+    rp_act_set_hp_level((uint8_t)lv_slider_get_value(sl));
+}
+
+/* The two sliders share this, because a slider styled by hand in two places is
+   a slider that stops matching. */
+static lv_obj_t *thin_slider(lv_obj_t *r, int y, int32_t lo, int32_t hi,
+                             int32_t at, lv_event_cb_t cb)
+{
+    lv_obj_t *sl = lv_slider_create(r);
+
+    lv_obj_set_size(sl, CONTENT_W - 8, 6);
+    lv_obj_set_pos(sl, MARGIN, y);
+    lv_slider_set_range(sl, lo, hi);
+    lv_slider_set_value(sl, at, LV_ANIM_OFF);
+
+    lv_obj_set_style_bg_color(sl, lv_color_hex(C_SURFACE_2), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(sl, lv_color_hex(C_SIGNAL), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(sl, lv_color_hex(C_TEXT), LV_PART_KNOB);
+    lv_obj_set_style_radius(sl, 2, LV_PART_MAIN);
+    lv_obj_set_style_radius(sl, 2, LV_PART_INDICATOR);
+    lv_obj_set_style_pad_all(sl, 7, LV_PART_KNOB);
+    lv_obj_set_ext_click_area(sl, 18);
+    lv_obj_add_event_cb(sl, cb, LV_EVENT_VALUE_CHANGED, 0);
+    return sl;
+}
+
 static void on_region_next(lv_event_t *e)
 {
     (void)e;
@@ -2096,6 +2271,43 @@ static void build_settings(void)
     s_set_std = row_value(r, C_RDS);
     lv_obj_set_pos(s_set_std, MARGIN, 14);
     y += 48;
+
+    /*
+     * Where the sound goes, and how loud - near the top because they are the
+     * two settings anybody actually opens this screen for, and because on a
+     * device that can play to headphones and Bluetooth at the same time
+     * "which one is this going to" is a question people ask before any other.
+     */
+    r = setting_row(s, y, 62, "Output", 0, on_output_next);
+    s_set_output = row_value(r, C_SIGNAL);
+    lv_obj_set_pos(s_set_output, MARGIN, 14);
+    s_set_output_note = para(r, "", F_CAPTION, C_TEXT_MUTE, CONTENT_W);
+    lv_obj_set_pos(s_set_output_note, MARGIN, 32);
+    y += 62;
+
+    r = setting_row(s, y, 66, "Volume", 0, 0);
+    s_set_vol_val = row_value(r, C_SIGNAL);
+    lv_obj_set_pos(s_set_vol_val, MARGIN, 8);
+    s_set_vol = thin_slider(r, 40, 0, 100, 100, on_volume_slider);
+    y += 66;
+
+    /* The codec's analog level. A separate row because it is a separate kind
+       of thing: it applies to the headphone leg only, it is set once against a
+       meter rather than adjusted while listening, and the top of its range
+       clips - which is what the caption is for. */
+    /* 94 and not 80: the caption below the slider wraps to two lines, and a
+       row measured for one puts the second through its own rule. */
+    r = setting_row(s, y, 94, "Headphone level", 0, 0);
+    s_set_hp_val = row_value(r, C_TEXT_DIM);
+    lv_obj_set_pos(s_set_hp_val, MARGIN, 8);
+    s_set_hp = thin_slider(r, 40, 0, 88, 75, on_hp_slider);
+    {
+        lv_obj_t *n = para(r, "The codec's own volume. 75 is calibrated; above "
+                              "about 80 it clips.", F_CAPTION, C_TEXT_MUTE,
+                           CONTENT_W);
+        lv_obj_set_pos(n, MARGIN, 54);
+    }
+    y += 94;
 
     /* These two keep their text because it is not a description of a control -
        it is which driver and which device, which is the answer to why the
@@ -2191,6 +2403,42 @@ static void refresh_settings(void)
     lv_label_set_text(s_set_region,
                       rp_model.region ? rp_model.region->name : "-");
     lv_label_set_text(s_set_std, rp_model.rds.rbds ? "RBDS" : "RDS");
+
+    lv_label_set_text(s_set_output, rp_out_label(rp_model.output));
+    /* Dimmed when the chosen destination is not actually receiving anything,
+       which on this device means the Bluetooth encoder has gone. The name
+       stays, because it is still what was chosen. */
+    lv_obj_set_style_text_color(s_set_output,
+        lv_color_hex(rp_model.output_open ? C_SIGNAL : C_TEXT_MUTE), 0);
+
+    if (s_out_why[0] && (int32_t)(lv_tick_get() - s_out_why_until) < 0) {
+        lv_label_set_text(s_set_output_note, s_out_why);
+    } else {
+        s_out_why[0] = 0;
+        lv_label_set_text(s_set_output_note,
+                          rp_model.output_open ? "" : "not receiving audio");
+    }
+
+    {
+        char b[16];
+
+        b[0] = 0;
+        put_uint(b, rp_model.volume, 0);
+        cat(b, "%", sizeof b);
+        lv_label_set_text(s_set_vol_val, rp_model.volume_ok ? b : "-");
+        /* Not while it is being dragged: writing the model's value back into a
+           slider under a finger fights the finger. */
+        if (!lv_obj_has_state(s_set_vol, LV_STATE_PRESSED))
+            lv_slider_set_value(s_set_vol, rp_model.volume, LV_ANIM_OFF);
+
+        b[0] = 0;
+        put_uint(b, rp_model.hp_level, 0);
+        cat(b, " / 88", sizeof b);
+        lv_label_set_text(s_set_hp_val, rp_model.hp_level_ok ? b : "-");
+        if (!lv_obj_has_state(s_set_hp, LV_STATE_PRESSED))
+            lv_slider_set_value(s_set_hp, rp_model.hp_level, LV_ANIM_OFF);
+    }
+
     lv_label_set_text(s_set_backend,
                       rp_model.backend ? rp_model.backend : "not detected");
     lv_label_set_text(s_set_capture,

@@ -210,32 +210,69 @@ The scan's squelch and your mute are separate flags over the same bit in the
 chip. A scan that ended by unmuting would have overridden a decision you made
 before you started it.
 
-There is deliberately no volume here. No FM volume register appears anywhere in
-the recovered `FM_RDS_Command` map; level on this path is the codec's playback
-volume once the audio reaches the headphones, which is already a control. A
-software gain would be a second volume corresponding to nothing.
+### Volume, on a device with no volume register
 
-### FM into Bluetooth headphones
+![Volume](screenshots/volume.png)
+
+The two buttons on the side change the volume, which sounds like it should not
+be worth a section.
+
+No FM volume register appears anywhere in the recovered `FM_RDS_Command` map.
+The Bluetooth path is an SBC encoder in userspace with no gain stage at all.
+The codec has a real analog playback volume, but it applies to the headphone
+leg only and its top end clips outright — 88 of 88 pins the peak at 0.0 dBFS
+with a flat crest factor, which is audible as fuzz. So on the face of it there
+is nowhere to put a volume control.
+
+`/etc/asound.conf` puts one where the hardware has none. Each output is a
+`softvol` plugin, which applies the gain in software and registers a genuine
+mixer control for it, so "Bluetooth Soft Volume" is a control on card 0 that
+behaves like any other with no register behind it. Radio+ moves whichever one
+belongs to the output currently selected.
+
+That is also why this app links `alsa-lib` rather than tinyalsa, which it used
+until the audio path was finished: tinyalsa talks to `/dev/snd` directly and
+cannot see an alsa-lib plugin at all, so with it there is no volume, no mute,
+no rate conversion and no simultaneous output.
+
+**Headphone level** is on the settings screen too, and is a different thing:
+the codec's own 0–88, applying to the headphone leg only. It is a calibration
+against the physical output rather than a knob — 75 measures about −20 dBFS RMS
+and −9 dBFS peak on FM, against RetailOS at roughly −12 — so the app sets it
+once and leaves it. It is exposed for anybody measuring their own unit.
+
+### Headphones, Bluetooth, or both at once
+
+![Settings](screenshots/settings.png)
+
+Choosing an output is choosing an alsa-lib device name. There is no routing API
+on this hardware and nothing to program:
+
+| | |
+|---|---|
+| `n31hp` | softvol → 48 kHz → the codec and the jack |
+| `n31bt` | softvol → 48 kHz → a fifo the Bluetooth encoder reads |
+| `n31both` | softvol → 48 kHz → a tee into both of those at once |
+
+Both at once shares one volume, because it is one softvol over a tee rather
+than two streams. Two independent levels would need two writers.
+
+The Bluetooth legs need an encoder reading the far end of the fifo, and the app
+checks before offering them — opening a fifo for writing *blocks* until a
+reader exists, so switching to Bluetooth with nothing listening would not fail,
+it would hang inside the open with the radio stopped. Probing with
+`O_WRONLY | O_NONBLOCK` turns that into an answer, and the settings row says
+"nothing is listening on Bluetooth" instead of doing nothing. Start the reader
+first:
 
 ```bash
-RADIOPLUS_PCM_OUT=1,0 radioplus     # write to hw:Loopback,0
+sh -c 'exec 3<> /run/n31-bt.pcm; exec tinybtd audio <addr> --rate 48000 <&3'
 ```
 
-With `snd-aloop` loaded, that puts the radio where `tinybtd`'s SBC encoder
-reads it from `hw:Loopback,1`, and FM comes out of a pair of Bluetooth
-headphones. This was assumed for a long time to need audio routing the SoC does
-not have; with the encoder in software it is two PCMs and a kernel module, and
-was never a hardware limit.
-
-Doing it in the player rather than with an `arecord` pipe off the capture
+Doing this in the player rather than with an `arecord` pipe off the capture
 device keeps the parts that make this app worth using — the live ring, the
 scrubbing and the recording all sit between the tuner and that write, and a
 pipe bypasses every one of them.
-
-Two things to know before setting it: the loopback takes its rate from
-whichever side opens first, so start the encoder end first; and a loopback with
-nothing reading it fills and stops, which sounds exactly like the radio having
-died.
 
 ### Two optional screens
 
