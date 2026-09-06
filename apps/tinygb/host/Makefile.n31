@@ -29,6 +29,34 @@
 
 IPOD_ROOT ?= /mnt/c/src/ipod/artifacts/linux-n31
 TOOLCHAIN ?= $(IPOD_ROOT)/tinyalsa-build/arm-linux-musleabi-cross
+
+# Which toolchain, and which float ABI.
+#
+# Overridable so a hard-float build can be made without disturbing this one.
+# The default is unchanged and stays unchanged until hard float has been shown
+# to work on hardware: this is what currently boots.
+#
+# softfp is not soft float. The FPU does the arithmetic either way; what the
+# ABI decides is whether a float crossing a function boundary travels in a VFP
+# register or in a pair of integer ones. Hard float cannot simply be switched
+# on here, because musleabi's own libc is built the other way and the link
+# fails with "uses VFP register arguments" - it needs the whole parallel
+# toolchain, and every vendored library rebuilt against it.
+#
+#   make -f Makefile.n31 \
+#     TOOLCHAIN=$(IPOD_ROOT)/toolchain-hf/arm-linux-musleabihf-cross \
+#     TRIPLE=arm-linux-musleabihf FLOAT_ABI=hard BUILD=build-n31-hf
+#
+# BUILD has to differ too. Objects of the two ABIs cannot be linked together -
+# which at least fails loudly rather than quietly - but they would happily
+# share an object directory and confuse every later build.
+TRIPLE    ?= arm-linux-musleabi
+FLOAT_ABI ?= softfp
+
+# Hard-float builds stage under a different name. The soft-float
+# artifact is what mk-initramfs.sh packs, and a parallel ABI
+# experiment must not quietly become the thing that boots.
+STAGE_SUFFIX := $(if $(filter-out softfp,$(FLOAT_ABI)),-$(FLOAT_ABI),)
 TINYALSA  ?= $(IPOD_ROOT)/tinyalsa-build/tinyalsa-2.0.0
 ALSALIB   ?= $(IPOD_ROOT)/alsa
 
@@ -50,17 +78,17 @@ TG_AUDIO ?= alsalib
 SSH_KEY   ?= $(IPOD_ROOT)/n31_id
 DEVICE    ?= root@192.168.7.2
 
-CROSS  := $(TOOLCHAIN)/bin/arm-linux-musleabi-
+CROSS  := $(TOOLCHAIN)/bin/$(TRIPLE)-
 CCACHE := $(shell command -v ccache 2>/dev/null)
 CC     := $(CCACHE) $(CROSS)gcc
 STRIP  := $(CROSS)strip
 AR     := $(CROSS)ar
 READELF:= $(CROSS)readelf
 
-BUILD  := build-n31
+BUILD  ?= build-n31
 APP    := $(BUILD)/tinygb
 
-ARCH_FLAGS := -mcpu=cortex-a5 -mthumb -mfpu=vfpv4 -mfloat-abi=softfp
+ARCH_FLAGS := -mcpu=cortex-a5 -mthumb -mfpu=vfpv4 -mfloat-abi=$(FLOAT_ABI)
 
 # The APU is compiled for one rate and it is the sink's, so nothing resamples.
 # 48000 because the codec's 12 MHz master clock only divides into that family -
@@ -109,9 +137,11 @@ LVGL     ?= ../../../lvgl
 include ../../lvgl-mirror.mk
 
 LV_CONF    := lv_conf_n31.h
+# The float ABI is part of the key, not just the config: objects of the
+# two ABIs cannot be linked together, and a cache that ignored the
+# difference would hand a hard-float build its soft-float objects.
 LV_CONF_ID := $(shell md5sum $(LV_CONF) 2>/dev/null | cut -c1-12)
-LV_CACHE   ?= $(HOME)/.cache/n31-lvgl/tinygb-n31-$(LV_CONF_ID)
-
+LV_CACHE   ?= $(HOME)/.cache/n31-lvgl/tinygb-n31-$(LV_CONF_ID)-$(FLOAT_ABI)
 LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_n31.h\" \
              -I$(LVGL_SRC) -I$(LVGL_SRC)/src -I$(LVGL_SRC)/include -I$(LVGL_SRC)/..
 
@@ -261,8 +291,8 @@ $(APP): $(OBJS) $(LINK_TA) $(LVLIB)
 	@echo "  $(APP)  $$(stat -c%s $(APP)) bytes"
 	@$(MAKE) -s -f Makefile.n31 check
 	@mkdir -p $(IPOD_ROOT)
-	@cp -f $@ $(IPOD_ROOT)/tinygb
-	@echo "  staged -> $(IPOD_ROOT)/tinygb"
+	@cp -f $@ $(IPOD_ROOT)/tinygb$(STAGE_SUFFIX)
+	@echo "  staged -> $(IPOD_ROOT)/tinygb$(STAGE_SUFFIX)"
 
 # The two ways this binary can be wrong without failing to build: a float ABI
 # the libc does not share, and a dynamic binary looking for a loader that is

@@ -12,18 +12,46 @@
 #     format as the RetailOS build, so ui.c is used unchanged.
 #   * The CPU reports vfpv3/vfpv4 and NO neon, so no NEON anywhere.
 #   * The toolchain is arm-linux-musleabi — a SOFT-FLOAT ABI. Hardware FP
-#     instructions are still used via -mfloat-abi=softfp; -mfloat-abi=hard
+#     instructions are still used via -mfloat-abi=$(FLOAT_ABI); -mfloat-abi=hard
 #     would produce a binary that cannot call its own libc.
 #   * ALSA is card 0 device 0 (nano7gaudio / cs42l81-hifi-0), driven through
 #     tinyalsa compiled straight in.
 
 IPOD_ROOT ?= /mnt/c/src/ipod/artifacts/linux-n31
 TOOLCHAIN ?= $(IPOD_ROOT)/tinyalsa-build/arm-linux-musleabi-cross
+
+# Which toolchain, and which float ABI.
+#
+# Overridable so a hard-float build can be made without disturbing this one.
+# The default is unchanged and stays unchanged until hard float has been shown
+# to work on hardware: this is what currently boots.
+#
+# softfp is not soft float. The FPU does the arithmetic either way; what the
+# ABI decides is whether a float crossing a function boundary travels in a VFP
+# register or in a pair of integer ones. Hard float cannot simply be switched
+# on here, because musleabi's own libc is built the other way and the link
+# fails with "uses VFP register arguments" - it needs the whole parallel
+# toolchain, and every vendored library rebuilt against it.
+#
+#   make -f Makefile.n31 \
+#     TOOLCHAIN=$(IPOD_ROOT)/toolchain-hf/arm-linux-musleabihf-cross \
+#     TRIPLE=arm-linux-musleabihf FLOAT_ABI=hard BUILD=build-n31-hf
+#
+# BUILD has to differ too. Objects of the two ABIs cannot be linked together -
+# which at least fails loudly rather than quietly - but they would happily
+# share an object directory and confuse every later build.
+TRIPLE    ?= arm-linux-musleabi
+FLOAT_ABI ?= softfp
+
+# Hard-float builds stage under a different name. The soft-float
+# artifact is what mk-initramfs.sh packs, and a parallel ABI
+# experiment must not quietly become the thing that boots.
+STAGE_SUFFIX := $(if $(filter-out softfp,$(FLOAT_ABI)),-$(FLOAT_ABI),)
 TINYALSA  ?= $(IPOD_ROOT)/tinyalsa-build/tinyalsa-2.0.0
 SSH_KEY   ?= $(IPOD_ROOT)/n31_id
 DEVICE    ?= root@192.168.7.2
 
-CROSS   := $(TOOLCHAIN)/bin/arm-linux-musleabi-
+CROSS   := $(TOOLCHAIN)/bin/$(TRIPLE)-
 CCACHE  := $(shell command -v ccache 2>/dev/null)
 CC      := $(CCACHE) $(CROSS)gcc
 AR      := $(CROSS)ar
@@ -36,8 +64,7 @@ LVGL    ?= ../../../lvgl
 # which is nineteen times faster - see apps/lvgl-mirror.mk.
 include ../../lvgl-mirror.mk
 
-BUILD   := build-n31
-
+BUILD   ?= build-n31
 # LVGL objects live on the native filesystem, not the Windows drive.
 #
 # A full pass measured twelve minutes wall for four and a half of CPU. The rest
@@ -48,11 +75,13 @@ BUILD   := build-n31
 # without changing a byte - reuses what is already there instead of rebuilding
 # it, and flipping a config option back finds its old objects still present.
 LV_CONF    := lv_conf_n31.h
+# The float ABI is part of the key, not just the config: objects of the
+# two ABIs cannot be linked together, and a cache that ignored the
+# difference would hand a hard-float build its soft-float objects.
 LV_CONF_ID := $(shell md5sum $(LV_CONF) 2>/dev/null | cut -c1-12)
-LV_CACHE   ?= $(HOME)/.cache/n31-lvgl/entrain-n31-$(LV_CONF_ID)
-
+LV_CACHE   ?= $(HOME)/.cache/n31-lvgl/entrain-n31-$(LV_CONF_ID)-$(FLOAT_ABI)
 # Cortex-A8, Thumb-2, hardware FP but soft-float ABI, and no NEON.
-ARCH_FLAGS := -mcpu=cortex-a5 -mthumb -mfpu=vfpv4 -mfloat-abi=softfp
+ARCH_FLAGS := -mcpu=cortex-a5 -mthumb -mfpu=vfpv4 -mfloat-abi=$(FLOAT_ABI)
 
 CFLAGS  := -O2 -g0 -std=gnu99 $(ARCH_FLAGS) \
            -ffunction-sections -fdata-sections \
@@ -158,8 +187,8 @@ $(BUILD)/entrain: $(APP_SRCS) $(APP_HDRS) $(BUILD)/liblvgl_n31.a $(BUILD)/libtin
 	@# from the other repo can never be older than the last build here. See
 	@# STAGING in the app READMEs.
 	@mkdir -p $(IPOD_ROOT)
-	@cp -f $@ $(IPOD_ROOT)/entrain
-	@echo "  staged -> $(IPOD_ROOT)/entrain"
+	@cp -f $@ $(IPOD_ROOT)/entrain$(STAGE_SUFFIX)
+	@echo "  staged -> $(IPOD_ROOT)/entrain$(STAGE_SUFFIX)"
 	@echo "=== $@ ===" && ls -l $@ && file $@ 2>/dev/null || true
 
 # The key lives on a Windows-mounted path, which shows as 0777 under WSL, and

@@ -17,6 +17,34 @@
 
 IPOD_ROOT ?= /mnt/c/src/ipod/artifacts/linux-n31
 TOOLCHAIN ?= $(IPOD_ROOT)/tinyalsa-build/arm-linux-musleabi-cross
+
+# Which toolchain, and which float ABI.
+#
+# Overridable so a hard-float build can be made without disturbing this one.
+# The default is unchanged and stays unchanged until hard float has been shown
+# to work on hardware: this is what currently boots.
+#
+# softfp is not soft float. The FPU does the arithmetic either way; what the
+# ABI decides is whether a float crossing a function boundary travels in a VFP
+# register or in a pair of integer ones. Hard float cannot simply be switched
+# on here, because musleabi's own libc is built the other way and the link
+# fails with "uses VFP register arguments" - it needs the whole parallel
+# toolchain, and every vendored library rebuilt against it.
+#
+#   make -f Makefile.n31 \
+#     TOOLCHAIN=$(IPOD_ROOT)/toolchain-hf/arm-linux-musleabihf-cross \
+#     TRIPLE=arm-linux-musleabihf FLOAT_ABI=hard BUILD=build-n31-hf
+#
+# BUILD has to differ too. Objects of the two ABIs cannot be linked together -
+# which at least fails loudly rather than quietly - but they would happily
+# share an object directory and confuse every later build.
+TRIPLE    ?= arm-linux-musleabi
+FLOAT_ABI ?= softfp
+
+# Hard-float builds stage under a different name. The soft-float
+# artifact is what mk-initramfs.sh packs, and a parallel ABI
+# experiment must not quietly become the thing that boots.
+STAGE_SUFFIX := $(if $(filter-out softfp,$(FLOAT_ABI)),-$(FLOAT_ABI),)
 SSH_KEY   ?= $(IPOD_ROOT)/n31_id
 DEVICE    ?= root@192.168.7.2
 
@@ -25,10 +53,10 @@ DEVICE    ?= root@192.168.7.2
 # identically.
 CCACHE := $(shell command -v ccache 2>/dev/null)
 
-CC     := $(CCACHE) $(TOOLCHAIN)/bin/arm-linux-musleabi-gcc
-STRIP  := $(TOOLCHAIN)/bin/arm-linux-musleabi-strip
-AR     := $(TOOLCHAIN)/bin/arm-linux-musleabi-ar
-BUILD  := build-n31
+CC     := $(CCACHE) $(TOOLCHAIN)/bin/$(TRIPLE)-gcc
+STRIP  := $(TOOLCHAIN)/bin/$(TRIPLE)-strip
+AR     := $(TOOLCHAIN)/bin/$(TRIPLE)-ar
+BUILD  ?= build-n31
 LVGL   ?= ../../../lvgl
 LV_CONF := lv_conf_n31.h
 
@@ -42,16 +70,18 @@ LV_CONF := lv_conf_n31.h
 # objects, so switching branch - which rewrites lv_conf and moves its mtime
 # without changing a byte - reuses what is already there instead of rebuilding
 # it, and flipping a config option back finds its old objects still present.
+# The float ABI is part of the key, not just the config: objects of the
+# two ABIs cannot be linked together, and a cache that ignored the
+# difference would hand a hard-float build its soft-float objects.
 LV_CONF_ID := $(shell md5sum $(LV_CONF) 2>/dev/null | cut -c1-12)
-LV_CACHE   ?= $(HOME)/.cache/n31-lvgl/launcher-n31-$(LV_CONF_ID)
-
+LV_CACHE   ?= $(HOME)/.cache/n31-lvgl/launcher-n31-$(LV_CONF_ID)-$(FLOAT_ABI)
 $(LV_CACHE):
 	@mkdir -p $@
 
 LVLIB_OWN  = $(LV_CACHE)/liblvgl_n31.a
 LVLIB     ?= $(LVLIB_OWN)
 
-ARCH_FLAGS := -mcpu=cortex-a5 -mthumb -mfpu=vfpv4 -mfloat-abi=softfp
+ARCH_FLAGS := -mcpu=cortex-a5 -mthumb -mfpu=vfpv4 -mfloat-abi=$(FLOAT_ABI)
 
 CFLAGS := -O2 -g0 -std=gnu99 $(ARCH_FLAGS) \
           -ffunction-sections -fdata-sections \
@@ -110,8 +140,8 @@ $(APP): $(SRCS) $(HDRS) $(LVLIB) | $(BUILD)
 	@# from the other repo can never be older than the last build here. See
 	@# STAGING in the app READMEs.
 	@mkdir -p $(IPOD_ROOT)
-	@cp -f $@ $(IPOD_ROOT)/n31launcher
-	@echo "  staged -> $(IPOD_ROOT)/n31launcher"
+	@cp -f $@ $(IPOD_ROOT)/n31launcher$(STAGE_SUFFIX)
+	@echo "  staged -> $(IPOD_ROOT)/n31launcher$(STAGE_SUFFIX)"
 	@ls -l $@
 
 $(BUILD):
