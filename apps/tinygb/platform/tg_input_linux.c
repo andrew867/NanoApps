@@ -18,6 +18,9 @@
 
 #include <linux/input.h>
 
+#include "tg_pad.h"
+#include "touch.h"
+
 /* The launcher's key codes, and for the same reason: they are the ones this
    hardware actually emits. */
 #define KEY_VOLUMEDOWN_N31 114
@@ -27,6 +30,15 @@
 #define KEY_POWER_N31      116
 
 #define MAX_FDS 8
+
+/*
+ * How many fingers are worth tracking.
+ *
+ * Two is what a Game Boy is played with and four is what a panel this size
+ * can physically hold. Contacts in higher slots are ignored rather than
+ * wrapped onto a lower one, which would press a button nobody touched.
+ */
+#define TG_SLOTS 4
 
 /*
  * The event struct, spelled out.
@@ -60,6 +72,22 @@ struct tg_input {
     int      acc_x, acc_y, acc_z;
     tg_tilt  tilt;        /* the decision itself; see tg_tilt.h */
     uint8_t  tilt_bits;
+
+    /*
+     * The touch panel, on a file descriptor of its own.
+     *
+     * Deliberately NOT in fd[]: that loop reads ABS_X and ABS_Y as the
+     * accelerometer's axes, and the panel reports the same two codes through
+     * the kernel's pointer emulation. Mixed into one stream a thumb on the
+     * screen would tilt the d-pad, which is a wonderfully confusing fault to
+     * be looking at.
+     */
+    int      touch_fd;
+    int      slot;                  /* the contact ABS_MT_ events refer to */
+    int      slot_id[TG_SLOTS];     /* tracking id, or -1 for released */
+    int      slot_x[TG_SLOTS];
+    int      slot_y[TG_SLOTS];
+    uint8_t  touch_bits;
 };
 
 /* ---- opening ------------------------------------------------------------- */
@@ -174,6 +202,29 @@ void tg_input_set_centre(tg_input *in, int x, int y, int z)
     tg_tilt_set_centre(&in->tilt, x, y, z);
 }
 
+/*
+ * The panel, found the way every other app here finds it.
+ *
+ * Shared with the launcher rather than repeated, because "which event node is
+ * the touchscreen" is a question with one answer and three askers, and the
+ * numbering moves with driver probe order.
+ */
+static void open_touch(tg_input *in)
+{
+    const char *path = n31_touch_find();
+    int i;
+
+    for (i = 0; i < TG_SLOTS; i++)
+        in->slot_id[i] = -1;
+
+    if (!path)
+        return;
+
+    in->touch_fd = open(path, O_RDONLY | O_NONBLOCK);
+    if (in->touch_fd >= 0)
+        in->sources |= TG_SRC_TOUCH;
+}
+
 tg_input *tg_input_open(unsigned sources)
 {
     tg_input *in = calloc(1, sizeof *in);
@@ -207,6 +258,23 @@ tg_input *tg_input_open(unsigned sources)
             continue;
         }
 
+        /*
+         * The touch panel is not a keypad, however much it looks like one.
+         *
+         * It reports EV_KEY - BTN_TOUCH, from the kernel's pointer emulation -
+         * so it would be taken by the branch below and read by the loop that
+         * treats ABS_X and ABS_Y as the accelerometer's axes. A thumb on the
+         * screen would then tilt the d-pad. It is opened separately, by
+         * open_touch, and read as multitouch slots.
+         *
+         * A real multitouch range is the test, which is the same question
+         * looks_like_accel asks in the other direction.
+         */
+        if (abs_range(fd, ABS_MT_POSITION_X, NULL, NULL)) {
+            close(fd);
+            continue;
+        }
+
         if ((sources & TG_SRC_KEYS) && has_type(fd, EV_KEY)) {
             in->sources |= TG_SRC_KEYS;
             in->fd[in->nfd++] = fd;
@@ -217,6 +285,15 @@ tg_input *tg_input_open(unsigned sources)
     }
 
     calibrate(in);
+
+    /* Last, and on its own descriptor. Asked for or not, so that a build that
+       did not request it still initialises the slots to "no contact". */
+    in->touch_fd = -1;
+    if (sources & TG_SRC_TOUCH)
+        open_touch(in);
+    else
+        for (int i = 0; i < TG_SLOTS; i++) in->slot_id[i] = -1;
+
     return in;
 }
 
@@ -224,6 +301,7 @@ void tg_input_close(tg_input *in)
 {
     if (!in) return;
     for (unsigned i = 0; i < in->nfd; i++) close(in->fd[i]);
+    if (in->touch_fd >= 0) close(in->touch_fd);
     free(in);
 }
 
@@ -262,6 +340,58 @@ static uint8_t key_to_button(uint16_t code)
     }
 }
 
+/*
+ * The panel, as multitouch slots.
+ *
+ * Protocol B: a slot is selected, its fields are set, and SYN_REPORT ends the
+ * frame. Reading the single-touch emulation instead would be less code and
+ * would make the pad useless - one contact means you cannot hold a direction
+ * and press A, which is most of what playing a Game Boy consists of.
+ *
+ * The mask is rebuilt from scratch on each sync rather than accumulated,
+ * because a contact that simply stops being reported has been lifted, and a
+ * mask that only ever gains bits is a button that sticks down.
+ */
+static void poll_touch(tg_input *in)
+{
+    struct evt e;
+    unsigned bits;
+    int i;
+
+    if (in->touch_fd < 0)
+        return;
+
+    while (read(in->touch_fd, &e, sizeof e) == (ssize_t)sizeof e) {
+        if (e.type == EV_ABS) {
+            switch (e.code) {
+            case ABS_MT_SLOT:
+                in->slot = e.value;
+                break;
+            case ABS_MT_TRACKING_ID:
+                if (in->slot >= 0 && in->slot < TG_SLOTS)
+                    in->slot_id[in->slot] = e.value;   /* -1 is a release */
+                break;
+            case ABS_MT_POSITION_X:
+                if (in->slot >= 0 && in->slot < TG_SLOTS)
+                    in->slot_x[in->slot] = e.value;
+                break;
+            case ABS_MT_POSITION_Y:
+                if (in->slot >= 0 && in->slot < TG_SLOTS)
+                    in->slot_y[in->slot] = e.value;
+                break;
+            default:
+                break;
+            }
+        } else if (e.type == EV_SYN && e.code == SYN_REPORT) {
+            bits = 0;
+            for (i = 0; i < TG_SLOTS; i++)
+                if (in->slot_id[i] >= 0)
+                    bits |= tg_pad_hit(in->slot_x[i], in->slot_y[i]);
+            in->touch_bits = (uint8_t)bits;
+        }
+    }
+}
+
 uint8_t tg_input_poll(tg_input *in)
 {
     struct evt e;
@@ -297,7 +427,9 @@ uint8_t tg_input_poll(tg_input *in)
         in->tilt_bits = tg_tilt_feed(&in->tilt, in->acc_x, in->acc_y,
                                      in->acc_z);
 
-    return (uint8_t)(in->keys | in->tilt_bits);
+    poll_touch(in);
+
+    return (uint8_t)(in->keys | in->tilt_bits | in->touch_bits);
 }
 
 bool tg_input_take_quit(tg_input *in)

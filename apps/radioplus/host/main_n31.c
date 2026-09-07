@@ -35,6 +35,7 @@
 #include "../platform/tuner.h"
 #include "../platform/capture.h"
 #include "../platform/player.h"
+#include "fbrefresh.h"
 
 #define FRAME_MS 33          /* about 30 Hz, which is more than enough */
 
@@ -276,6 +277,13 @@ int main(int argc, char **argv)
     }
     lv_linux_fbdev_set_file(disp, fb);
     lv_display_set_resolution(disp, RP_SCREEN_W, RP_SCREEN_H);
+
+    /* Ask for the flush explicitly, when told to. See fbrefresh.h - this is
+       the switch that says whether the damage is the problem. */
+    if (n31_fb_force_refresh()) {
+        lv_linux_fbdev_set_force_refresh(disp, true);
+        printf("radioplus: forcing a framebuffer refresh every frame\n");
+    }
 
 #if LV_USE_EVDEV
     if (!input) input = find_touch();

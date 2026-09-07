@@ -36,6 +36,8 @@
 #include "../core/tg_core.h"
 #include "../platform/tg_fb.h"
 #include "../platform/tg_input.h"
+#include "../platform/tg_pad.h"
+#include "fbrefresh.h"
 #include "../platform/tg_palette.h"
 #include "../platform/tg_roms.h"
 #include "../ui/tg_menu.h"
@@ -545,7 +547,14 @@ static enum tg_menu_action play_once(int argc, char **argv, tg_menu_state *st,
     tg_scaler_init(&scaler, pal, smooth);
 
     /* Black once, so the half below the picture is not last boot's console. */
+    /* Read once rather than per frame: an environment variable cannot change
+       under a running process, and this is on the frame path. */
+    bool force_refresh = n31_fb_force_refresh();
+    if (force_refresh)
+        printf("tinygb: forcing a framebuffer refresh every frame\n");
+
     tg_fb_fill(&fb, 0x000000);
+    tg_pad_invalidate();
     tg_fb_layout(&fb, &ox, &oy);
     dst = tg_fb_at(&fb, ox, oy);
 
@@ -618,7 +627,21 @@ static enum tg_menu_action play_once(int argc, char **argv, tg_menu_state *st,
 
     while (!s_stop && (!limit || frames < limit)) {
         if (input) {
-            core->set_buttons(ctx, tg_input_poll(input));
+            uint8_t held = tg_input_poll(input);
+
+            core->set_buttons(ctx, held);
+
+            /*
+             * The pad, showing what is held.
+             *
+             * Only when the panel is actually there: without it the bottom
+             * half stays black, which is what it has been for the whole port
+             * and is the right answer for a device being played with its
+             * buttons. Cheap on every frame - tg_pad_draw returns immediately
+             * unless something changed.
+             */
+            if (tg_input_sources(input) & TG_SRC_TOUCH)
+                tg_pad_draw(&fb, held, false);
 
             if (tg_input_take_quit(input)) {
                 /*
@@ -645,6 +668,9 @@ static enum tg_menu_action play_once(int argc, char **argv, tg_menu_state *st,
                                    st->smooth);
                 tg_fb_fill(&fb, 0x000000);
                 tg_scaler_invalidate(&scaler);
+                /* The fill took the pad with it, and tg_pad_draw cannot see
+                   that happen from where it sits. */
+                tg_pad_invalidate();
                 next = now_ns();
             }
         }
@@ -668,6 +694,9 @@ static enum tg_menu_action play_once(int argc, char **argv, tg_menu_state *st,
            like a performance regression. */
         if (noskip) tg_scaler_invalidate(&scaler);
         tg_scale_15(&scaler, dst, fb.stride_px, core->pixels(ctx));
+        /* The frame is in the mapping; whether anybody notices is the
+           question fbrefresh.h exists to answer. */
+        if (force_refresh) tg_fb_flush(&fb);
         t_blit += now_ns() - t_mark;
 
         frames++;

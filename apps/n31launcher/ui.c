@@ -27,6 +27,7 @@
 
 #include "lvgl/lvgl.h"
 
+#include <stdint.h>
 #include <stdio.h>
 
 #define C_BG        0x08090D
@@ -193,6 +194,39 @@ static lv_obj_t *s_ic_pct;
  * The key chip sits under the icon rather than beside the name. Beside it left
  * 66 px for a 20 pt name, and every one of them overflowed into the chip.
  */
+/*
+ * Where a tap goes. Null until launcher.c says otherwise.
+ */
+static void (*s_on_tile)(int tile);
+static void (*s_on_row)(int app_index);
+static void (*s_on_back)(void);
+
+void n31_ui_on_tile(void (*cb)(int tile)) { s_on_tile = cb; }
+void n31_ui_on_row(void (*cb)(int app_index)) { s_on_row = cb; }
+void n31_ui_on_back(void (*cb)(void)) { s_on_back = cb; }
+
+/* A target the size of the thing, and a pressed state - on a screen with no
+   cursor, the only way a tap can be seen to have landed is the thing it
+   landed on changing. */
+static void make_tappable(lv_obj_t *o, lv_event_cb_t cb, int data)
+{
+    lv_obj_add_flag(o, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(o, cb, LV_EVENT_CLICKED, (void *)(intptr_t)data);
+    lv_obj_set_style_bg_color(o, lv_color_hex(C_SURFACE), LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(o, LV_OPA_COVER, LV_STATE_PRESSED);
+}
+
+static void tile_clicked(lv_event_t *e)
+{
+    if (s_on_tile) s_on_tile((int)(intptr_t)lv_event_get_user_data(e));
+}
+
+static void back_clicked(lv_event_t *e)
+{
+    (void)e;
+    if (s_on_back) s_on_back();
+}
+
 static void build_tile(tile_t *t, lv_obj_t *screen, int y, const char *name,
                        const char *tagline, const char *glyph,
                        const char *key, uint32_t accent)
@@ -220,6 +254,10 @@ static void build_tile(tile_t *t, lv_obj_t *screen, int y, const char *name,
     t->tagline = fitted(t->root, tagline, F_CAPTION, C_TEXT_DIM, rx, 58, rw, 18);
 
     panel(t->root, MARGIN, TILE_H - 1, CONTENT_W, 1, C_HAIRLINE);
+
+    /* The whole tile, not the icon: a 58 px icon is a fussy target on a panel
+       this size, and the row is what reads as the button anyway. */
+    make_tappable(t->root, tile_clicked, (int)(t - s_tile));
 }
 
 /*
@@ -503,6 +541,21 @@ static int  s_selected;
 static int  s_first;              /* first app shown in row 0 */
 static bool s_opening;
 
+/*
+ * A row carries its SLOT, not the app it is showing.
+ *
+ * The list scrolls, so slot three is a different app before and after a
+ * scroll; an index baked in at build time would open whatever happened to be
+ * there when the screen was created. s_first is where the list currently
+ * starts and it is read at the moment of the tap.
+ */
+static void row_clicked(lv_event_t *e)
+{
+    int slot = (int)(intptr_t)lv_event_get_user_data(e);
+
+    if (s_on_row) s_on_row(s_first + slot);
+}
+
 static void build_row(row_t *r, lv_obj_t *screen, int y)
 {
     r->root = panel(screen, 0, y, N31_SCREEN_W, ROW_H, C_BG);
@@ -520,6 +573,8 @@ static void build_row(row_t *r, lv_obj_t *screen, int y)
     r->tagline = fitted(r->root, "", F_CAPTION, C_TEXT_DIM, rx, 38, rw, 18);
 
     panel(r->root, MARGIN, ROW_H - 1, CONTENT_W, 1, C_HAIRLINE);
+
+    make_tappable(r->root, row_clicked, (int)(r - s_row));
 }
 
 static void fill_row(row_t *r, int app_index)
@@ -594,7 +649,9 @@ static void build_extras(void)
     flat(s_extras, C_BG);
     lv_obj_set_size(s_extras, N31_SCREEN_W, N31_SCREEN_H);
 
-    header(s_extras, &s_extras_status);
+    /* The header is the way back, because on a touch device there has to be
+       one on the screen. The HOME key still does the same thing. */
+    make_tappable(header(s_extras, &s_extras_status), back_clicked, 0);
 
     for (int i = 0; i < ROWS; i++)
         build_row(&s_row[i], s_extras, LIST_TOP + i * ROW_H);

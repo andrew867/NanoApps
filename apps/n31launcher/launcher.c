@@ -57,6 +57,8 @@
 #include "apps.h"
 #include "backlight.h"
 #include "fbcon.h"
+#include "touch.h"
+#include "fbrefresh.h"
 #include "status.h"
 #include "scanner.h"
 #include "klog.h"
@@ -778,6 +780,69 @@ static void on_key(uint16_t code, int32_t value)
     }
 }
 
+/* ---- touch ---------------------------------------------------------------- */
+
+/*
+ * A tap is a button, and gets the same guards.
+ *
+ * Every one of these was learned from the keys and none of them is optional.
+ * Asleep, a tap wakes and does nothing else - a screen found in a pocket
+ * should light up, not open whatever was under the thumb. While an app is
+ * running the launcher draws nothing, so anything on screen belongs to the
+ * app and a tap on it is the app's. And settling() is what stops the release
+ * of the tap that opened a screen being read as a tap on whatever has just
+ * appeared underneath it, which on a list is how you open the wrong app.
+ */
+static bool tap_allowed(void)
+{
+    s_last_input = millis();
+
+    if (s_asleep) {
+        wake_up();
+        return false;
+    }
+    if (s_child)
+        return false;
+    return !settling();
+}
+
+static void on_tile_tap(int tile)
+{
+    if (!tap_allowed()) return;
+
+    /* The same three destinations the three keys have, so the two ways of
+       driving this screen cannot drift apart. */
+    switch (tile) {
+    case N31_TILE_RADIO:  open_app(builtin("radioplus")); break;
+    case N31_TILE_MUSIC:  open_app(builtin("tinypod"));   break;
+    case N31_TILE_EXTRAS:
+        s_selected = (int)n31_extra_first;
+        go(SCREEN_EXTRAS);
+        break;
+    default: break;
+    }
+}
+
+static void on_row_tap(int app_index)
+{
+    if (!tap_allowed()) return;
+
+    /* The row knows its slot and the list knows where it starts, and the two
+       are combined at the moment of the tap - but a slot past the end of a
+       short list still resolves to something, so it is checked here. */
+    if (app_index < (int)n31_extra_first || app_index >= (int)n31_app_count)
+        return;
+
+    s_selected = app_index;
+    open_app(&n31_apps[app_index]);
+}
+
+static void on_back_tap(void)
+{
+    if (!tap_allowed()) return;
+    go(SCREEN_HOME);
+}
+
 /*
  * Sleep until there is a key or the deadline, whichever comes first.
  *
@@ -935,12 +1000,47 @@ int main(int argc, char **argv)
     lv_linux_fbdev_set_file(disp, fb);
     lv_display_set_resolution(disp, N31_SCREEN_W, N31_SCREEN_H);
 
+    /* Ask for the flush explicitly, when told to. See fbrefresh.h - this is
+       the switch that says whether the damage is the problem. */
+    if (n31_fb_force_refresh()) {
+        lv_linux_fbdev_set_force_refresh(disp, true);
+        printf("n31launcher: forcing a framebuffer refresh every frame\n");
+    }
+
     /* Now that we can draw, take the screen. Before this point the console is
        still the only thing that can report a failure, and it keeps that job -
        the framebuffer error above is printed while it is still visible. */
     if (!n31_fbcon_detach())
         printf("n31launcher: framebuffer console still attached - kernel "
                "messages will draw over the UI\n");
+
+    /*
+     * The touch panel, if there is one.
+     *
+     * Found by capability rather than by a fixed event number, because the
+     * numbering depends on which input drivers registered and in what order.
+     * Absent is a normal state and not an error: this device has buttons, and
+     * every screen here is reachable with them.
+     */
+    {
+        const char *tp = n31_touch_find();
+
+        if (tp) {
+            lv_indev_t *in = lv_evdev_create(LV_INDEV_TYPE_POINTER, tp);
+
+            if (in) {
+                lv_indev_set_display(in, disp);
+                n31_ui_on_tile(on_tile_tap);
+                n31_ui_on_row(on_row_tap);
+                n31_ui_on_back(on_back_tap);
+                printf("n31launcher: touch on %s\n", tp);
+            } else {
+                printf("n31launcher: %s would not open as a pointer\n", tp);
+            }
+        } else {
+            printf("n31launcher: no touch panel found\n");
+        }
+    }
 
     open_keys();
 

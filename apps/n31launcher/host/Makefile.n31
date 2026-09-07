@@ -58,6 +58,16 @@ STRIP  := $(TOOLCHAIN)/bin/$(TRIPLE)-strip
 AR     := $(TOOLCHAIN)/bin/$(TRIPLE)-ar
 BUILD  ?= build-n31
 LVGL   ?= ../../../lvgl
+
+# Compile LVGL from a native mirror rather than across the Windows mount.
+#
+# Every other app here does this and this one did not, which is the whole of
+# why a launcher build took an hour and three quarters against Radio+'s two
+# minutes. Measured in apps/lvgl-mirror.mk on this tree: twenty files take
+# 267 s from /mnt/c and 14 s from a mirror, because every header LVGL includes
+# is read again for every translation unit and each of those reads crosses
+# drvfs. It is not the number of files - it is where they are read from.
+include ../../lvgl-mirror.mk
 LV_CONF := lv_conf_n31.h
 
 # LVGL objects live on the native filesystem, not the Windows drive.
@@ -88,10 +98,11 @@ CFLAGS := -O2 -g0 -std=gnu99 $(ARCH_FLAGS) \
           -Wall -Wextra -Wshadow -Wno-unused-parameter
 
 LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_n31.h\" \
-             -I$(LVGL) -I$(LVGL)/src -I$(LVGL)/include -I$(LVGL)/.. -I..
+             -I$(LVGL_SRC) -I$(LVGL_SRC)/src -I$(LVGL_SRC)/include \
+             -I$(LVGL_SRC)/.. -I..
 
 APP  := $(BUILD)/n31launcher
-SRCS := ../launcher.c ../ui.c ../apps.c ../fbcon.c ../status.c ../scanner.c ../klog.c ../backlight.c ../../build_stamp.c
+SRCS := ../launcher.c ../ui.c ../apps.c ../fbcon.c ../status.c ../scanner.c ../klog.c ../backlight.c ../touch.c ../../build_stamp.c
 HDRS := $(wildcard ../*.h)
 
 
@@ -117,10 +128,29 @@ all: $(APP)
 # app does not use are dropped at link time by --gc-sections, and picking a
 # subset by hand is how you discover a missing symbol six months later. It is a
 # few hundred files, so the first build takes a while - pass -j.
-LV_SRCS := $(shell find $(LVGL)/src -name '*.c')
-LV_OBJS := $(patsubst $(LVGL)/%.c,$(LV_CACHE)/%.o,$(LV_SRCS))
+# LVGL, minus every platform this target will never be.
+#
+# This was a bare find over the whole tree, which meant every build
+# compiled LVGL's VG-Lite GPU driver, its ThorVG renderer, and back ends
+# for SDL, X11, Wayland, DRM, NuttX, QNX and UEFI - none of which exist on
+# this device or are reachable from this binary. Twenty minutes a build
+# against Radio+'s two, for objects the linker then threw away.
+#
+# The same list Radio+ uses, because it is the same device.
+LV_SRCS := $(shell find $(LVGL_SRC)/src -name '*.c' \
+             -not -name 'lv_freertos.c' -not -name 'lv_cmsis_rtos2.c' \
+             -not -name 'lv_mqx.c'      -not -name 'lv_rtthread.c' \
+             -not -name 'lv_windows.c'  -not -name 'lv_sdl2.c' \
+             -not -path '*/drivers/nuttx/*'    -not -path '*/drivers/qnx/*' \
+             -not -path '*/drivers/uefi/*'     -not -path '*/drivers/windows/*' \
+             -not -path '*/drivers/wayland/*'  -not -path '*/drivers/x11/*' \
+             -not -path '*/drivers/libinput/*' -not -path '*/drivers/opengles/*' \
+             -not -path '*/drivers/sdl/*'      -not -path '*/drivers/display/drm/*' \
+             -not -path '*/libs/vg_lite_driver/*' \
+             2>/dev/null)
+LV_OBJS := $(patsubst $(LVGL_SRC)/%.c,$(LV_CACHE)/%.o,$(LV_SRCS))
 
-$(LV_CACHE)/%.o: $(LVGL)/%.c
+$(LV_CACHE)/%.o: $(LVGL_SRC)/%.c
 	@mkdir -p $(dir $@)
 	@$(CC) $(CFLAGS) $(LV_CFLAGS) -c -o $@ $<
 

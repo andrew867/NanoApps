@@ -59,4 +59,19 @@ void tg_fb_layout(const tg_fb *fb, unsigned *x, unsigned *y);
    outside the visible area. */
 uint32_t *tg_fb_at(const tg_fb *fb, unsigned x, unsigned y);
 
+/*
+ * Tell the framebuffer the picture changed.
+ *
+ * Ordinarily nothing here calls this: writing into the mapping is the whole
+ * of presenting a frame, and the kernel notices through the page faults that
+ * writing causes. On a DRM driver's fbdev emulation that noticing is the
+ * damage path, and whether it keeps up with sixty frames a second is the open
+ * question behind apps that draw continuously showing nothing.
+ *
+ * So this exists to be switched on from the outside - see fbrefresh.h - and
+ * asks for the flush explicitly rather than relying on being noticed. Cheap
+ * to call and safe when there is nothing to do.
+ */
+void tg_fb_flush(tg_fb *fb);
+
 #endif /* TINYGB_FB_H */

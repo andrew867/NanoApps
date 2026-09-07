@@ -132,6 +132,31 @@ void tg_fb_layout(const tg_fb *fb, unsigned *x, unsigned *y)
     if (y) *y = 0;
 }
 
+void tg_fb_flush(tg_fb *fb)
+{
+    struct fb_var_screeninfo var;
+
+    if (!fb || fb->fd < 0)
+        return;
+
+    /*
+     * Read it back before writing it, rather than keeping a copy in tg_fb.
+     *
+     * Two ioctls a frame instead of one, and worth it: putting a
+     * fb_var_screeninfo in the struct would put <linux/fb.h> in tg_fb.h and
+     * therefore in every file that draws, and the kernel headers on this
+     * toolchain are exactly what the hand-rolled ioctls elsewhere in this tree
+     * exist to avoid. Nothing is being changed here anyway - the write itself
+     * is the point, because it is what drm_fb_helper turns into a full-screen
+     * damage.
+     */
+    if (ioctl(fb->fd, FBIOGET_VSCREENINFO, &var) < 0)
+        return;
+
+    var.activate = FB_ACTIVATE_NOW;
+    (void)ioctl(fb->fd, FBIOPUT_VSCREENINFO, &var);
+}
+
 uint32_t *tg_fb_at(const tg_fb *fb, unsigned x, unsigned y)
 {
     if (!fb->pixels || x >= fb->w || y >= fb->h) return NULL;

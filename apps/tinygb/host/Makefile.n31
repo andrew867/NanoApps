@@ -105,7 +105,8 @@ CFLAGS := $(TG_OPT) -g0 -std=gnu11 $(ARCH_FLAGS) $(TG_EXTRA) \
           -ffunction-sections -fdata-sections \
           -Wall -Wextra -Wno-unused-parameter \
           -DAUDIO_SAMPLE_RATE=$(TG_AUDIO_RATE) \
-          -DMINIGB_APU_AUDIO_FORMAT_S16SYS=1
+          -DMINIGB_APU_AUDIO_FORMAT_S16SYS=1 \
+          -I../../n31launcher
 LDFLAGS := -static -Wl,--gc-sections
 LDLIBS  := -lm
 
@@ -178,6 +179,7 @@ SRCS := ../core/tg_core.c \
         ../platform/tg_fb_linux.c \
         ../platform/tg_audio_clock.c \
         ../platform/tg_input_linux.c \
+        ../platform/tg_pad.c \
         ../platform/tg_tilt.c \
         ../platform/tg_roms.c \
         ../platform/tg_palette.c \
@@ -185,6 +187,7 @@ SRCS := ../core/tg_core.c \
         ../../build_stamp.c \
         ../platform/tg_save.c \
         ../../n31launcher/fbcon.c \
+        ../../n31launcher/touch.c \
         ../linux/tg_linux.c
 
 # tinyalsa is eight files with no dependencies, which is exactly why it is used
@@ -254,10 +257,12 @@ $(BUILD)/tg_audio_linux.o: ../platform/tg_audio_linux.c | $(BUILD) ; $(CC) $(CFL
 $(BUILD)/tg_audio_alsalib.o: ../platform/tg_audio_alsalib.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/tg_audio_clock.o: ../platform/tg_audio_clock.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/tg_input_linux.o: ../platform/tg_input_linux.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/tg_pad.o:  ../platform/tg_pad.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/tg_tilt.o: ../platform/tg_tilt.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/tg_roms.o: ../platform/tg_roms.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/tg_save.o: ../platform/tg_save.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/fbcon.o:       ../../n31launcher/fbcon.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/touch.o:       ../../n31launcher/touch.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/tg_linux.o:    ../linux/tg_linux.c        | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
 $(LV_CACHE)/%.o: $(LVGL_SRC)/%.c

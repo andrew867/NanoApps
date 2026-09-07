@@ -80,4 +80,24 @@ void n31_ui_status(const char *text);
    leaves LVGL believing the screen still holds what it last drew. */
 void n31_ui_redraw(void);
 
+/*
+ * Touch.
+ *
+ * The screens are drawn here and the decisions are made in launcher.c, so a
+ * tap has to cross that line - and it crosses as a callback rather than as
+ * this file calling open_app(), which would put the launcher's policy inside
+ * its renderer.
+ *
+ * All three are optional and every dispatch is guarded, so a build that never
+ * sets them behaves exactly as it did. That is also what a device with no
+ * touch panel gets.
+ *
+ *   tile   0..2, the same N31_TILE_ numbers the keys use
+ *   row    an index into n31_apps, already resolved from the scroll position
+ *   back   the header was tapped, which is the touch equivalent of HOME
+ */
+void n31_ui_on_tile(void (*cb)(int tile));
+void n31_ui_on_row(void (*cb)(int app_index));
+void n31_ui_on_back(void (*cb)(void));
+
 #endif /* N31_LAUNCHER_UI_H */

@@ -106,7 +106,7 @@ ARCH_FLAGS := -mcpu=cortex-a5 -mthumb -mfpu=vfpv4 -mfloat-abi=$(FLOAT_ABI)
 CFLAGS := -O2 -g0 -std=gnu99 $(ARCH_FLAGS) \
           -ffunction-sections -fdata-sections \
           -Wall -Wextra -Wshadow -Wno-unused-parameter \
-          -I$(ALSA)/include
+          -I$(ALSA)/include -I../../n31launcher
 
 LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_n31.h\" \
              -I$(LVGL_SRC) -I$(LVGL_SRC)/src -I$(LVGL_SRC)/include -I$(LVGL_SRC)/.. -I..
