@@ -213,7 +213,7 @@ ifneq ($(TG_AUDIO),alsalib)
 LINK_TA := $(TA_OBJS)
 endif
 
-.PHONY: all push run check clean
+.PHONY: all push run check check-built clean
 
 # Stated rather than implied. Including lvgl-mirror.mk above this brings its
 # own lvgl-resync rule in first, and the first rule in a makefile is what a
@@ -281,7 +281,30 @@ $(LVLIB): $(LV_OBJS)
 $(BUILD)/tg_menu.o: ../ui/tg_menu.c | $(BUILD)
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
-$(BUILD)/build_stamp.o: ../../build_stamp.c | $(BUILD)
+# The stamp is refreshed whenever anything else was rebuilt.
+#
+# BUILD_STAMP is computed fresh on every invocation and handed to the compiler
+# as -DEN_BUILD_STAMP, but build_stamp.c had not changed since the day it was
+# written - so make considered this object up to date, never recompiled it, and
+# the binary kept reporting the stamp baked in on the day the file was last
+# touched. Four days of TinyGB builds all claimed to be from 2026-09-04, which
+# is exactly backwards from what a build stamp is for: the one number you
+# consult when asking whether the thing on the device is the thing you just
+# built. Radio+ never had this because it compiles its whole source list in one
+# invocation, so build_stamp.c is recompiled every time by construction.
+#
+# Depending on the OTHER objects rather than on a FORCE target, which is the
+# obvious fix and is a trap here. $(APP)'s recipe runs `make check`, and check
+# depends on $(APP) - harmless while a no-op build is genuinely a no-op, and
+# infinite recursion the moment one prerequisite can never be satisfied. FORCE
+# is exactly such a prerequisite: the sub-make rebuilt the stamp, relinked,
+# called check, and went round again. Seven of them were still running ten
+# hours later.
+#
+# This way a build that really has nothing to do still has nothing to do, and
+# the stamp moves whenever any part of the binary did.
+$(BUILD)/build_stamp.o: ../../build_stamp.c \
+                        $(filter-out $(BUILD)/build_stamp.o,$(OBJS)) | $(BUILD)
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
 $(BUILD)/tg_palette.o: ../platform/tg_palette.c | $(BUILD)
@@ -299,7 +322,7 @@ $(APP): $(OBJS) $(LINK_TA) $(LVLIB)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 	$(STRIP) $@
 	@echo "  $(APP)  $$(stat -c%s $(APP)) bytes"
-	@$(MAKE) -s -f Makefile.n31 check
+	@$(MAKE) -s -f Makefile.n31 check-built
 	@mkdir -p $(IPOD_ROOT)
 	@cp -f $@ $(IPOD_ROOT)/tinygb$(STAGE_SUFFIX)
 	@echo "  staged -> $(IPOD_ROOT)/tinygb$(STAGE_SUFFIX)"
@@ -316,7 +339,12 @@ $(APP): $(OBJS) $(LINK_TA) $(LVLIB)
 #
 # Tag_ABI_VFP_args is the separate question and the one that actually breaks:
 # it says floats travel in VFP registers, which this libc does not do.
-check: $(APP)
+# `check` builds first, for a person running it by hand. `check-built` only
+# inspects, and is what the link recipe calls - so the recipe can no longer ask
+# make to build the thing whose recipe is currently running.
+check: $(APP) check-built
+
+check-built:
 	@fp=$$($(READELF) -A $(APP) | sed -n 's/.*Tag_FP_arch: //p'); \
 	 case "$$fp" in \
 	   VFPv2|VFPv3|VFPv3-D16|VFPv4|VFPv4-D16) echo "  FP_arch $$fp  ok";; \
