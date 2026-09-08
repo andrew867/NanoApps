@@ -204,9 +204,34 @@ static void on_signal(int sig) { (void)sig; s_quit = 1; }
 
 /* ---- input ---------------------------------------------------------------- */
 
-#define MAX_KEY_FDS 4
+/*
+ * Eight, not four.
+ *
+ * The touch panel reports BTN_TOUCH, which is an EV_KEY code, so it answers
+ * the capability test in open_keys and used to take one of the four slots -
+ * pushing a real button device out of the set on a device that had enough of
+ * them. It is excluded by name below now, but the headroom is worth keeping.
+ */
+#define MAX_KEY_FDS 8
 static int s_key_fd[MAX_KEY_FDS];
 static int s_key_fds;
+
+/*
+ * A second descriptor on the touch panel, opened purely so poll() has
+ * something to wait on.
+ *
+ * LVGL's evdev driver keeps its own descriptor and reads it inside
+ * lv_timer_handler, and this loop does not spin - it sleeps in poll() until a
+ * button or the mount table says otherwise. Nothing in that set was the
+ * panel, so a touch changed nothing until the next timer happened to come
+ * due, and with the home screen's cap that was long enough to read as the
+ * touchscreen simply not working. It was working; nobody was listening.
+ *
+ * Each open of an evdev node gets its own event queue, so draining this one
+ * takes nothing away from LVGL - it is a doorbell, not the input.
+ */
+static int  s_touch_fd = -1;
+static char s_touch_path[64];
 
 struct n31_input_event {
     long     sec;
@@ -221,6 +246,11 @@ static void open_keys(void)
     for (int i = 0; i < 12 && s_key_fds < MAX_KEY_FDS; i++) {
         char path[64];
         snprintf(path, sizeof path, "/dev/input/event%d", i);
+
+        /* The panel answers the EV_KEY test because of BTN_TOUCH, and it
+           is already being read as a pointer. Reading it here as well would
+           feed on_key a stream of button presses it has no meaning for. */
+        if (s_touch_path[0] && !strcmp(path, s_touch_path)) continue;
 
         int fd = open(path, O_RDONLY | O_NONBLOCK);
         if (fd < 0) continue;
@@ -250,6 +280,8 @@ static void open_keys(void)
  */
 static bool     s_asleep;          /* backlight off, drawing nothing */
 static uint32_t s_last_input;      /* when a key last arrived */
+static uint32_t s_touch_swallow;   /* ignore the panel until this, 0 for never */
+static lv_indev_t *s_touch_indev;  /* so the wake gesture can be dropped */
 
 /* Defined below, next to the poll they belong with; on_key comes first. */
 static void go_to_sleep(void);
@@ -855,12 +887,16 @@ static void on_back_tap(void)
  * wait from lv_timer_handler - which happens whenever a timer came due while
  * we were busy elsewhere - used to mean no sleep at all.
  */
+/* Long enough to cover a press and its release, short enough that a real
+   tap straight after waking is still a tap. */
+#define TOUCH_SWALLOW_MS 400u
+
 #define IDLE_FOREVER 0xFFFFFFFFu
 
 static void idle_for(uint32_t ms)
 {
-    struct pollfd pfd[MAX_KEY_FDS + 1];
-    int n = 0, mounts_slot = -1;
+    struct pollfd pfd[MAX_KEY_FDS + 2];
+    int n = 0, mounts_slot = -1, touch_slot = -1;
 
     if (ms < 4) ms = 4;
 
@@ -870,6 +906,16 @@ static void idle_for(uint32_t ms)
 
     for (int i = 0; i < s_key_fds; i++) {
         pfd[n].fd = s_key_fd[i];
+        pfd[n].events = POLLIN;
+        pfd[n].revents = 0;
+        n++;
+    }
+
+    /* The panel. Waiting on it is the whole reason a tap is noticed at the
+       moment it happens rather than at the next timer. */
+    if (s_touch_fd >= 0) {
+        touch_slot = n;
+        pfd[n].fd = s_touch_fd;
         pfd[n].events = POLLIN;
         pfd[n].revents = 0;
         n++;
@@ -899,6 +945,28 @@ static void idle_for(uint32_t ms)
         (pfd[mounts_slot].revents & (POLLPRI | POLLERR))) {
         mounts_read();
         s_scan_wanted = true;
+    }
+
+    if (touch_slot >= 0 && (pfd[touch_slot].revents & POLLIN)) {
+        struct n31_input_event ev;
+
+        /* Drain our copy so it does not stay readable and turn this back
+           into a spin. LVGL still has every event on its own descriptor. */
+        while (read(s_touch_fd, &ev, sizeof ev) == (ssize_t)sizeof ev)
+            ;
+
+        s_last_input = millis();
+        if (s_asleep) {
+            /*
+             * Woken by a touch. The gesture that did the waking must not
+             * also press whatever happened to be under it - a screen that
+             * launches an app because it was tapped awake is worse than one
+             * that needs tapping twice - so LVGL is told to forget the
+             * touch it is about to read.
+             */
+            wake_up();
+            s_touch_swallow = millis() + TOUCH_SWALLOW_MS;
+        }
     }
 
     /*
@@ -1030,9 +1098,19 @@ int main(int argc, char **argv)
 
             if (in) {
                 lv_indev_set_display(in, disp);
+                s_touch_indev = in;
                 n31_ui_on_tile(on_tile_tap);
                 n31_ui_on_row(on_row_tap);
                 n31_ui_on_back(on_back_tap);
+
+                /* Remembered so open_keys can skip it, and opened again so
+                   idle_for has something to wait on - see s_touch_fd. */
+                snprintf(s_touch_path, sizeof s_touch_path, "%s", tp);
+                s_touch_fd = open(tp, O_RDONLY | O_NONBLOCK);
+                if (s_touch_fd < 0)
+                    printf("n31launcher: %s will not open a second time; "
+                           "taps will wait for the next redraw\n", tp);
+
                 printf("n31launcher: touch on %s\n", tp);
             } else {
                 printf("n31launcher: %s would not open as a pointer\n", tp);
@@ -1262,6 +1340,16 @@ int main(int argc, char **argv)
          */
         uint32_t wait = lv_timer_handler();
         uint32_t cap = s_screen == SCREEN_HOME ? IDLE_HOME_MS : IDLE_OTHER_MS;
+
+        /* The handler is where LVGL reads the panel, so this is where the
+           gesture that woke the screen gets thrown away. */
+        if (s_touch_swallow) {
+            if (millis() < s_touch_swallow) {
+                if (s_touch_indev) lv_indev_reset(s_touch_indev, NULL);
+            } else {
+                s_touch_swallow = 0;
+            }
+        }
 
         if (wait > cap) wait = cap;
         idle_for(wait);
