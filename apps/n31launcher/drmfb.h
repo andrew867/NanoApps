@@ -8,21 +8,30 @@
  * twenty frames a second whatever they do. This is the same shape against the
  * DRM device instead, where telling the driver is explicit and immediate.
  *
- * WHY ONE BUFFER AND A DAMAGE CALL, NOT TWO AND A FLIP
+ * WHY ONE BUFFER, NOT TWO
  *
  * Double buffering is the usual answer and is wrong for these two. Both draw
  * INCREMENTALLY - TinyGB's scaler skips rows that did not change between
  * frames, and DOOM's status bar is left alone for most of a tick - and with
  * two buffers each is a frame stale, so "unchanged since last frame" becomes
  * false and every skip-optimisation turns into a bug that looks like tearing.
+ * One buffer, written in place, keeps both apps' drawing exactly as it was;
+ * the tear that costs is real and accepted.
  *
- * The driver makes the single-buffer path the right one anyway: it declares
- * .fb_create = drm_gem_fb_create_with_dirty, so a damage report is turned into
- * a plane update, and it stages into its own compositor buffers on every
- * commit - so the double buffering that matters is already happening one layer
- * down. One dumb buffer, written in place, with n31_drmfb_present() to say
- * what changed, gives one compositor kick per frame and leaves both apps'
- * drawing exactly as it was.
+ * WHY ATOMIC AND NOT THE LEGACY CALLS
+ *
+ * This started on drmModeSetCrtc plus a DIRTYFB damage hint, on the reasoning
+ * that the driver declares .fb_create = drm_gem_fb_create_with_dirty and so
+ * turns damage into a plane update. Both TinyGB and DOOM were black anyway,
+ * for a whole evening, with their sound playing.
+ *
+ * The bench that proved this driver fast - tools/linux-n31/drmtest.c, 120
+ * commits and 120 flip events at sixty-four frames a second - sets the
+ * universal-planes and atomic client caps and drives the panel with
+ * DRM_IOCTL_MODE_ATOMIC. It never calls SetCrtc, PageFlip or DIRTYFB. That is
+ * the one path on this driver with evidence behind it, and the legacy calls
+ * were the part chosen by reasoning. So this now does what the bench does:
+ * same caps, same properties, same commit, one buffer instead of two.
  *
  * Nothing here is LVGL. display.h is the LVGL equivalent and the two do not
  * share code, because they share no shape: one hands back an lv_display_t and
@@ -35,6 +44,14 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+/* The plane properties a commit has to carry. Named rather than an array so
+   a missing one is a compile error somewhere useful. */
+typedef struct {
+    uint32_t fb_id, crtc_id;
+    uint32_t src_x, src_y, src_w, src_h;
+    uint32_t crtc_x, crtc_y, crtc_w, crtc_h;
+} n31_drmfb_planeprops;
 
 typedef struct {
     int       fd;           /* the card, or -1 when this is not open */
@@ -49,12 +66,19 @@ typedef struct {
     uint32_t  handle;
     uint32_t  crtc_id;
     uint32_t  conn_id;
+    uint32_t  plane_id;
+    uint32_t  mode_blob;
     void     *saved_crtc;   /* drmModeCrtc *, opaque so this header stays clean */
-    void     *mode;         /* drmModeModeInfo *, kept so the mode can be re-set */
 
-    /* How a finished frame is announced - see the comment in n31_drmfb_present. */
-    int       use_flip;     /* page flips, until one proves they do not work */
-    int       flip_pending; /* a flip is in the air and its event is not read */
+    /* Property ids, looked up once. */
+    n31_drmfb_planeprops plane;
+    uint32_t  p_crtc_active;
+    uint32_t  p_crtc_mode;
+    uint32_t  p_conn_crtc;
+
+    int       modeset_done; /* the first commit carries ALLOW_MODESET */
+    int       flip_pending; /* a commit is in the air, its event unread */
+    int       failures;     /* consecutive refused commits */
 } n31_drmfb;
 
 /*
@@ -73,13 +97,11 @@ bool n31_drmfb_open(n31_drmfb *s);
 void n31_drmfb_close(n31_drmfb *s);
 
 /*
- * Say that the picture changed, which is what actually puts it on the panel.
+ * Put the picture on the panel.
  *
- * The whole surface. A rectangle would be less work for the compositor, but
- * both callers already redraw most of the screen every frame and neither
- * tracks a bounding box it could hand over honestly - and a damage rectangle
- * that is smaller than the truth is a display with stale pixels in it, which
- * is a far worse bug than a slightly larger copy.
+ * One atomic commit of the primary plane, with a flip event asked for and
+ * waited on - which is what paces the caller to the panel. Not optional and
+ * not a hint: on DRM this call IS the frame.
  */
 void n31_drmfb_present(n31_drmfb *s);
 
