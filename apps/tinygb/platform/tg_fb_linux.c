@@ -59,20 +59,32 @@ bool tg_fb_open(tg_fb *fb, const char *path)
     struct fb_fix_screeninfo fix;
 
     /*
-     * DRM first, fbdev if there is no DRM device or the caller asked for the
-     * old path with N31_DISPLAY=fbdev. The console still has to be detached
-     * either way, and open_drm does not do it - the DRM path takes the CRTC
-     * from fbcon by setting a mode, but fbcon is still free to draw into its
-     * own surface underneath and gets it back on the way out.
+     * The console goes first, on both paths.
+     *
+     * This used to detach after the DRM modeset, which is the wrong order and
+     * it cost the whole picture: fbcon draws through /dev/fb0, /dev/fb0 is
+     * this driver's own emulation and therefore a DRM client in its own
+     * right, and one blink of its cursor puts its framebuffer back on the
+     * plane. Ours was then attached to nothing and every frame after it went
+     * into memory the panel was not reading - a black screen with the sound
+     * still running.
+     *
+     * Detaching first means there is nobody left to take it back. The
+     * re-assert in n31_drmfb_present is the belt to this pair of braces.
      */
-    if (open_drm(fb)) {
-        fb->took_console = n31_fbcon_detach();
-        return true;
-    }
+    {
+        bool took = n31_fbcon_detach();
 
-    memset(fb, 0, sizeof *fb);
-    fb->fd = -1;
-    fb->drm.fd = -1;
+        if (open_drm(fb)) {
+            fb->took_console = took;
+            return true;
+        }
+
+        memset(fb, 0, sizeof *fb);
+        fb->fd = -1;
+        fb->drm.fd = -1;
+        fb->took_console = took;
+    }
 
     if (!path) path = "/dev/fb0";
 
@@ -87,8 +99,10 @@ bool tg_fb_open(tg_fb *fb, const char *path)
      * If it cannot be detached the app still runs - a picture with dmesg drawn
      * through it is better than no picture, and on a serial console this is a
      * non-issue anyway.
+     *
+     * Taken above, before DRM was tried, and carried across the reset of this
+     * struct - so it is not taken again here.
      */
-    fb->took_console = n31_fbcon_detach();
 
     if ((fb->fd = open(path, O_RDWR)) < 0) {
         fprintf(stderr, "tinygb: cannot open %s\n", path);
@@ -169,6 +183,7 @@ void tg_fb_close(tg_fb *fb)
 
     memset(fb, 0, sizeof *fb);
     fb->fd = -1;
+    fb->drm.fd = -1;    /* zero is a descriptor; -1 is what "none" means */
 }
 
 void tg_fb_fill(tg_fb *fb, uint32_t rgb)

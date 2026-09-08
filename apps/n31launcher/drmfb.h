@@ -50,6 +50,11 @@ typedef struct {
     uint32_t  crtc_id;
     uint32_t  conn_id;
     void     *saved_crtc;   /* drmModeCrtc *, opaque so this header stays clean */
+    void     *mode;         /* drmModeModeInfo *, kept so the mode can be re-set */
+
+    /* How a finished frame is announced - see the comment in n31_drmfb_present. */
+    int       use_flip;     /* page flips, until one proves they do not work */
+    int       flip_pending; /* a flip is in the air and its event is not read */
 } n31_drmfb;
 
 /*

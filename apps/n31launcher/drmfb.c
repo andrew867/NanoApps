@@ -9,9 +9,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+/* How long a flip is given to complete before flips are written off. Two
+   frames at the slowest rate this panel is ever driven at. */
+#define FLIP_WAIT_MS 100
 
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -155,13 +160,30 @@ bool n31_drmfb_open(n31_drmfb *s)
     memset(s->pixels, 0, s->map_len);
 
     /*
-     * Show it. This is the one modeset - everything after it is damage on a
-     * surface that is already on screen, which is why there is no flip loop
-     * and nothing to wait for.
+     * Show it - and keep the mode, because this will have to be done again.
+     *
+     * It was written as the one modeset, on the reasoning that everything
+     * after it is damage on a surface already on screen. That reasoning holds
+     * only while nothing else commits to this CRTC, and on this device
+     * something always does: /dev/fb0 is the driver's own emulation, a real
+     * DRM client in the kernel, and fbcon blinking a cursor through it is
+     * enough to put its framebuffer back on the plane. Ours is then attached
+     * to nothing, DIRTYFB has no plane to damage, and the app draws sixty
+     * frames a second into memory that is not being scanned out - a black
+     * screen with the sound still playing, which is exactly the symptom this
+     * was reported as.
      */
     if (drmModeSetCrtc(s->fd, s->crtc_id, s->fb_id, 0, 0,
                        &s->conn_id, 1, &mode) != 0)
         goto fail;
+
+    s->mode = malloc(sizeof mode);
+    if (s->mode)
+        memcpy(s->mode, &mode, sizeof mode);
+
+    /* Flips until proven otherwise; see n31_drmfb_present. */
+    s->use_flip = 1;
+    s->flip_pending = 0;
 
     drmModeFreeResources(res);
     snprintf(s_desc, sizeof s_desc, "DRM %ux%u %s", s->w, s->h, card_path());
@@ -174,10 +196,119 @@ fail:
     return false;
 }
 
+/*
+ * Is our framebuffer still the one being scanned out?
+ *
+ * One ioctl, asked once a frame. That is a real cost and it buys the
+ * difference between a display and a black screen, because the alternative -
+ * assuming the modeset holds - is only true on a device where nothing else
+ * ever touches the CRTC, and this is not one.
+ */
+static bool still_ours(n31_drmfb *s)
+{
+    drmModeCrtc *c = drmModeGetCrtc(s->fd, s->crtc_id);
+    bool ours;
+
+    if (!c)
+        return true;    /* Cannot tell; assume yes rather than fight it. */
+
+    ours = (c->buffer_id == s->fb_id);
+    drmModeFreeCrtc(c);
+    return ours;
+}
+
+static void flip_done(int fd, unsigned seq, unsigned sec, unsigned usec,
+                      void *data)
+{
+    n31_drmfb *s = data;
+
+    (void)fd; (void)seq; (void)sec; (void)usec;
+    if (s)
+        s->flip_pending = 0;
+}
+
+/*
+ * Wait for the flip we already asked for.
+ *
+ * Bounded, because a display that stops answering must not take the app down
+ * with it. A timeout is taken as proof that flips do not work here and the
+ * damage hint becomes the way frames are announced from then on - a slower
+ * display beats a frozen one.
+ */
+static void wait_flip(n31_drmfb *s)
+{
+    drmEventContext ctx;
+    struct pollfd pfd;
+
+    if (!s->flip_pending)
+        return;
+
+    pfd.fd = s->fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+
+    if (poll(&pfd, 1, FLIP_WAIT_MS) <= 0) {
+        s->flip_pending = 0;
+        s->use_flip = 0;
+        return;
+    }
+
+    memset(&ctx, 0, sizeof ctx);
+    ctx.version = 2;
+    ctx.page_flip_handler = flip_done;
+    if (drmHandleEvent(s->fd, &ctx) != 0)
+        s->flip_pending = 0;
+}
+
 void n31_drmfb_present(n31_drmfb *s)
 {
     if (!s || s->fd < 0 || !s->fb_id)
         return;
+
+    /*
+     * Take the plane back first if something else has it.
+     *
+     * Only when it has actually been lost: a modeset per frame would be a
+     * full mode change sixty times a second, and on this panel that is
+     * visible. Losing it is rare - it takes another client committing - so
+     * the check is what runs every frame and the repair almost never does.
+     */
+    if (s->mode && !still_ours(s)) {
+        drmModeSetCrtc(s->fd, s->crtc_id, s->fb_id, 0, 0, &s->conn_id, 1,
+                       (drmModeModeInfo *)s->mode);
+        s->flip_pending = 0;    /* whatever was in the air went with the mode */
+    }
+
+    /*
+     * A page flip, which is what this driver was actually measured doing.
+     *
+     * The first version of this announced frames with DRM_IOCTL_MODE_DIRTYFB
+     * and nothing appeared. The bench that proved the driver fast - 120
+     * commits, 120 flip events, sixty-four frames a second - drove it with
+     * atomic commits and flip events, and that is the path with the evidence
+     * behind it. Flipping to the buffer that is already scanned out is a real
+     * commit to the plane, which is the part that matters; there is one
+     * buffer here and drawing into it while it is on screen is a tear this
+     * accepts, exactly as the damage-hint version did.
+     *
+     * The event is waited for rather than left in the queue, because a second
+     * flip on top of an unfinished one is refused - and waiting for it paces
+     * the caller to the panel, which is a better way to spend the time than
+     * spinning ahead of it.
+     */
+    if (s->use_flip) {
+        wait_flip(s);
+
+        if (s->use_flip &&
+            drmModePageFlip(s->fd, s->crtc_id, s->fb_id,
+                            DRM_MODE_PAGE_FLIP_EVENT, s) == 0) {
+            s->flip_pending = 1;
+            return;
+        }
+
+        /* Refused. Fall through, and stop asking. */
+        s->use_flip = 0;
+    }
 
     /*
      * NULL clips means the whole framebuffer, which is what the driver's
@@ -208,6 +339,13 @@ void n31_drmfb_close(n31_drmfb *s)
         drmModeFreeCrtc(c);
         s->saved_crtc = NULL;
     }
+
+    /* Do not tear the buffer out from under a flip that has not landed. */
+    if (s->flip_pending)
+        wait_flip(s);
+
+    free(s->mode);
+    s->mode = NULL;
 
     if (s->pixels) {
         munmap(s->pixels, s->map_len);

@@ -654,10 +654,43 @@ static enum tg_menu_action play_once(int argc, char **argv, tg_menu_state *st,
                 if (!have_menu)
                     break;
 
-                if (pause_menu(st, ctx, core, &save, info.sram_size != 0,
-                               rom_path, &next_action)) {
-                    /* Leaving, one way or another. */
-                    break;
+                /*
+                 * Give the panel back before the menu draws on it.
+                 *
+                 * The menu is LVGL on /dev/fb0 and the game is a DRM surface,
+                 * and those are two different pictures of which only one is
+                 * being scanned out. With the game holding the CRTC the menu
+                 * rendered perfectly into a buffer nobody was reading, which
+                 * from the outside is HOME doing nothing at all.
+                 *
+                 * Closing the surface restores the mode the console had, which
+                 * is the fbdev emulation, which is what the menu draws
+                 * through. It is reopened on the way back.
+                 */
+                {
+                    bool had_drm = fb.drm.fd >= 0;
+                    bool leaving;
+
+                    if (had_drm)
+                        tg_fb_close(&fb);
+
+                    leaving = pause_menu(st, ctx, core, &save,
+                                         info.sram_size != 0, rom_path,
+                                         &next_action);
+
+                    if (had_drm && !tg_fb_open(&fb, fb_path)) {
+                        fprintf(stderr, "tinygb: lost the display coming back "
+                                        "from the menu\n");
+                        next_action = TG_MENU_QUIT;
+                        break;
+                    }
+                    if (leaving)
+                        break;      /* Leaving, one way or another. */
+
+                    /* Reopening moved the buffer, and dst is a pointer into
+                       it - a stale one draws into the old mapping. */
+                    tg_fb_layout(&fb, &ox, &oy);
+                    dst = tg_fb_at(&fb, ox, oy);
                 }
 
                 /* Back into the game: the menu may have changed how it is

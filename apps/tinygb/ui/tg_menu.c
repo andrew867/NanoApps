@@ -207,6 +207,13 @@ void tg_menu_suspend(void)
 void tg_menu_resume(void)
 {
     s_suspended = false;
+    /*
+     * Everything on screen, not only what changed. The panel was showing the
+     * game while this was suspended, so LVGL's idea of what is already drawn
+     * where describes a surface that is no longer on the display.
+     */
+    if (s_disp)
+        lv_obj_invalidate(lv_display_get_screen_active(s_disp));
     /* The game has been writing over every pixel LVGL believes it owns, so
        nothing on screen is what LVGL last drew. */
     if (s_screen)
