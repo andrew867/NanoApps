@@ -108,6 +108,9 @@ static int write_bmp(const char *path)
     return 1;
 }
 
+#include "backlight.h"
+#include "touch.h"
+
 /* ---- physical buttons over evdev ------------------------------------------
  *
  * The N31 kernel exposes n31-buttons and the PMIC buttons as keyboards, and
@@ -193,6 +196,40 @@ static void input_open_all(void)
 
 static int s_home_cycles;
 
+/*
+ * The touch panel.
+ *
+ * Looked for again on every input rescan rather than once at startup, for the
+ * reason the launcher had to learn: an app started at boot can easily be up
+ * before the touchscreen driver has registered its node, and a single miss
+ * then means no touch for the whole session. The rescan already exists for
+ * the buttons, so this costs one more pass over the same directory.
+ */
+static lv_display_t *s_touch_disp;
+static lv_indev_t   *s_touch_indev;
+static int           s_screen_off;
+
+static void touch_try(void)
+{
+    const char *tp;
+
+    if (s_touch_indev || !s_touch_disp)
+        return;
+
+    tp = n31_touch_find();
+    if (!tp)
+        return;
+
+    s_touch_indev = lv_evdev_create(LV_INDEV_TYPE_POINTER, tp);
+    if (!s_touch_indev) {
+        printf("entrain: %s would not open as a pointer\n", tp);
+        return;
+    }
+    lv_indev_set_display(s_touch_indev, s_touch_disp);
+    printf("entrain: touch on %s\n", tp);
+    fflush(stdout);
+}
+
 /* True if this code arrived too soon after the last one to be a new press. */
 static int debounced(uint16_t code)
 {
@@ -214,7 +251,10 @@ static void input_poll(void)
        were re-registered twice inside one session while their driver was being
        worked on; without this the app goes on polling a node the kernel has
        already torn down, and every press after that lands nowhere. */
-    if (en_sys_millis() - s_last_scan_ms >= EN_INPUT_RESCAN_MS) input_scan(0);
+    if (en_sys_millis() - s_last_scan_ms >= EN_INPUT_RESCAN_MS) {
+        input_scan(0);
+        touch_try();
+    }
 
     for (int i = 0; i < EN_MAX_INPUT_FDS; i++) {
         if (s_input_fd[i] < 0) continue;
@@ -241,13 +281,46 @@ static void input_poll(void)
             case EN_KEY_VOLUMEDOWN: en_ui_key(EN_KEY_VOL_DOWN);   break;
             case EN_KEY_PLAYPAUSE:
             case EN_KEY_NEXTSONG:   en_ui_key(EN_KEY_PLAY_PAUSE); break;
+            case EN_KEY_POWER:
+                /*
+                 * The screen off, and back on.
+                 *
+                 * POWER was deliberately unmapped here on the reasoning that
+                 * it belongs to the system. It does - but nothing else in
+                 * this process is listening for it, so while entrain was on
+                 * screen the button did nothing at all, which reads as the
+                 * device having stopped responding rather than as a policy.
+                 *
+                 * Only the backlight. Holding it is still the system's
+                 * business and is not touched.
+                 */
+                if (s_screen_off) {
+                    n31_backlight_on();
+                    s_screen_off = 0;
+                } else {
+                    n31_backlight_off();
+                    s_screen_off = 1;
+                }
+                break;
+
             case EN_KEY_HOMEPAGE:
+                /*
+                 * HOME leaves, the way it does everywhere else here.
+                 *
+                 * It used to be a third way of saying Back, which meant that
+                 * from the top screen it did nothing and there was no way out
+                 * of the app but killing it. The launcher is what HOME is
+                 * for; Back is still on its own button below.
+                 */
+                if (s_home_cycles)
+                    en_ui_key(EN_KEY_NEXT_PROGRAM);
+                else
+                    en_sys_request_exit();
+                break;
+
             case EN_KEY_BACKKEY:
             case EN_KEY_ESC:
-                /* Home means "go back" on a device you can touch. With no
-                   touchscreen there is nowhere useful to go back to, so on
-                   this port it steps through the programs instead. */
-                en_ui_key(s_home_cycles ? EN_KEY_NEXT_PROGRAM : EN_KEY_BACK);
+                en_ui_key(EN_KEY_BACK);
                 break;
             default: break;
             }

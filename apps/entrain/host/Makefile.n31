@@ -104,8 +104,13 @@ CFLAGS += -I$(LIBDRM)/include
 CORE_SRCS := $(CORE)/osc.c $(CORE)/noise.c $(CORE)/render.c \
              $(CORE)/program.c $(CORE)/measured.c $(CORE)/progfile.c $(CORE)/freqset.c ../../build_stamp.c $(CORE)/wavout.c
 
+# The panel and the backlight are shared with the launcher rather than
+# copied - same discovery, same sysfs handling, one place to fix them.
+SHARED    := ../../n31launcher
+CFLAGS    += -I$(SHARED)
 APP_SRCS  := main_host.c ../ui.c ../engine.c \
-             ../platform/audio_linux.c ../platform/sys_host.c $(CORE_SRCS)
+             ../platform/audio_linux.c ../platform/sys_host.c \
+             $(SHARED)/touch.c $(SHARED)/backlight.c $(CORE_SRCS)
 
 # The app is compiled in one gcc invocation, so there are no object files for
 # -MMD to hang dependency files off. Without this, editing a header changed
