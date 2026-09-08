@@ -355,6 +355,18 @@ int main(int argc, char **argv)
         }
     }
     if (shot_dir && !backend) backend = "headless";
+#if LV_USE_LINUX_DRM
+    /*
+     * On the device, DRM unless told otherwise.
+     *
+     * This defaulted to sdl, which is right on a workstation and is not a
+     * thing that exists on an iPod - the N31 build was only ever reached with
+     * an explicit --backend. Now the device build picks the fast path by
+     * itself and the desktop build is unchanged, because LV_USE_LINUX_DRM is
+     * only 1 in the N31 config.
+     */
+    if (!backend) backend = "drm";
+#endif
     if (!backend) backend = "sdl";
 
     /* Line-buffer stdout. Redirected to a file it would otherwise be block
@@ -385,7 +397,24 @@ int main(int argc, char **argv)
 #if LV_USE_LINUX_DRM
     else if (!strcmp(backend, "drm")) {
         disp = lv_linux_drm_create();
-        if (disp) lv_linux_drm_set_file(disp, drm_path, -1);
+        if (disp && lv_linux_drm_set_file(disp, drm_path, -1) != LV_RESULT_OK) {
+            /*
+             * Opened the node and could not drive it. Delete rather than
+             * leak: LVGL closes the descriptor on LV_EVENT_DELETE, and
+             * holding it would keep DRM master and stop the fbdev fallback
+             * from ever reaching the panel.
+             */
+            lv_display_delete(disp);
+            disp = NULL;
+        }
+#if LV_USE_LINUX_FBDEV
+        if (!disp) {
+            fprintf(stderr, "entrain: %s would not drive the panel; "
+                            "falling back to %s\n", drm_path, fbdev_path);
+            disp = lv_linux_fbdev_create();
+            if (disp) lv_linux_fbdev_set_file(disp, fbdev_path);
+        }
+#endif
     }
 #endif
     else {

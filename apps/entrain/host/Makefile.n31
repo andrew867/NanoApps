@@ -18,6 +18,9 @@
 #     tinyalsa compiled straight in.
 
 IPOD_ROOT ?= /mnt/c/src/ipod/artifacts/linux-n31
+# Static libdrm, so LVGL can drive /dev/dri/card0 directly. Built once by
+# tools/linux-n31/build-n31-libdrm.sh in the ipod repo.
+LIBDRM    ?= $(IPOD_ROOT)/libdrm
 TOOLCHAIN ?= $(IPOD_ROOT)/tinyalsa-build/arm-linux-musleabi-cross
 
 # Which toolchain, and which float ABI.
@@ -87,11 +90,16 @@ CFLAGS  := -O2 -g0 -std=gnu99 $(ARCH_FLAGS) \
            -ffunction-sections -fdata-sections \
            -Wall -Wextra -Wno-unused-parameter
 LDFLAGS := -static -Wl,--gc-sections
-LDLIBS  := -lm -lpthread
+LDLIBS  := $(LIBDRM)/lib/libdrm.a -lm -lpthread
 
 LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_n31.h\" \
              -I$(LVGL_SRC) -I$(LVGL_SRC)/src -I$(LVGL_SRC)/include -I$(LVGL_SRC)/..
 TA_CFLAGS := -I$(TINYALSA)/include
+
+# libdrm's headers, for LVGL's DRM backend. On the general CFLAGS rather than
+# only the LVGL ones, because main_host.c reaches lv_linux_drm.h through
+# lvgl.h and that pulls the backend's own includes in behind it.
+CFLAGS += -I$(LIBDRM)/include
 
 CORE_SRCS := $(CORE)/osc.c $(CORE)/noise.c $(CORE)/render.c \
              $(CORE)/program.c $(CORE)/measured.c $(CORE)/progfile.c $(CORE)/freqset.c ../../build_stamp.c $(CORE)/wavout.c
@@ -120,7 +128,7 @@ LV_SRCS := $(shell find $(LVGL_SRC)/src -name '*.c' \
              -not -path '*/drivers/uefi/*'     -not -path '*/drivers/windows/*' \
              -not -path '*/drivers/wayland/*'  -not -path '*/drivers/x11/*' \
              -not -path '*/drivers/libinput/*' -not -path '*/drivers/opengles/*' \
-             -not -path '*/drivers/sdl/*'      -not -path '*/drivers/display/drm/*' \
+             -not -path '*/drivers/sdl/*' \
              2>/dev/null)
 
 LV_OBJS := $(patsubst $(LVGL_SRC)/%.c,$(LV_CACHE)/%.o,$(LV_SRCS))

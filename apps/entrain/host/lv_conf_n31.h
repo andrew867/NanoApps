@@ -34,8 +34,21 @@
 /* No SDL, no DRM, no GPU. Framebuffer and evdev only. */
 #undef  LV_USE_SDL
 #define LV_USE_SDL              0
+/*
+ * DRM, because the kernel driver is a real DRM/KMS driver and /dev/fb0 is its
+ * emulation of itself - capped by fb_deferred_io's timer at 75 compositor
+ * kicks for 150 repaints, measured, where the DRM path gives one kick per
+ * commit at 64 fps.
+ *
+ * GBM is not needed: LVGL uses dumb buffers unless LV_USE_LINUX_DRM_GBM_BUFFERS
+ * is set, so this needs libdrm alone - five files, built by
+ * tools/linux-n31/build-n31-libdrm.sh in the ipod repo.
+ *
+ * fbdev stays compiled in. --backend fbdev still selects it, and a kernel
+ * without the DRM driver must not mean a black screen.
+ */
 #undef  LV_USE_LINUX_DRM
-#define LV_USE_LINUX_DRM        0
+#define LV_USE_LINUX_DRM        1
 
 #undef  LV_USE_LINUX_FBDEV
 #define LV_USE_LINUX_FBDEV      1
