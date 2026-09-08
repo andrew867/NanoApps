@@ -58,6 +58,8 @@
 #include "backlight.h"
 #include "fbcon.h"
 #include "touch.h"
+
+#include <sys/stat.h>
 #include "fbrefresh.h"
 #include "status.h"
 #include "scanner.h"
@@ -232,6 +234,27 @@ static int s_key_fds;
  */
 static int  s_touch_fd = -1;
 static char s_touch_path[64];
+
+/*
+ * The panel is looked for again until it is found.
+ *
+ * It was looked for once, here, at startup - and the launcher starts at boot,
+ * from PID 1, which is early enough that the touchscreen driver has often not
+ * registered its evdev node yet. n31_touch_find then returns nothing, and
+ * that answer was kept for the rest of the session: touch was dead until the
+ * device was rebooted into something else. TinyPod never showed it because
+ * TinyPod is started by hand, long after everything has come up.
+ *
+ * So a miss is not an answer, it is a "not yet". The scan is a handful of
+ * opens and an ioctl each, which is cheap enough every couple of seconds, and
+ * it gives up after a minute because a device with no panel should not pay
+ * for one for ever.
+ */
+#define TOUCH_RETRY_MS   2000u
+#define TOUCH_GIVE_UP_MS 60000u
+
+static uint32_t s_touch_next_try;   /* 0 once the search is over, either way */
+static uint32_t s_touch_since;      /* when the search began */
 
 struct n31_input_event {
     long     sec;
@@ -1036,6 +1059,65 @@ static void pump_keys(void)
     }
 }
 
+/*
+ * Attach the panel to LVGL, if it is there yet.
+ *
+ * Everything touch needs happens here so that it can happen late: the indev,
+ * the tap callbacks, and the second descriptor idle_for waits on. Returns
+ * false when there is simply no panel yet, which is not an error.
+ */
+static bool try_open_touch(lv_display_t *disp)
+{
+    const char *tp = n31_touch_find();
+    lv_indev_t *in;
+
+    if (!tp)
+        return false;
+
+    in = lv_evdev_create(LV_INDEV_TYPE_POINTER, tp);
+    if (!in) {
+        printf("n31launcher: %s would not open as a pointer\n", tp);
+        fflush(stdout);
+        return false;
+    }
+
+    lv_indev_set_display(in, disp);
+    s_touch_indev = in;
+    n31_ui_on_tile(on_tile_tap);
+    n31_ui_on_row(on_row_tap);
+    n31_ui_on_back(on_back_tap);
+
+    /* Remembered so open_keys can skip it, and opened again so idle_for has
+       something to wait on - see s_touch_fd. */
+    snprintf(s_touch_path, sizeof s_touch_path, "%s", tp);
+    s_touch_fd = open(tp, O_RDONLY | O_NONBLOCK);
+    if (s_touch_fd < 0)
+        printf("n31launcher: %s will not open a second time; taps will wait "
+               "for the next redraw\n", tp);
+
+    /*
+     * If the panel turned up after open_keys ran, it is in the button set -
+     * it answers the EV_KEY test because of BTN_TOUCH - and would feed on_key
+     * a stream of presses that mean nothing. Take it back out.
+     */
+    for (int i = 0; i < s_key_fds; i++) {
+        char link[64];
+        struct stat a, b;
+
+        snprintf(link, sizeof link, "%s", tp);
+        if (fstat(s_key_fd[i], &a) == 0 && stat(link, &b) == 0 &&
+            a.st_rdev == b.st_rdev) {
+            close(s_key_fd[i]);
+            s_key_fd[i] = s_key_fd[--s_key_fds];
+            break;
+        }
+    }
+
+    printf("n31launcher: touch on %s\n", tp);
+    fflush(stdout);
+    return true;
+}
+
 /* ---- main ----------------------------------------------------------------- */
 
 int main(int argc, char **argv)
@@ -1090,34 +1172,10 @@ int main(int argc, char **argv)
      * Absent is a normal state and not an error: this device has buttons, and
      * every screen here is reachable with them.
      */
-    {
-        const char *tp = n31_touch_find();
-
-        if (tp) {
-            lv_indev_t *in = lv_evdev_create(LV_INDEV_TYPE_POINTER, tp);
-
-            if (in) {
-                lv_indev_set_display(in, disp);
-                s_touch_indev = in;
-                n31_ui_on_tile(on_tile_tap);
-                n31_ui_on_row(on_row_tap);
-                n31_ui_on_back(on_back_tap);
-
-                /* Remembered so open_keys can skip it, and opened again so
-                   idle_for has something to wait on - see s_touch_fd. */
-                snprintf(s_touch_path, sizeof s_touch_path, "%s", tp);
-                s_touch_fd = open(tp, O_RDONLY | O_NONBLOCK);
-                if (s_touch_fd < 0)
-                    printf("n31launcher: %s will not open a second time; "
-                           "taps will wait for the next redraw\n", tp);
-
-                printf("n31launcher: touch on %s\n", tp);
-            } else {
-                printf("n31launcher: %s would not open as a pointer\n", tp);
-            }
-        } else {
-            printf("n31launcher: no touch panel found\n");
-        }
+    if (!try_open_touch(disp)) {
+        printf("n31launcher: no touch panel yet, still looking\n");
+        s_touch_since = millis();
+        s_touch_next_try = s_touch_since + TOUCH_RETRY_MS;
     }
 
     open_keys();
@@ -1338,8 +1396,29 @@ int main(int argc, char **argv)
          * lv_timer_handler ask for a short wait, so this follows one without
          * being told about it.
          */
+        /* Still looking for the panel, if it was not there at boot. */
+        if (s_touch_next_try && millis() >= s_touch_next_try) {
+            if (try_open_touch(disp)) {
+                s_touch_next_try = 0;
+            } else if (millis() - s_touch_since > TOUCH_GIVE_UP_MS) {
+                s_touch_next_try = 0;
+                printf("n31launcher: no touch panel; buttons only\n");
+                fflush(stdout);
+            } else {
+                s_touch_next_try = millis() + TOUCH_RETRY_MS;
+            }
+        }
+
         uint32_t wait = lv_timer_handler();
         uint32_t cap = s_screen == SCREEN_HOME ? IDLE_HOME_MS : IDLE_OTHER_MS;
+
+        /* While the panel is still being looked for, do not sleep past the
+           next attempt - poll() has nothing that would wake us for it. */
+        if (s_touch_next_try) {
+            uint32_t until = s_touch_next_try - millis();
+
+            if (until < cap) cap = until;
+        }
 
         /* The handler is where LVGL reads the panel, so this is where the
            gesture that woke the screen gets thrown away. */
