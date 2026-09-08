@@ -45,8 +45,22 @@
 /* No SDL, no DRM, no GPU. Framebuffer and evdev only. */
 #undef  LV_USE_SDL
 #define LV_USE_SDL              0
+/*
+ * DRM, because the kernel driver is a real DRM/KMS driver and its fbdev
+ * emulation is capped by fb_deferred_io's timer - 75 compositor kicks for 150
+ * repaints, measured, where the DRM path gives one kick per commit at 64 fps.
+ *
+ * The note this replaces said the DRM path "needs libdrm and gbm" and was half
+ * wrong: GBM is opt-in behind LV_USE_LINUX_DRM_GBM_BUFFERS and LVGL uses dumb
+ * buffers without it, so Mesa never enters into it. libdrm alone is five files
+ * with no dependency beyond libc - see tools/linux-n31/build-n31-libdrm.sh in
+ * the ipod repo - and links statically like everything else here.
+ *
+ * fbdev stays compiled in as the fallback: a kernel without the DRM driver
+ * must not mean a black screen.
+ */
 #undef  LV_USE_LINUX_DRM
-#define LV_USE_LINUX_DRM        0
+#define LV_USE_LINUX_DRM        1
 
 #undef  LV_USE_LINUX_FBDEV
 #define LV_USE_LINUX_FBDEV      1

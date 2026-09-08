@@ -60,6 +60,9 @@ FLOAT_ABI ?= softfp
 # experiment must not quietly become the thing that boots.
 STAGE_SUFFIX := $(if $(filter-out softfp,$(FLOAT_ABI)),-$(FLOAT_ABI),)
 ALSA      ?= $(IPOD_ROOT)/alsa
+# Static libdrm, so LVGL can drive /dev/dri/card0 directly. Built once by
+# tools/linux-n31/build-n31-libdrm.sh in the ipod repo.
+LIBDRM    ?= $(IPOD_ROOT)/libdrm
 SSH_KEY   ?= $(IPOD_ROOT)/n31_id
 DEVICE    ?= root@192.168.7.2
 
@@ -87,6 +90,12 @@ LV_CONF    := lv_conf_n31.h
 LV_CONF_ID := $(shell md5sum $(LV_CONF) 2>/dev/null | cut -c1-12)
 LV_CACHE   ?= $(HOME)/.cache/n31-lvgl/radioplus-n31-$(LV_CONF_ID)-$(FLOAT_ABI)
 # LVGL, minus every platform this target will never be.
+#
+# drivers/display/drm is NOT excluded, and that is the point: this app
+# drives /dev/dri/card0 through it. It used to be on the list, from when
+# LV_USE_LINUX_DRM was 0 and the files compiled to nothing - and leaving
+# it there after turning the backend on cost a link failure with two
+# undefined symbols and no hint as to why.
 LV_SRCS := $(shell find $(LVGL_SRC)/src -name '*.c' \
              -not -name 'lv_freertos.c' -not -name 'lv_cmsis_rtos2.c' \
              -not -name 'lv_mqx.c'      -not -name 'lv_rtthread.c' \
@@ -95,7 +104,9 @@ LV_SRCS := $(shell find $(LVGL_SRC)/src -name '*.c' \
              -not -path '*/drivers/uefi/*'     -not -path '*/drivers/windows/*' \
              -not -path '*/drivers/wayland/*'  -not -path '*/drivers/x11/*' \
              -not -path '*/drivers/libinput/*' -not -path '*/drivers/opengles/*' \
-             -not -path '*/drivers/sdl/*'      -not -path '*/drivers/display/drm/*' \
+             -not -path '*/drivers/sdl/*' \
+             \
+             -not -path '*/libs/vg_lite_driver/*' \
              2>/dev/null)
 
 LV_OBJS := $(patsubst $(LVGL_SRC)/%.c,$(LV_CACHE)/%.o,$(LV_SRCS))
@@ -106,7 +117,7 @@ ARCH_FLAGS := -mcpu=cortex-a5 -mthumb -mfpu=vfpv4 -mfloat-abi=$(FLOAT_ABI)
 CFLAGS := -O2 -g0 -std=gnu99 $(ARCH_FLAGS) \
           -ffunction-sections -fdata-sections \
           -Wall -Wextra -Wshadow -Wno-unused-parameter \
-          -I$(ALSA)/include -I../../n31launcher
+          -I$(ALSA)/include -I$(LIBDRM)/include -I../../n31launcher
 
 LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_n31.h\" \
              -I$(LVGL_SRC) -I$(LVGL_SRC)/src -I$(LVGL_SRC)/include -I$(LVGL_SRC)/.. -I..
@@ -120,7 +131,8 @@ PLAT_SRCS := $(PLAT)/tuner_linux.c $(PLAT)/capture_linux.c \
              $(PLAT)/player_linux.c $(PLAT)/model_linux.c
 
 APP      := $(BUILD)/radioplus
-APP_SRCS := main_n31.c ../ui.c $(CORE_SRCS) $(PLAT_SRCS)
+APP_SRCS := main_n31.c ../ui.c $(CORE_SRCS) $(PLAT_SRCS) \
+            ../../n31launcher/display.c
 
 OBJS := $(patsubst %.c,$(BUILD)/%.o,$(notdir $(CORE_SRCS) $(PLAT_SRCS)))
 HDRS := $(wildcard $(CORE)/*.h $(PLAT)/*.h ../*.h)
@@ -158,6 +170,10 @@ $(LVLIB): $(LV_OBJS)
 
 # Static, so it needs nothing on the device but a kernel.
 $(APP): $(APP_SRCS) $(HDRS) $(LVLIB) | $(BUILD)
+	@test -f $(LIBDRM)/lib/libdrm.a || { \
+	  echo "no ARM libdrm at $(LIBDRM)/lib/libdrm.a"; \
+	  echo "build it once with build-n31-libdrm.sh in the ipod repo"; \
+	  exit 1; }
 	@test -f $(ALSA)/lib/libasound.a || { \
 	  echo "no ARM alsa-lib at $(ALSA)/lib/libasound.a"; \
 	  echo "build it once with build-n31-mpg123-alsa.sh in the ipod repo"; \
@@ -166,7 +182,8 @@ $(APP): $(APP_SRCS) $(HDRS) $(LVLIB) | $(BUILD)
 	@# against musl those are stubs, which is correct here: every plugin this
 	@# app names is one of the built-ins.
 	$(CC) $(CFLAGS) $(LV_CFLAGS) -static -Wl,--gc-sections \
-	      -o $@ $(APP_SRCS) $(LVLIB) $(ALSA)/lib/libasound.a -ldl -lm -lpthread
+	      -o $@ $(APP_SRCS) $(LVLIB) $(ALSA)/lib/libasound.a \
+	      $(LIBDRM)/lib/libdrm.a -ldl -lm -lpthread
 	@$(STRIP) $@
 	@# Stage where the image builder looks, every time, so an image packed
 	@# from the other repo can never be older than the last build here. See

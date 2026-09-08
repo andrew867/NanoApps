@@ -35,7 +35,7 @@
 #include "../platform/tuner.h"
 #include "../platform/capture.h"
 #include "../platform/player.h"
-#include "fbrefresh.h"
+#include "display.h"
 
 #define FRAME_MS 33          /* about 30 Hz, which is more than enough */
 
@@ -270,20 +270,13 @@ int main(int argc, char **argv)
     lv_init();
     lv_tick_set_cb(millis);
 
-    lv_display_t *disp = lv_linux_fbdev_create();
+    /* DRM if the driver is there, fbdev if it is not - see display.h. */
+    lv_display_t *disp = n31_display_create(fb, RP_SCREEN_W, RP_SCREEN_H, NULL);
     if (!disp) {
-        fprintf(stderr, "radioplus: no framebuffer display\n");
+        fprintf(stderr, "radioplus: no display at all\n");
         return 1;
     }
-    lv_linux_fbdev_set_file(disp, fb);
-    lv_display_set_resolution(disp, RP_SCREEN_W, RP_SCREEN_H);
-
-    /* Ask for the flush explicitly, when told to. See fbrefresh.h - this is
-       the switch that says whether the damage is the problem. */
-    if (n31_fb_force_refresh()) {
-        lv_linux_fbdev_set_force_refresh(disp, true);
-        printf("radioplus: forcing a framebuffer refresh every frame\n");
-    }
+    printf("radioplus: display %s\n", n31_display_describe());
 
 #if LV_USE_EVDEV
     if (!input) input = find_touch();
