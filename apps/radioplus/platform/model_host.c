@@ -219,6 +219,9 @@ void rp_act_tune_quiet(uint32_t khz)
 
 /* Nothing to persist to on the desktop: the preview keeps its presets in
    memory and is thrown away with the process. */
+/* Nothing here polls a tuner, so there is no cadence to change. */
+void rp_model_set_fast(bool on) { (void)on; }
+
 void rp_act_presets_save(void) { }
 
 void rp_act_set_rec_limit(uint16_t minutes)

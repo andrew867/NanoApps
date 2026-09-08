@@ -1214,6 +1214,82 @@ static void check_hits(en_scan_t *s, const char *how)
           en_scan_percent(s));
 }
 
+/*
+ * A station on the very first channel of the band.
+ *
+ * This is the case the device met and this suite did not. The existing fakes
+ * put their lowest station at 88.3 in a band starting at 87.5, so the first
+ * seek always landed above the bottom edge - and the sweep's end-of-band test
+ * was "at or below the bottom edge", which was therefore never true early.
+ *
+ * On the Americas grid the first channel is 87.9 and there was a station on
+ * it. The first seek landed exactly on the bottom of the band, the sweep
+ * decided it had already wrapped, and the whole scan ended after one step with
+ * no hits. From the outside that is a scan button that does nothing except
+ * leave the radio somewhere strange.
+ *
+ * The top edge is in here for the same reason: a station on the last channel
+ * has to be found before the wrap, not after it.
+ */
+static const uint32_t EDGE_STATIONS[] = { 87900, 90100, 107900 };
+#define EDGE_N ((int)(sizeof EDGE_STATIONS / sizeof EDGE_STATIONS[0]))
+
+static uint8_t edge_rssi(uint32_t khz)
+{
+    for (int i = 0; i < EDGE_N; i++)
+        if (EDGE_STATIONS[i] == khz) return 200;
+    return 10;
+}
+
+/* Seeking up wraps to the bottom, which is what a real tuner does and what
+   the sweep has to be able to tell apart from progress. */
+static uint32_t edge_seek(const en_region_t *rg, uint32_t khz)
+{
+    for (int i = 0; i < EDGE_N; i++)
+        if (EDGE_STATIONS[i] > khz) return EDGE_STATIONS[i];
+    return rg->low_khz;
+}
+
+static void test_scan_band_edges(void)
+{
+    const en_region_t *us = find_region("Americas");
+    en_scan_t sc;
+    en_rds_t rds;
+    uint32_t khz, want = 0;
+    int guard = 0;
+
+    CHECK(us != NULL, "no Americas region");
+    if (!us) return;
+    CHECK(EDGE_STATIONS[0] == us->low_khz,
+          "the point of this test is a station on the first channel");
+    CHECK(EDGE_STATIONS[EDGE_N - 1] == us->high_khz,
+          "and one on the last");
+
+    en_rds_init(&rds, true);
+    CHECK(en_scan_start(&sc, us, 98100, 100, true), "the scan would not start");
+    khz = sc.khz;
+
+    while (sc.phase != EN_SCAN_DONE && guard++ < 200000) {
+        switch (en_scan_tick(&sc, 40, khz, edge_rssi(khz), NULL, &want)) {
+        case EN_SCAN_TUNE: khz = want; break;
+        case EN_SCAN_SEEK: khz = edge_seek(us, khz); break;
+        default: break;
+        }
+    }
+
+    CHECK(sc.phase == EN_SCAN_DONE, "the edge sweep never finished");
+    CHECK(sc.n_hits == EDGE_N, "found %u stations, expected %d - a hit on the "
+                               "first channel is the one that used to be lost",
+          sc.n_hits, EDGE_N);
+    for (uint8_t i = 0; i < sc.n_hits && i < EDGE_N; i++)
+        CHECK(sc.hits[i].khz == EDGE_STATIONS[i], "hit %u was %u, expected %u",
+              i, sc.hits[i].khz, EDGE_STATIONS[i]);
+
+    /* And it comes back to where the listener was, on the grid. */
+    CHECK(khz == 98100, "the sweep left the radio on %u, not where it started",
+          khz);
+}
+
 static void test_scan(void)
 {
     const en_region_t *eu = find_region("Europe");
@@ -1995,6 +2071,7 @@ int main(void)
     test_wav();
     test_presets();
     test_scan();
+    test_scan_band_edges();
     test_stereo_mode();
     test_reg_coverage();
     test_rtplus();

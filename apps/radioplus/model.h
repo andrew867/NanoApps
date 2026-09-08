@@ -197,6 +197,17 @@ void rp_act_tune_quiet(uint32_t khz);
    wait for something that is never going to happen. */
 bool rp_act_seek_quiet(bool up);
 
+/*
+ * Poll the tuner harder for a while.
+ *
+ * The band scan decides whether a seek has landed by watching the frequency,
+ * and the ordinary cadence is slower than the scan's own settle time. Asked
+ * for by whatever is sweeping and turned off when it stops - it costs a driver
+ * round trip several times a second and there is nothing to see at that rate
+ * the rest of the time.
+ */
+void rp_model_set_fast(bool on);
+
 /* Persist the preset list. The scan writes many presets at once, so it does
    not go through rp_act_preset_toggle and has to ask for the save itself. */
 void rp_act_presets_save(void);

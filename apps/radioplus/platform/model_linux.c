@@ -256,6 +256,34 @@ static void failed(const char *why)
    here because bringing the mixer up has to reassert it - see try_mixer. */
 static void mute_apply(void);
 
+/*
+ * The nearest real channel.
+ *
+ * Nothing enforced this, so any arithmetic slip anywhere upstream became a
+ * frequency: 87645 kHz was tuned, displayed and written to the settings file,
+ * and it is not a channel in any region this radio knows. An off-grid
+ * frequency is not a station - it is noise between two of them - which is
+ * exactly what a radio that "loads and then plays static" sounds like.
+ *
+ * Applied at the one place every tune goes through, rather than trusted to
+ * each caller.
+ */
+static uint32_t snap_khz(uint32_t khz)
+{
+    const en_region_t *rg = rp_model.region;
+    uint32_t off, v;
+
+    if (!rg || !rg->step_khz || !khz) return khz;
+    if (khz < rg->low_khz) return rg->low_khz;
+    if (khz > rg->high_khz) return rg->high_khz;
+
+    /* Nearest, not downward: a frequency half a channel high belongs to the
+       channel above it, and truncating would always drag it back down. */
+    off = (khz - rg->low_khz + rg->step_khz / 2u) / rg->step_khz;
+    v = rg->low_khz + off * rg->step_khz;
+    return v > rg->high_khz ? rg->high_khz : v;
+}
+
 static bool s_tuner_configured;
 
 /*
@@ -284,6 +312,40 @@ static bool s_tuner_settled;
    tuner, and the only cost of being wrong is a moment of silence on a machine
    where one turns up late. */
 #define TUNE_GRACE_MS 3000u
+
+/*
+ * The frequency we asked for, and how long the chip has to catch up.
+ *
+ * rp_model.khz was two things at once: what the listener chose, and what the
+ * chip last reported. The poll below runs every 400 ms and simply assigned the
+ * second over the first - so pressing + on the dial tuned 88.1, and then the
+ * next poll, arriving before the chip had retuned, wrote 87.9 back over it.
+ * The display snapped back, the next press asked for 88.1 again, and the
+ * kernel log filled with the same tune four times in a second and a half.
+ * That is the whole of "changing channels does not work".
+ *
+ * So an intent is remembered. While one is outstanding the chip's report is
+ * only believed when it agrees; the moment it agrees, or once the settle
+ * window has passed, the chip is authoritative again. A tune that genuinely
+ * fails therefore shows the truth after a beat rather than lying forever.
+ *
+ * A seek is the other way round - the chip picks the frequency, so there is
+ * no intent to defend and the latch is dropped.
+ */
+static uint32_t s_want_khz;
+static uint32_t s_want_until;
+#define TUNE_SETTLE_MS 1500u
+
+/*
+ * Faster state polling while something is sweeping the band.
+ *
+ * The scan ticks every frame and decides whether a seek has landed by
+ * comparing the frequency it is handed against the one it started from. At
+ * 400 ms that answer is up to four hundred milliseconds stale, which is longer
+ * than the scan's own hundred-millisecond settle - so it judged RSSI on the
+ * previous channel and called seeks failed that had already landed.
+ */
+static bool s_fast_poll;
 
 static uint32_t s_bringup_ms;      /* when bring_up ran, for the cadence */
 static bool s_bringup_reported;    /* the deadline message, at most once */
@@ -660,6 +722,21 @@ static void bring_up(void)
     try_all();
 
     /*
+     * And say where that got to, rather than leaving "tuner init" on screen.
+     *
+     * step() is only called from in here, and the startup loop only relabels
+     * the boot screen while rp_model_waiting() has something to say. Between
+     * those two, a bring-up that got far enough to stop the loop from running
+     * left the last step it had announced sitting there - so a radio that had
+     * finished starting read as one stuck on "tuner init".
+     */
+    {
+        const char *left = dep_missing();
+
+        step(left ? left : "ready");
+    }
+
+    /*
      * And that is all bring-up does. It does not wait.
      *
      * An earlier version of this sat in a sleep loop here until everything had
@@ -785,14 +862,27 @@ void rp_model_refresh(void)
         }
     }
 
-    /* Signal and frequency, a few times a second. Each of these is a driver
-       round trip and nothing on screen changes faster. */
-    if (rp_model.tuner_ok && t - last_slow >= 400u) {
+    /* Signal and frequency, a few times a second - and four times faster
+       while a sweep is running, which needs to see a seek land. Each of these
+       is a driver round trip and nothing else on screen changes faster. */
+    if (rp_model.tuner_ok && t - last_slow >= (s_fast_poll ? 100u : 400u)) {
         last_slow = t;
 
         en_tuner_state_t st;
         if (en_tuner_state(&st) == EN_TUNER_OK) {
-            if (st.khz) rp_model.khz = st.khz;
+            if (st.khz) {
+                /* An outstanding request is defended until the chip agrees
+                   with it or the settle window runs out - see s_want_khz. */
+                if (s_want_khz && (int32_t)(t - s_want_until) < 0) {
+                    if (st.khz == s_want_khz) {
+                        s_want_khz = 0;
+                        rp_model.khz = st.khz;
+                    }
+                } else {
+                    s_want_khz = 0;
+                    rp_model.khz = st.khz;
+                }
+            }
             rp_model.rssi = st.rssi;
             rp_model.snr = st.snr;
             rp_model.stereo = st.stereo;
@@ -913,10 +1003,14 @@ void rp_model_refresh(void)
 
 void rp_act_tune(uint32_t khz)
 {
+    khz = snap_khz(khz);
+
     /* Whatever round was in progress is void: the listener has chosen a
        station, and that station is home now. */
     en_af_retuned(&rp_model.af, khz);
     rp_model.khz = khz;
+    s_want_khz = khz;
+    s_want_until = now_ms() + TUNE_SETTLE_MS;
     if (rp_model.tuner_ok) en_tuner_tune(khz);
     settings_save();
 
@@ -933,10 +1027,15 @@ void rp_act_tune_quiet(uint32_t khz)
        tell the follower that the listener has chosen a new home. The follower
        retunes through here, and treating its own move as a manual retune
        would cancel the round it had just started. */
+    khz = snap_khz(khz);
     rp_model.khz = khz;
+    s_want_khz = khz;
+    s_want_until = now_ms() + TUNE_SETTLE_MS;
     if (rp_model.tuner_ok) en_tuner_tune(khz);
     en_rds_init(&rp_model.rds, rp_model.region ? rp_model.region->rbds : true);
 }
+
+void rp_model_set_fast(bool on) { s_fast_poll = on; }
 
 void rp_act_presets_save(void) { presets_save(); }
 
@@ -955,14 +1054,35 @@ void rp_act_set_rec_at(int16_t minutes)
     settings_save();
 }
 
-bool rp_act_seek_quiet(bool up)
+/*
+ * Seek, and take the answer straight away.
+ *
+ * The chip decides where this lands, so there is no intent to defend and the
+ * latch is dropped. The state is read back here rather than left to the next
+ * poll: the band scan asks "has it moved yet" on the very next tick, and an
+ * answer that is four hundred milliseconds old makes a landed seek look like
+ * one that never went anywhere.
+ */
+static bool seek_and_adopt(bool up)
 {
+    en_tuner_state_t st;
+
     if (!rp_model.tuner_ok) return false;
     if (en_tuner_seek(up) != EN_TUNER_OK) return false;
+
+    s_want_khz = 0;
+    if (en_tuner_state(&st) == EN_TUNER_OK && st.khz)
+        rp_model.khz = st.khz;
+
     /* The station changed underneath the decoder, so what it had belongs to
        the previous one. */
     en_rds_init(&rp_model.rds, rp_model.region ? rp_model.region->rbds : true);
     return true;
+}
+
+bool rp_act_seek_quiet(bool up)
+{
+    return seek_and_adopt(up);
 }
 
 void rp_act_stereo_mode(uint8_t mode)
@@ -1021,11 +1141,18 @@ void rp_act_step(bool up)
 
 void rp_act_seek(bool up)
 {
-    if (rp_model.tuner_ok) {
-        en_tuner_seek(up);
-        en_rds_init(&rp_model.rds,
-                    rp_model.region ? rp_model.region->rbds : true);
+    /*
+     * A seek the listener asked for, so its result is theirs: remembered,
+     * and treated as a new home for the follower. Neither happened before -
+     * the frequency a seek landed on was never written to the settings, so a
+     * radio restarted after seeking came back where it had been before.
+     */
+    if (seek_and_adopt(up)) {
+        en_af_retuned(&rp_model.af, rp_model.khz);
+        settings_save();
     } else {
+        /* No hardware seek, or it refused. Stepping is the honest fallback -
+           silently doing nothing is what this used to do when it failed. */
         rp_act_step(up);
     }
 }

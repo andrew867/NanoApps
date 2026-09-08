@@ -94,6 +94,16 @@ typedef struct {
 
     uint32_t khz;            /* the channel it believes it is on */
     uint32_t from_khz;       /* where the current seek started */
+    /*
+     * The highest channel this sweep has reached.
+     *
+     * A seek upward moves up until it runs off the top and comes back round,
+     * so "not higher than last time" is what a wrap actually looks like. The
+     * end of the sweep used to be tested as "at or below the bottom of the
+     * band", which is also true of the very first station a sweep finds -
+     * because a sweep starts at the bottom of the band.
+     */
+    uint32_t last_khz;
     uint32_t waited_ms;
     uint8_t  peak;           /* best RSSI seen on this channel so far */
 

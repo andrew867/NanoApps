@@ -213,6 +213,9 @@ void rp_act_tune_quiet(uint32_t khz)
     en_rds_init(&rp_model.rds, rp_model.region ? rp_model.region->rbds : true);
 }
 
+/* Nothing here polls a tuner, so there is no cadence to change. */
+void rp_model_set_fast(bool on) { (void)on; }
+
 void rp_act_presets_save(void) { presets_save(); }
 
 void rp_act_set_rec_limit(uint16_t minutes)

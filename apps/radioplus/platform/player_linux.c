@@ -171,6 +171,22 @@ bool en_play_out_ready(uint8_t i)
    and far too little to notice on a radio. */
 #define LIVE_LAG_FRAMES (PERIOD_FRAMES * 2u)
 
+/*
+ * Inside this much, the listener is live.
+ *
+ * The distance between the write head and the read head is not a smooth
+ * quantity: the capture thread appends a period at a time and the player
+ * consumes one at a time, so it saws between roughly the lag and the lag plus
+ * a period. Subtracting a constant lag from a sawtooth and asking whether the
+ * result is exactly zero produces an answer that changes several times a
+ * second - which is what made the home screen flicker between "live" and a
+ * time behind, taking the pause and record buttons with it.
+ *
+ * A quarter of a second is far below anything a person can hear as a delay and
+ * comfortably above the sawtooth, so the readout is steady and still honest.
+ */
+#define LIVE_DEADBAND_FRAMES (PERIOD_FRAMES * 16u)
+
 /* When to stop believing an output is coming back. At one attempt every
    200 ms this is about a minute, which is long enough to ride out an encoder
    being restarted and short enough that a genuinely dead device is reported
@@ -681,6 +697,9 @@ void en_play_state(en_play_state_t *out)
                                      ? total - LIVE_LAG_FRAMES : 0);
         uint64_t behind = (total > at) ? total - at : 0;
         behind = (behind > LIVE_LAG_FRAMES) ? behind - LIVE_LAG_FRAMES : 0;
+        /* Snapped to live inside the deadband, so the readout does not
+           oscillate with the period boundary - see LIVE_DEADBAND_FRAMES. */
+        if (behind < LIVE_DEADBAND_FRAMES) behind = 0;
         out->behind_ms = frames_to_ms(behind, LIVE_RATE);
         out->behind_max_ms = frames_to_ms(total > oldest ? total - oldest : 0,
                                           LIVE_RATE);

@@ -1418,6 +1418,221 @@ static void on_step_down(lv_event_t *e) { (void)e; rp_act_step(false); }
 static void on_step_up(lv_event_t *e)   { (void)e; rp_act_step(true); }
 static void on_preset_here(lv_event_t *e) { (void)e; rp_act_preset_toggle(); }
 
+/*
+ * Tapping the band strip.
+ *
+ * The strip spans the whole region, so where along it the finger landed is a
+ * fraction of the band - turned into a channel and snapped by rp_act_tune,
+ * which is the one place that knows the grid.
+ */
+static void on_strip_tap(lv_event_t *e)
+{
+    lv_obj_t *o = lv_event_get_target(e);
+    lv_indev_t *in = lv_indev_active();
+    const en_region_t *rg = rp_model.region;
+    lv_area_t a;
+    lv_point_t p;
+    int32_t w;
+
+    if (!in || !rg || !rg->step_khz) return;
+
+    lv_indev_get_point(in, &p);
+    lv_obj_get_coords(o, &a);
+    w = a.x2 - a.x1;
+    if (w <= 0) return;
+
+    {
+        int32_t x = p.x - a.x1;
+        uint32_t span = rg->high_khz - rg->low_khz;
+
+        if (x < 0) x = 0;
+        if (x > w) x = w;
+        rp_act_tune(rg->low_khz + (uint32_t)((uint64_t)span * (uint32_t)x
+                                             / (uint32_t)w));
+    }
+}
+
+/* ---- typing a frequency ---------------------------------------------------
+ *
+ * Stepping and seeking are both relative, and neither answers "put me on
+ * 98.5". On a radio with four buttons that was a fair limitation; with a
+ * touchscreen it is just a missing feature, and the one people reach for
+ * first when they already know the station they want.
+ *
+ * Digits are collected as tenths of a megahertz - "985" is 98.5 - because
+ * that is how the number is said out loud and it means no decimal point to
+ * place. The entry is checked against the region before it is offered, so the
+ * button that commits it is simply unavailable for a frequency this band does
+ * not have, rather than accepting it and snapping somewhere else.
+ */
+static lv_obj_t *s_pad, *s_pad_entry, *s_pad_note, *s_pad_go;
+static char      s_pad_buf[8];
+
+/* What has been typed, as kHz, or 0 for nothing usable yet. */
+static uint32_t pad_khz(void)
+{
+    uint32_t v = 0;
+    int i;
+
+    if (!s_pad_buf[0]) return 0;
+    for (i = 0; s_pad_buf[i]; i++) v = v * 10u + (uint32_t)(s_pad_buf[i] - '0');
+    return v * 100u;            /* tenths of a MHz -> kHz */
+}
+
+static void pad_refresh(void)
+{
+    uint32_t khz = pad_khz();
+    bool ok = khz && rp_model.region &&
+              en_region_on_grid(rp_model.region, khz);
+    char buf[48];
+
+    if (!s_pad) return;
+
+    if (s_pad_buf[0]) {
+        int n = 0, i;
+
+        /* Written as it is typed - "9", "98", "98.5" - so the decimal point
+           appears where the eye expects it rather than at the end. */
+        for (i = 0; s_pad_buf[i] && n < (int)sizeof buf - 2; i++) {
+            if (i == 3) buf[n++] = '.';
+            else if (i == 2 && !s_pad_buf[3]) { buf[n++] = s_pad_buf[i];
+                                                buf[n++] = 0; goto done; }
+            buf[n++] = s_pad_buf[i];
+        }
+        buf[n] = 0;
+done:
+        ;
+    } else {
+        buf[0] = 0;
+    }
+    lv_label_set_text(s_pad_entry, s_pad_buf[0] ? buf : "---");
+
+    if (!s_pad_buf[0])
+        lv_label_set_text(s_pad_note, "Enter a frequency");
+    else if (ok)
+        lv_label_set_text(s_pad_note, "MHz");
+    else
+        lv_label_set_text(s_pad_note, "not a channel in this band");
+
+    /* Unavailable rather than absent: a button that vanishes as you type is
+       harder to aim at than one that is simply dim until it means something. */
+    lv_obj_set_style_bg_color(s_pad_go,
+                              lv_color_hex(ok ? C_SIGNAL : C_SURFACE_2), 0);
+    lv_obj_set_style_text_color(lv_obj_get_child(s_pad_go, 0),
+                                lv_color_hex(ok ? C_BG : C_TEXT_MUTE), 0);
+}
+
+static void pad_close(void)
+{
+    if (s_pad) lv_obj_add_flag(s_pad, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void on_pad_open(lv_event_t *e)
+{
+    (void)e;
+    if (!s_pad) return;
+    s_pad_buf[0] = 0;
+    pad_refresh();
+    lv_obj_remove_flag(s_pad, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void on_pad_digit(lv_event_t *e)
+{
+    int d = (int)(intptr_t)lv_event_get_user_data(e);
+    int n = 0;
+
+    while (s_pad_buf[n]) n++;
+    /* Four digits is the whole band - 87.9 through 107.9 - and a fifth could
+       only be a mistake, so it is refused rather than silently dropped from
+       the front. */
+    if (n >= 4) return;
+    s_pad_buf[n] = (char)('0' + d);
+    s_pad_buf[n + 1] = 0;
+    pad_refresh();
+}
+
+static void on_pad_back(lv_event_t *e)
+{
+    int n = 0;
+
+    (void)e;
+    while (s_pad_buf[n]) n++;
+    if (n) s_pad_buf[n - 1] = 0;
+    pad_refresh();
+}
+
+static void on_pad_cancel(lv_event_t *e)
+{
+    (void)e;
+    pad_close();
+}
+
+static void on_pad_go(lv_event_t *e)
+{
+    uint32_t khz = pad_khz();
+
+    (void)e;
+    if (!khz || !rp_model.region || !en_region_on_grid(rp_model.region, khz))
+        return;
+    pad_close();
+    rp_act_tune(khz);
+    rp_ui_show(RP_SCREEN_NOW);
+}
+
+static void build_pad(lv_obj_t *parent)
+{
+    static const char *row[4][3] = {
+        { "1", "2", "3" }, { "4", "5", "6" },
+        { "7", "8", "9" }, { "<", "0", "X" },
+    };
+    int r, c;
+
+    s_pad = panel(parent, 0, 0, RP_SCREEN_W, RP_SCREEN_H, C_BG);
+    lv_obj_add_flag(s_pad, LV_OBJ_FLAG_HIDDEN);
+    /* Clickable so a tap on the backdrop does not fall through to the dial
+       underneath, which would tune something while the keypad is open. */
+    lv_obj_add_flag(s_pad, LV_OBJ_FLAG_CLICKABLE);
+
+    s_pad_entry = label(s_pad, "---", F_FREQ, C_TEXT);
+    lv_obj_set_style_text_align(s_pad_entry, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(s_pad_entry, CONTENT_W);
+    lv_obj_set_pos(s_pad_entry, MARGIN, 24);
+
+    s_pad_note = label(s_pad, "", F_CAPTION, C_TEXT_DIM);
+    lv_obj_set_style_text_align(s_pad_note, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(s_pad_note, CONTENT_W);
+    lv_obj_set_pos(s_pad_note, MARGIN, 90);
+
+    for (r = 0; r < 4; r++) {
+        for (c = 0; c < 3; c++) {
+            const char *t = row[r][c];
+            int w = (CONTENT_W - 16) / 3;
+            lv_obj_t *k = panel(s_pad, MARGIN + c * (w + 8),
+                                122 + r * 58, w, 50, C_SURFACE);
+
+            lv_obj_set_style_radius(k, 6, 0);
+            lv_obj_add_flag(k, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_set_style_bg_color(k, lv_color_hex(C_SURFACE_2),
+                                      LV_STATE_PRESSED);
+            lv_obj_center(label(k, t, F_TITLE, C_TEXT));
+
+            if (t[0] == '<')
+                lv_obj_add_event_cb(k, on_pad_back, LV_EVENT_CLICKED, 0);
+            else if (t[0] == 'X')
+                lv_obj_add_event_cb(k, on_pad_cancel, LV_EVENT_CLICKED, 0);
+            else
+                lv_obj_add_event_cb(k, on_pad_digit, LV_EVENT_CLICKED,
+                                    (void *)(intptr_t)(t[0] - '0'));
+        }
+    }
+
+    s_pad_go = panel(s_pad, MARGIN, 360, CONTENT_W, 52, C_SURFACE_2);
+    lv_obj_set_style_radius(s_pad_go, 6, 0);
+    lv_obj_add_flag(s_pad_go, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_center(label(s_pad_go, "Tune", F_BODY, C_TEXT_MUTE));
+    lv_obj_add_event_cb(s_pad_go, on_pad_go, LV_EVENT_CLICKED, 0);
+}
+
 static void build_dial(void)
 {
     lv_obj_t *s = s_screen[RP_SCREEN_DIAL];
@@ -1426,19 +1641,36 @@ static void build_dial(void)
     lv_obj_set_pos(cap, MARGIN, 10);
     hairline(s, 32);
 
-    s_dial_freq = label(s, "--.-", F_FREQ, C_TEXT);
+    /* The readout is the way into the keypad. It is the largest thing on the
+       screen and it is the number you want to change, so it is where a thumb
+       goes first - a separate button would be a second place to look. */
+    lv_obj_t *freqhit = panel(s, MARGIN, 46, CONTENT_W, 66, C_BG);
+    lv_obj_add_flag(freqhit, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(freqhit, on_pad_open, LV_EVENT_CLICKED, 0);
+    lv_obj_set_style_bg_color(freqhit, lv_color_hex(C_SURFACE),
+                              LV_STATE_PRESSED);
+
+    s_dial_freq = label(freqhit, "--.-", F_FREQ, C_TEXT);
     lv_obj_set_style_text_align(s_dial_freq, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(s_dial_freq, CONTENT_W);
-    lv_obj_set_pos(s_dial_freq, MARGIN, 52);
+    lv_obj_set_pos(s_dial_freq, 0, 6);
 
     s_dial_note = label(s, "", F_CAPTION, C_TEXT_DIM);
     lv_obj_set_style_text_align(s_dial_note, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(s_dial_note, CONTENT_W);
     lv_obj_set_pos(s_dial_note, MARGIN, 118);
 
-    /* A strip of the band around where we are. Not interactive - it is an
-       orientation aid, showing whether there is anywhere to go next. */
+    /*
+     * A strip of the band around where we are, and a way onto it.
+     *
+     * It was an orientation aid and nothing more, which was right when there
+     * was no touchscreen. With one, a picture of the band that cannot be
+     * touched is the most obviously missing control on the screen: tapping
+     * along it tunes to the channel under the finger.
+     */
     s_dial_grid = panel(s, 0, 150, RP_SCREEN_W, 46, C_BG);
+    lv_obj_add_flag(s_dial_grid, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_dial_grid, on_strip_tap, LV_EVENT_CLICKED, 0);
 
     hairline(s, 210);
 
@@ -1465,6 +1697,8 @@ static void build_dial(void)
     lv_obj_set_style_bg_color(save, lv_color_hex(C_SURFACE_2), LV_STATE_PRESSED);
     lv_obj_center(label(save, "Save as preset", F_BODY, C_TEXT));
 
+    /* Last, so it covers everything above it when it is shown. */
+    build_pad(s);
 }
 
 static void refresh_dial(void)
@@ -1604,6 +1838,7 @@ static void scan_pump(void)
 
     if (s_scan.phase == EN_SCAN_DONE) {
         rp_act_squelch(false);
+        rp_model_set_fast(false);
         s_scan_added = en_scan_commit(&s_scan, &rp_model.presets);
         rp_act_presets_save();
         s_scan_note_for = 60;
@@ -1621,6 +1856,7 @@ static void on_scan(lv_event_t *e)
         /* Cancel. Put the tuner back before anything else, so a cancelled
            scan costs nothing but the time it ran for. */
         rp_act_squelch(false);
+        rp_model_set_fast(false);
         en_scan_stop(&s_scan);
         rp_act_tune(s_scan.resume_khz);
         s_scan_added = 0;
@@ -1650,11 +1886,23 @@ static void on_scan(lv_event_t *e)
      */
     rp_act_squelch(true);
 
+    /*
+     * And a faster look at the tuner for the duration.
+     *
+     * The sweep decides a seek has landed by watching the frequency change,
+     * and the ordinary poll is slower than the sweep's own settle time - so
+     * it was reading RSSI for the previous channel and timing out seeks that
+     * had already arrived. Turned off again at both exits below.
+     */
+    rp_model_set_fast(true);
+
     if (en_scan_start(&s_scan, rp_model.region, rp_model.khz, RP_SCAN_RSSI,
                       rp_model.can_seek))
         rp_act_tune_quiet(s_scan.khz);
-    else
+    else {
         rp_act_squelch(false);   /* it never started; do not leave it muted */
+        rp_model_set_fast(false);
+    }
 }
 
 /* ---- Presets --------------------------------------------------------------- */

@@ -51,10 +51,20 @@ bool en_scan_start(en_scan_t *s, const en_region_t *rg, uint32_t from_khz,
     s->name_ms = 2500;
     s->khz = rg->low_khz;
     s->from_khz = rg->low_khz;
+    s->last_khz = 0;
     s->waited_ms = 0;
     s->peak = 0;
     s->seek_pending = false;
-    s->settling = false;
+    /*
+     * The bottom of the band counts as a landed station.
+     *
+     * The caller tunes there before the first tick, and a seeking sweep used
+     * to immediately seek away from it - so whatever was on the first channel
+     * was never measured and never recorded. Starting in the settling state
+     * means the first thing the sweep does is judge where it already is,
+     * which is also what the software sweep does.
+     */
+    s->settling = use_seek;
     s->done = 0;
     s->total = n;
     s->n_hits = 0;
@@ -139,6 +149,7 @@ static en_scan_req_t start_naming(en_scan_t *s, uint32_t *tune_khz)
 /* One channel at a time, in software. */
 static en_scan_req_t sweep_step(en_scan_t *s, uint32_t *tune_khz)
 {
+    s->last_khz = s->khz;
     profile_put(s, s->khz, s->peak);
     if (s->peak >= s->threshold) record(s, s->khz, s->peak);
 
@@ -201,11 +212,24 @@ static en_scan_req_t sweep_seek(en_scan_t *s, uint32_t khz, uint32_t *tune_khz)
     if (s->waited_ms < s->sweep_ms) return EN_SCAN_WAIT;
     s->settling = false;
 
-    /* Compared against the low edge rather than against the previous
-       frequency, because a chip that returns the same station twice would
-       otherwise look like progress forever. */
-    if ((s->region && s->khz <= s->region->low_khz) || s->khz < s->from_khz)
+    /*
+     * The end of the band is a seek that did not go up.
+     *
+     * This was "at or below the bottom of the band", which is also true of
+     * the first station a sweep finds - because the sweep starts at the
+     * bottom of the band. So the first landing ended the sweep, every time,
+     * with no hits, and the app tuned straight back to where it started. It
+     * looked like a scan that did nothing and it was a scan that ran one
+     * step and stopped.
+     *
+     * Comparing against the highest channel reached instead is the real
+     * test: an upward seek climbs until it wraps, and a chip that returns
+     * the same station twice also fails to climb, which ends it just as
+     * correctly rather than looping forever.
+     */
+    if (s->last_khz && s->khz <= s->last_khz)
         return start_naming(s, tune_khz);
+    s->last_khz = s->khz;
 
     profile_put(s, s->khz, s->peak);
     if (s->peak >= s->threshold) record(s, s->khz, s->peak);
