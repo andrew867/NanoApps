@@ -3,6 +3,8 @@
  */
 
 #include "tg_fb.h"
+
+#include "fbrefresh.h"
 #include "tg_scale.h"
 #include "../../n31launcher/fbcon.h"
 
@@ -14,13 +16,63 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+/*
+ * The DRM path, tried first.
+ *
+ * /dev/fb0 still works and is still here, but it is the driver's emulation of
+ * itself and fb_deferred_io caps it at about twenty frames a second whatever
+ * the app does - which for something running a Game Boy at sixty is the whole
+ * ballgame. On the DRM device a finished frame is announced rather than
+ * noticed.
+ */
+static bool open_drm(tg_fb *fb)
+{
+    memset(fb, 0, sizeof *fb);
+    fb->fd = -1;
+    fb->drm.fd = -1;
+
+    if (!n31_drmfb_open(&fb->drm))
+        return false;
+
+    fb->pixels    = fb->drm.pixels;
+    fb->map_len   = fb->drm.map_len;
+    fb->w         = fb->drm.w;
+    fb->h         = fb->drm.h;
+    fb->stride_px = fb->drm.stride_px;
+    fb->bpp       = 32;
+
+    if (fb->w < TG_SCALED_W || fb->h < TG_SCALED_H) {
+        fprintf(stderr, "tinygb: %s is %ux%u, need at least %ux%u\n",
+                n31_drmfb_describe(&fb->drm), fb->w, fb->h,
+                TG_SCALED_W, TG_SCALED_H);
+        n31_drmfb_close(&fb->drm);
+        return false;
+    }
+
+    printf("tinygb: display %s\n", n31_drmfb_describe(&fb->drm));
+    return true;
+}
+
 bool tg_fb_open(tg_fb *fb, const char *path)
 {
     struct fb_var_screeninfo var;
     struct fb_fix_screeninfo fix;
 
+    /*
+     * DRM first, fbdev if there is no DRM device or the caller asked for the
+     * old path with N31_DISPLAY=fbdev. The console still has to be detached
+     * either way, and open_drm does not do it - the DRM path takes the CRTC
+     * from fbcon by setting a mode, but fbcon is still free to draw into its
+     * own surface underneath and gets it back on the way out.
+     */
+    if (open_drm(fb)) {
+        fb->took_console = n31_fbcon_detach();
+        return true;
+    }
+
     memset(fb, 0, sizeof *fb);
     fb->fd = -1;
+    fb->drm.fd = -1;
 
     if (!path) path = "/dev/fb0";
 
@@ -104,8 +156,14 @@ void tg_fb_close(tg_fb *fb)
        back and a half-drawn Game Boy underneath a shell prompt is confusing. */
     if (fb->pixels) {
         tg_fb_fill(fb, 0x000000);
-        munmap(fb->pixels, fb->map_len);
+        tg_fb_flush(fb);
+        /* The DRM mapping belongs to n31_drmfb and is unmapped by it, along
+           with the buffer and the mode it took. Unmapping it here as well
+           would be unmapping it twice. */
+        if (fb->drm.fd < 0)
+            munmap(fb->pixels, fb->map_len);
     }
+    if (fb->drm.fd >= 0) n31_drmfb_close(&fb->drm);
     if (fb->fd >= 0) close(fb->fd);
     if (fb->took_console) n31_fbcon_restore();
 
@@ -136,7 +194,30 @@ void tg_fb_flush(tg_fb *fb)
 {
     struct fb_var_screeninfo var;
 
-    if (!fb || fb->fd < 0)
+    if (!fb)
+        return;
+
+    /*
+     * On DRM this is the call that puts the frame on the panel, so it is not
+     * optional there and is not gated on anything - see drmfb.h. On fbdev it
+     * is the force-refresh experiment, which measured as doing nothing, and
+     * stays gated behind the switch it was written for.
+     */
+    if (fb->drm.fd >= 0) {
+        n31_drmfb_present(&fb->drm);
+        return;
+    }
+
+    if (fb->fd < 0)
+        return;
+
+    /*
+     * The fbdev half is the force-refresh experiment and nothing more. It
+     * measured as doing nothing - fb_deferred_io has already coalesced the
+     * damage by the time this runs - so it stays behind the switch it was
+     * written for rather than costing two ioctls a frame for everyone.
+     */
+    if (!n31_fb_force_refresh())
         return;
 
     /*

@@ -18,6 +18,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "drmfb.h"
+
 typedef struct {
     int       fd;
     uint32_t *pixels;       /* the mapping, as 32-bit pixels */
@@ -28,6 +30,15 @@ typedef struct {
     unsigned  bpp;
 
     bool      took_console; /* we detached fbcon and owe it back */
+
+    /*
+     * The DRM surface, when there is one.
+     *
+     * `drm.fd` is -1 on the fbdev path and everything above still describes
+     * the mapping, so the emulator's drawing does not know or care which one
+     * it got - the difference is only in how a finished frame is announced.
+     */
+    n31_drmfb drm;
 } tg_fb;
 
 /*

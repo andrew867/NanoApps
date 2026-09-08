@@ -694,9 +694,15 @@ static enum tg_menu_action play_once(int argc, char **argv, tg_menu_state *st,
            like a performance regression. */
         if (noskip) tg_scaler_invalidate(&scaler);
         tg_scale_15(&scaler, dst, fb.stride_px, core->pixels(ctx));
-        /* The frame is in the mapping; whether anybody notices is the
-           question fbrefresh.h exists to answer. */
-        if (force_refresh) tg_fb_flush(&fb);
+        /*
+         * The frame is in the mapping; this is what puts it on the panel.
+         *
+         * Unconditional, because on DRM it is the frame - tg_fb_flush knows
+         * which display it has and only the fbdev half is still gated behind
+         * the force-refresh switch. Gating it out here would have left the
+         * DRM path drawing into a buffer nobody was ever told about.
+         */
+        tg_fb_flush(&fb);
         t_blit += now_ns() - t_mark;
 
         frames++;
