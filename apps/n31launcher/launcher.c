@@ -59,7 +59,7 @@
 #include "fbcon.h"
 #include "touch.h"
 
-#include <sys/ioctl.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include "fbrefresh.h"
 #include "status.h"
@@ -249,30 +249,74 @@ static void retake_touch(void);
 static uint32_t s_power_last;
 
 /*
- * Blank the panel itself, not only its backlight.
+ * Sleeping the screen, through the one interface that actually does it.
  *
- * Turning the backlight off leaves the panel driven - the glass is still being
- * refreshed, and on this device you can see that it is. FB_BLANK_POWERDOWN
- * through the framebuffer is the console blanking path, which the driver now
- * turns into a DRM DPMS transition, so one ioctl puts the whole pipeline down
- * and another brings it back.
+ * Writing to the backlight class only darkens the glass: the class is not the
+ * panel, so the panel goes on being driven and you can see that it is. The
+ * PMIC driver exposes screen_sleep, which runs the whole transition - the
+ * backlight fade, quiescing touch, and the panel off through the panel driver
+ * - and the reverse on wake. It is the same path the power button's short
+ * press uses in the kernel.
  *
- * Opened per call rather than held: this happens twice a minute at the very
- * most, and a descriptor kept open on /dev/fb0 for the life of the process is
- * one more thing to reason about when an app takes the display.
+ * Found by name rather than by bus address: 1-0073 is where it is today and
+ * the address is not the contract.
+ *
+ * Two things the interface asks of a caller, and both are honoured below: the
+ * write returns before the fade has finished, and on wake the kernel restores
+ * the backlight level it saved at sleep - so waking the kernel has to come
+ * first, or the launcher unblanks over a panel that is still off.
  */
-#define FBIOBLANK_        0x4611
-#define FB_BLANK_UNBLANK_ 0
-#define FB_BLANK_POWERDOWN_ 4
-
-static void panel_power(bool on)
+static const char *screen_sleep_path(void)
 {
-    int fd = open("/dev/fb0", O_RDWR);
+    static char path[128];
+    static int  looked;
+    DIR *d;
+    struct dirent *de;
 
+    if (looked)
+        return path[0] ? path : NULL;
+    looked = 1;
+
+    d = opendir("/sys/bus/i2c/devices");
+    if (!d)
+        return NULL;
+
+    while ((de = readdir(d)) != NULL) {
+        char cand[128];
+
+        if (de->d_name[0] == '.')
+            continue;
+        snprintf(cand, sizeof cand, "/sys/bus/i2c/devices/%s/screen_sleep",
+                 de->d_name);
+        if (access(cand, W_OK) == 0) {
+            snprintf(path, sizeof path, "%s", cand);
+            break;
+        }
+    }
+    closedir(d);
+
+    if (path[0]) printf("n31launcher: screen sleep via %s\n", path);
+    else         printf("n31launcher: no screen_sleep; backlight only\n");
+    fflush(stdout);
+    return path[0] ? path : NULL;
+}
+
+/* Returns false when there is no such control, so the caller can fall back to
+   the backlight and the screen at least goes dark. */
+static bool screen_sleep(bool asleep)
+{
+    const char *p = screen_sleep_path();
+    int fd;
+    ssize_t n;
+
+    if (!p)
+        return false;
+    fd = open(p, O_WRONLY);
     if (fd < 0)
-        return;
-    ioctl(fd, FBIOBLANK_, on ? FB_BLANK_UNBLANK_ : FB_BLANK_POWERDOWN_);
+        return false;
+    n = write(fd, asleep ? "1\n" : "0\n", 2);
     close(fd);
+    return n == 2;
 }
 
 /*
@@ -592,7 +636,8 @@ static void after_app(void)
      * and repaint everything rather than trusting LVGL's idea of what is
      * already on screen, which describes a surface that is no longer there.
      */
-    panel_power(true);
+    /* In case the app left the panel down on its way out. */
+    screen_sleep(false);
     n31_fbcon_reassert();
 
     /*
@@ -1117,10 +1162,10 @@ static void go_to_sleep(void)
 {
     if (s_asleep) return;
     s_asleep = true;
-    /* Backlight first, then the panel: the other order shows one frame of a
-       lit, blanked panel, which reads as a glitch rather than as sleep. */
-    n31_backlight_off();
-    panel_power(false);
+    /* One write does the fade, the touch quiesce and the panel. The
+       backlight class is only the fallback for a kernel without it. */
+    if (!screen_sleep(true))
+        n31_backlight_off();
     printf("n31launcher: screen off\n");
     fflush(stdout);
 }
@@ -1130,9 +1175,13 @@ static void wake_up(void)
     if (!s_asleep) return;
     s_asleep = false;
     s_last_input = millis();
-    /* Panel first this time, so there is something to light. */
-    panel_power(true);
-    n31_backlight_on();
+    /*
+     * The kernel first, then the backlight class - never the other way round.
+     * On wake the kernel puts back the level it saved at sleep, so touching
+     * the class first would unblank over a panel that is still off.
+     */
+    if (!screen_sleep(false))
+        n31_backlight_on();
 
     /* The console may have taken the framebuffer while nobody was looking,
        and nothing on screen has been drawn since before that. */
