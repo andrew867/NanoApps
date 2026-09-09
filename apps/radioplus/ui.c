@@ -116,6 +116,24 @@ static void refresh_settings(void);
 static void refresh_dots(void);
 static void rebuild_order(void);
 
+/*
+ * Screens are built when they are first looked at, not all at once.
+ *
+ * rp_ui_build_all used to construct all eleven before the interface opened,
+ * and on this hardware that is twenty to thirty seconds of a boot screen with
+ * nothing happening on it - long enough to read as a hang, and it was
+ * reported as one twice: once as "sits on tuner init forever" and once, after
+ * the label was corrected, as "sits on ready". The label was never the
+ * problem.
+ *
+ * Most of those screens are never opened in a given session. Now Playing is
+ * built at startup because it is what opens; the rest cost nothing until
+ * somebody swipes to them, and the one that is being swiped to is built
+ * during the same gesture that asks for it.
+ */
+static bool s_built[RP_SCREEN_COUNT];
+static void ensure_built(rp_screen_t w);
+
 /* the landscape readout */
 static lv_obj_t *s_w_freq, *s_w_unit, *s_w_clock, *s_w_date;
 static lv_obj_t *s_w_ps, *s_w_pty, *s_w_rt, *s_w_state;
@@ -439,6 +457,8 @@ static void build_simple(void)
 
 static void refresh_simple(void)
 {
+    /* Not built yet - see ensure_built. */
+    if (!s_built[RP_SCREEN_SIMPLE]) return;
     lv_obj_clean(s_simple_grid);
 
     const en_preset_t *pick[EN_SIMPLE_MAX];
@@ -618,6 +638,8 @@ static void build_wide(void)
 
 static void refresh_wide(void)
 {
+    /* Not built yet - see ensure_built. */
+    if (!s_built[RP_SCREEN_WIDE]) return;
     char buf[96], n[16];
 
     fmt_mhz(buf, sizeof buf, rp_model.khz);
@@ -1140,6 +1162,8 @@ static void build_now(void)
 
 static void refresh_now(void)
 {
+    /* Not built yet - see ensure_built. */
+    if (!s_built[RP_SCREEN_NOW]) return;
     char buf[96];
 
     fmt_mhz(buf, sizeof buf, rp_model.khz);
@@ -1703,6 +1727,8 @@ static void build_dial(void)
 
 static void refresh_dial(void)
 {
+    /* Not built yet - see ensure_built. */
+    if (!s_built[RP_SCREEN_DIAL]) return;
     char buf[64], n[16];
     fmt_mhz(buf, sizeof buf, rp_model.khz);
     lv_label_set_text(s_dial_freq, rp_model.khz ? buf : "--.-");
@@ -1970,6 +1996,8 @@ static void build_presets(void)
 
 static void refresh_presets(void)
 {
+    /* Not built yet - see ensure_built. */
+    if (!s_built[RP_SCREEN_PRESETS]) return;
     lv_obj_clean(s_preset_list);
 
     if (!rp_model.presets.count) {
@@ -2264,6 +2292,8 @@ static void refresh_timer_controls(void)
 
 static void refresh_library(void)
 {
+    /* Not built yet - see ensure_built. */
+    if (!s_built[RP_SCREEN_LIBRARY]) return;
     refresh_timer_controls();
     lv_obj_clean(s_library_list);
 
@@ -2660,6 +2690,8 @@ static void build_settings(void)
 
 static void refresh_settings(void)
 {
+    /* Not built yet - see ensure_built. */
+    if (!s_built[RP_SCREEN_SETTINGS]) return;
     lv_label_set_text(s_set_region,
                       rp_model.region ? rp_model.region->name : "-");
     lv_label_set_text(s_set_std, rp_model.rds.rbds ? "RBDS" : "RDS");
@@ -2782,6 +2814,8 @@ static void build_advanced(void)
 
 static void refresh_advanced(void)
 {
+    /* Not built yet - see ensure_built. */
+    if (!s_built[RP_SCREEN_ADVANCED]) return;
     lv_obj_clean(s_adv_list);
 
     /* The whole screen is generated from the register table, which is why
@@ -3327,6 +3361,8 @@ static void build_rds(void)
 
 static void refresh_rds(void)
 {
+    /* Not built yet - see ensure_built. */
+    if (!s_built[RP_SCREEN_RDS]) return;
     const en_rds_t *r = &rp_model.rds;
     char buf[160], tmp[40];
     uint8_t i;
@@ -3782,6 +3818,8 @@ static void build_clock(void)
 
 static void refresh_clock(void)
 {
+    /* Not built yet - see ensure_built. */
+    if (!s_built[RP_SCREEN_CLOCK]) return;
     char buf[96], tmp[40];
     uint8_t i;
 
@@ -3870,37 +3908,16 @@ static void refresh_clock(void)
 
 void rp_ui_build_all(void)
 {
+    /*
+     * The shells only - eleven empty containers, which is a few milliseconds.
+     * What each one contains is built by ensure_built when it is first shown.
+     */
     for (int i = 0; i < RP_SCREEN_COUNT; i++) build_screen_shell((rp_screen_t)i);
-
-    build_simple();
-    build_now();
-    build_wide();
-    build_dial();
-    build_presets();
-    build_library();
-    build_settings();
-    build_advanced();
-    build_register();
-    build_rds();
-    build_clock();
 
     rebuild_order();
 
-    /* Dots go on every screen that can be in the swipe order, including the
-       optional ones - which are built whether or not they are currently in
-       it, so that turning one on is a settings change and not a construction
-       job in the middle of a gesture. */
-    for (int i = 0; i < RP_SWIPE_MAX; i++)
-        build_dots(i, s_screen[i]);
-
-    refresh_simple();
-    refresh_now();
-    refresh_wide();
-    refresh_dial();
-    refresh_presets();
-    refresh_library();
-    refresh_settings();
-    refresh_advanced();
+    /* And the one that is about to be looked at. */
+    ensure_built(RP_SCREEN_NOW);
 }
 
 /* ---- the boot screen ------------------------------------------------------ */
@@ -4088,9 +4105,44 @@ void rp_ui_init(void)
     rp_ui_show(RP_SCREEN_NOW);
 }
 
+/*
+ * Build one screen, once.
+ *
+ * The dots go on with it rather than in a pass of their own, so a screen that
+ * appears late still shows where it sits in the swipe order.
+ */
+static void ensure_built(rp_screen_t w)
+{
+    if (w >= RP_SCREEN_COUNT || s_built[w] || !s_screen[w])
+        return;
+
+    /* Set first: the build and the refresh below both run code that asks
+       whether this screen exists, and it does by the time they look. */
+    s_built[w] = true;
+
+    switch (w) {
+    case RP_SCREEN_SIMPLE:   build_simple();   refresh_simple();   break;
+    case RP_SCREEN_NOW:      build_now();      refresh_now();      break;
+    case RP_SCREEN_WIDE:     build_wide();     refresh_wide();     break;
+    case RP_SCREEN_DIAL:     build_dial();     refresh_dial();     break;
+    case RP_SCREEN_PRESETS:  build_presets();  refresh_presets();  break;
+    case RP_SCREEN_LIBRARY:  build_library();  refresh_library();  break;
+    case RP_SCREEN_SETTINGS: build_settings(); refresh_settings(); break;
+    case RP_SCREEN_ADVANCED: build_advanced(); refresh_advanced(); break;
+    case RP_SCREEN_REGISTER: build_register(); break;
+    case RP_SCREEN_RDS:      build_rds();      break;
+    case RP_SCREEN_CLOCK:    build_clock();    break;
+    default: break;
+    }
+
+    if (w < RP_SWIPE_MAX)
+        build_dots((int)w, s_screen[w]);
+}
+
 void rp_ui_show(rp_screen_t which)
 {
     if (which >= RP_SCREEN_COUNT || !s_screen[which]) return;
+    ensure_built(which);
     s_current = which;
 
     /* Restyle this screen's own row of dots. */

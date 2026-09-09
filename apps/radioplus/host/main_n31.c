@@ -41,6 +41,14 @@
 
 static volatile sig_atomic_t s_quit;
 
+static uint32_t rp_now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)(ts.tv_sec * 1000u + (uint32_t)(ts.tv_nsec / 1000000));
+}
+
 static uint32_t millis(void)
 {
     struct timespec t;
@@ -69,6 +77,7 @@ static void on_signal(int sig)
 #define KEY_VOLUMEDOWN   114
 #define KEY_VOLUMEUP     115
 #define KEY_MENU         139
+#define KEY_HOMEPAGE     172
 #define KEY_BACK         158
 #define KEY_NEXTSONG     163
 #define KEY_PLAYPAUSE    164
@@ -199,6 +208,17 @@ static void pump_keys(void)
                 else
                     rp_act_record_toggle();
                 break;
+            case KEY_HOMEPAGE:
+                /*
+                 * HOME leaves, the way it does in every other app here.
+                 *
+                 * It was not handled at all, so there was no way out of Radio+
+                 * except killing it from a console - and the launcher
+                 * deliberately does not take HOME away from an app that says
+                 * it owns its own keys. Back is still Back, on its own button.
+                 */
+                s_quit = 1;
+                break;
             case KEY_MENU:
             case KEY_BACK:
                 rp_ui_show(RP_SCREEN_NOW);
@@ -209,6 +229,17 @@ static void pump_keys(void)
         }
     }
 }
+
+#if LV_USE_EVDEV
+static lv_display_t *s_touch_disp;
+static lv_indev_t   *s_touch_indev;
+static const char   *s_touch_want;      /* --input, when one was given */
+static uint32_t      s_touch_next_try;
+static uint32_t      s_touch_since;
+
+#define TOUCH_RETRY_MS   1000u
+#define TOUCH_GIVE_UP_MS 60000u
+#endif
 
 /* The touch panel is not always the same event node, so it is found by asking
    rather than by hard-coding a number that a driver load order can change. */
@@ -237,6 +268,70 @@ static const char *find_touch(void)
     }
     return NULL;
 }
+
+#if LV_USE_EVDEV
+/*
+ * Attach the panel if it is there, and keep asking if it is not.
+ *
+ * Cheap - a handful of opens and an ioctl each - and it runs once a second
+ * for the first minute only. After that a device with no panel stops paying
+ * for one.
+ */
+static void touch_retry(void)
+{
+    const char *tp;
+
+    if (s_touch_indev || !s_touch_disp)
+        return;
+
+    tp = s_touch_want ? s_touch_want : find_touch();
+    if (!tp) {
+        s_touch_next_try = rp_now_ms() + TOUCH_RETRY_MS;
+        return;
+    }
+
+    s_touch_indev = lv_evdev_create(LV_INDEV_TYPE_POINTER, tp);
+    if (!s_touch_indev) {
+        /* Named on the command line and unopenable is a mistake worth
+           reporting; found by searching and unopenable is worth another go. */
+        if (s_touch_want) {
+            printf("radioplus: %s would not open as a pointer\n", tp);
+            s_touch_want = NULL;
+        }
+        s_touch_next_try = rp_now_ms() + TOUCH_RETRY_MS;
+        return;
+    }
+
+    lv_indev_set_display(s_touch_indev, s_touch_disp);
+    s_touch_next_try = 0;
+    printf("radioplus: touch on %s\n", tp);
+    fflush(stdout);
+}
+
+/* Called from the frame loop; does nothing once the panel is in hand. */
+static void touch_tick(void)
+{
+    uint32_t now;
+
+    if (s_touch_indev || !s_touch_next_try)
+        return;
+    now = rp_now_ms();
+    if (now < s_touch_next_try)
+        return;
+    if (!s_touch_since)
+        s_touch_since = now;
+    if (now - s_touch_since > TOUCH_GIVE_UP_MS) {
+        s_touch_next_try = 0;
+        printf("radioplus: no touch panel; buttons only\n");
+        fflush(stdout);
+        return;
+    }
+    touch_retry();
+}
+#else
+static void touch_retry(void) {}
+static void touch_tick(void) {}
+#endif
 
 static void usage(const char *me)
 {
@@ -279,16 +374,22 @@ int main(int argc, char **argv)
     printf("radioplus: display %s\n", n31_display_describe());
 
 #if LV_USE_EVDEV
-    if (!input) input = find_touch();
-    if (input) {
-        lv_indev_t *in = lv_evdev_create(LV_INDEV_TYPE_POINTER, input);
-        if (in) {
-            lv_indev_set_display(in, disp);
-            printf("radioplus: touch on %s\n", input);
-        }
-    } else {
-        printf("radioplus: no touch panel; buttons only\n");
-    }
+    s_touch_since = 0;
+    /*
+     * The panel, looked for again until it is found.
+     *
+     * Asked once, at startup, this got the answer "no panel" whenever Radio+
+     * started before the touchscreen driver had registered its node - and
+     * kept that answer for the whole session. That is not hypothetical here:
+     * the node does not survive the previous app, so an app started straight
+     * after another one is asking at exactly the wrong moment. See
+     * touch_retry() in the main loop.
+     */
+    s_touch_want = input;
+    s_touch_disp = disp;
+    touch_retry();
+    if (!s_touch_indev)
+        printf("radioplus: no touch panel yet, still looking\n");
 #endif
 
     open_keys();
@@ -349,6 +450,7 @@ int main(int argc, char **argv)
     for (const char *what;
          !s_quit && rp_ui_booting() && (what = rp_model_waiting()) != NULL; ) {
         pump_keys();
+        touch_tick();
         rp_ui_boot(what);
         usleep(120000);
         rp_model_refresh();
@@ -367,6 +469,7 @@ int main(int argc, char **argv)
 
     while (!s_quit) {
         pump_keys();
+        touch_tick();
         rp_model_refresh();
         rp_ui_tick();
 
