@@ -207,7 +207,6 @@ static int s_home_cycles;
  */
 static lv_display_t *s_touch_disp;
 static lv_indev_t   *s_touch_indev;
-static int           s_screen_off;
 
 static void touch_try(void)
 {
@@ -281,27 +280,17 @@ static void input_poll(void)
             case EN_KEY_VOLUMEDOWN: en_ui_key(EN_KEY_VOL_DOWN);   break;
             case EN_KEY_PLAYPAUSE:
             case EN_KEY_NEXTSONG:   en_ui_key(EN_KEY_PLAY_PAUSE); break;
-            case EN_KEY_POWER:
-                /*
-                 * The screen off, and back on.
-                 *
-                 * POWER was deliberately unmapped here on the reasoning that
-                 * it belongs to the system. It does - but nothing else in
-                 * this process is listening for it, so while entrain was on
-                 * screen the button did nothing at all, which reads as the
-                 * device having stopped responding rather than as a policy.
-                 *
-                 * Only the backlight. Holding it is still the system's
-                 * business and is not touched.
-                 */
-                if (s_screen_off) {
-                    n31_backlight_on();
-                    s_screen_off = 0;
-                } else {
-                    n31_backlight_off();
-                    s_screen_off = 1;
-                }
-                break;
+            /*
+             * POWER is the launcher's.
+             *
+             * This briefly toggled the backlight here, which was better than
+             * the button doing nothing but still wrong: every app would need
+             * its own copy, they would disagree, and two of them acting on
+             * the same press - the app and the launcher, which reads the same
+             * evdev nodes - fights over the panel. The launcher is the one
+             * process that is always running and always holds the backlight,
+             * so sleep lives there and apps do not think about it.
+             */
 
             case EN_KEY_HOMEPAGE:
                 /*
