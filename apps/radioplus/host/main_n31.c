@@ -36,6 +36,7 @@
 #include "../platform/capture.h"
 #include "../platform/player.h"
 #include "display.h"
+#include "touch.h"
 
 #define FRAME_MS 33          /* about 30 Hz, which is more than enough */
 
@@ -241,32 +242,28 @@ static uint32_t      s_touch_since;
 #define TOUCH_GIVE_UP_MS 60000u
 #endif
 
-/* The touch panel is not always the same event node, so it is found by asking
-   rather than by hard-coding a number that a driver load order can change. */
+/*
+ * The touch panel, through the search every other app here uses.
+ *
+ * This had its own copy, and the copy was weaker in the way that matters on
+ * this device: it looked at event0 through event11 and matched on the name
+ * alone. The launcher's looks at event0 through event31 and asks each device
+ * what axes it reports before believing its name.
+ *
+ * That difference is not academic. The panel's node does not survive an app
+ * here - it goes away and comes back, and it does not have to come back with
+ * the same number - so a search that stops at eleven finds nothing as soon as
+ * the numbering has drifted past it, which is exactly the state Radio+ starts
+ * in when it is launched after another app. Touch worked on a fresh boot and
+ * not afterwards, and the swipe between pages went with it, because a gesture
+ * needs a pointer like everything else does.
+ *
+ * One implementation, one behaviour. n31_touch_find is in the launcher's
+ * touch.c, compiled in here the way display.c already is.
+ */
 static const char *find_touch(void)
 {
-    static char path[64];
-    for (int i = 0; i < 12; i++) {
-        snprintf(path, sizeof path, "/dev/input/event%d", i);
-        int fd = open(path, O_RDONLY | O_NONBLOCK);
-        if (fd < 0) continue;
-
-        char name[128] = { 0 };
-        /* EVIOCGNAME(sizeof name) without dragging in linux/input.h, which
-           conflicts with some libc headers on this toolchain. */
-        if (ioctl(fd, (int)(0x80000000u | ((sizeof name) << 16) | ('E' << 8) | 0x06),
-                  name) >= 0) {
-            close(fd);
-            for (char *p = name; *p; p++)
-                if ((p[0] == 't' || p[0] == 'T') &&
-                    (p[1] == 'o' || p[1] == 'O') &&
-                    (p[2] == 'u' || p[2] == 'U'))
-                    return path;
-            continue;
-        }
-        close(fd);
-    }
-    return NULL;
+    return n31_touch_find();
 }
 
 #if LV_USE_EVDEV

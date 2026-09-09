@@ -132,7 +132,7 @@ PLAT_SRCS := $(PLAT)/tuner_linux.c $(PLAT)/capture_linux.c \
 
 APP      := $(BUILD)/radioplus
 APP_SRCS := main_n31.c ../ui.c $(CORE_SRCS) $(PLAT_SRCS) \
-            ../../n31launcher/display.c
+            ../../n31launcher/display.c ../../n31launcher/touch.c
 
 OBJS := $(patsubst %.c,$(BUILD)/%.o,$(notdir $(CORE_SRCS) $(PLAT_SRCS)))
 HDRS := $(wildcard $(CORE)/*.h $(PLAT)/*.h ../*.h)
