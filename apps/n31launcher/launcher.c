@@ -59,6 +59,7 @@
 #include "fbcon.h"
 #include "touch.h"
 
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include "fbrefresh.h"
 #include "status.h"
@@ -234,6 +235,45 @@ static int s_key_fds;
  */
 static int  s_touch_fd = -1;
 static char s_touch_path[64];
+
+/* The display, kept so touch can be re-attached to it after an app exits. */
+static lv_display_t *s_disp;
+
+static bool try_open_touch(lv_display_t *disp);
+static void retake_touch(void);
+
+/* Two power presses inside this closes an app that does not handle its own
+   keys. One press is sleep, which is what the button says on every other
+   device. */
+#define POWER_DOUBLE_MS 600u
+static uint32_t s_power_last;
+
+/*
+ * Blank the panel itself, not only its backlight.
+ *
+ * Turning the backlight off leaves the panel driven - the glass is still being
+ * refreshed, and on this device you can see that it is. FB_BLANK_POWERDOWN
+ * through the framebuffer is the console blanking path, which the driver now
+ * turns into a DRM DPMS transition, so one ioctl puts the whole pipeline down
+ * and another brings it back.
+ *
+ * Opened per call rather than held: this happens twice a minute at the very
+ * most, and a descriptor kept open on /dev/fb0 for the life of the process is
+ * one more thing to reason about when an app takes the display.
+ */
+#define FBIOBLANK_        0x4611
+#define FB_BLANK_UNBLANK_ 0
+#define FB_BLANK_POWERDOWN_ 4
+
+static void panel_power(bool on)
+{
+    int fd = open("/dev/fb0", O_RDWR);
+
+    if (fd < 0)
+        return;
+    ioctl(fd, FBIOBLANK_, on ? FB_BLANK_UNBLANK_ : FB_BLANK_POWERDOWN_);
+    close(fd);
+}
 
 /*
  * The panel is looked for again until it is found.
@@ -540,10 +580,38 @@ static void after_app(void)
         n31_fbcon_reclaim();
         s_child_console = false;
     }
+
+    /*
+     * Take the display back properly.
+     *
+     * An app that drove the panel through DRM gave the mode back on its way
+     * out, but what the framebuffer holds after that is whatever was last
+     * staged into it - which came back as a white screen. The console may
+     * also have rebound itself while the app had the screen. So: unblank in
+     * case the app left the panel down, take the console back if it took it,
+     * and repaint everything rather than trusting LVGL's idea of what is
+     * already on screen, which describes a surface that is no longer there.
+     */
+    panel_power(true);
+    n31_fbcon_reassert();
+
+    /*
+     * And take touch back.
+     *
+     * The panel's evdev node does not survive an app on this device - the
+     * launcher's descriptor is dead by the time the app has gone, and the
+     * node may not even have the same number. Nothing noticed, so touch
+     * worked exactly once per boot: in the launcher until the first app, and
+     * then nowhere. Re-running the same discovery the launcher does at
+     * startup costs a handful of opens and gets it back.
+     */
+    retake_touch();
+
     n31_ui_status("");
     n31_ui_extras_opening(false);
     go(s_child_from);
     n31_ui_redraw();
+    lv_refr_now(NULL);
 }
 
 static void close_app(void)
@@ -777,11 +845,33 @@ static void on_key(uint16_t code, int32_t value)
      * the kernel's hard power-off, so nothing can trap the device.
      */
     if (s_child) {
-        if (code == N31_KEY_POWER && pressed
-            && !s_child_owns_keys
-            && millis() - s_launched_at >= SCREEN_GUARD_MS) {
-            close_app();
-            n31_ui_redraw();
+        /*
+         * Sleep belongs to the launcher, whatever is running.
+         *
+         * Every app was reimplementing this and most of them had not, so the
+         * power button did nothing at all inside Radio+ and TinyPod - which
+         * reads as a device that has stopped responding. The launcher is the
+         * one process that is always there, always holds the backlight, and
+         * always survives the app, so it is the one that should own the
+         * screen. Apps do not need to know about it.
+         *
+         * A short press sleeps and wakes. Closing an app that does not handle
+         * its own keys moved to a double press, so the two are not the same
+         * gesture - see s_power_taps.
+         */
+        if (code == N31_KEY_POWER && pressed) {
+            uint32_t now = millis();
+
+            if (!s_child_owns_keys
+                && now - s_power_last <= POWER_DOUBLE_MS
+                && now - s_launched_at >= SCREEN_GUARD_MS) {
+                s_power_last = 0;
+                close_app();
+                n31_ui_redraw();
+            } else {
+                s_power_last = now;
+                go_to_sleep();
+            }
         }
         return;
     }
@@ -1027,7 +1117,10 @@ static void go_to_sleep(void)
 {
     if (s_asleep) return;
     s_asleep = true;
+    /* Backlight first, then the panel: the other order shows one frame of a
+       lit, blanked panel, which reads as a glitch rather than as sleep. */
     n31_backlight_off();
+    panel_power(false);
     printf("n31launcher: screen off\n");
     fflush(stdout);
 }
@@ -1037,6 +1130,8 @@ static void wake_up(void)
     if (!s_asleep) return;
     s_asleep = false;
     s_last_input = millis();
+    /* Panel first this time, so there is something to light. */
+    panel_power(true);
     n31_backlight_on();
 
     /* The console may have taken the framebuffer while nobody was looking,
@@ -1068,6 +1163,9 @@ static void pump_keys(void)
  */
 static bool try_open_touch(lv_display_t *disp)
 {
+    /* Remembered for retake_touch, which runs every time an app exits. */
+    s_disp = disp;
+
     const char *tp = n31_touch_find();
     lv_indev_t *in;
 
@@ -1116,6 +1214,33 @@ static bool try_open_touch(lv_display_t *disp)
     printf("n31launcher: touch on %s\n", tp);
     fflush(stdout);
     return true;
+}
+
+/*
+ * Drop the panel and find it again.
+ *
+ * Deliberately a full teardown rather than a check: whether the node is gone,
+ * renumbered, or merely holding a descriptor that now returns errors, the
+ * answer is the same and this is cheap enough to do unconditionally on the
+ * one event that causes it.
+ */
+static void retake_touch(void)
+{
+    if (s_touch_indev) {
+        lv_indev_delete(s_touch_indev);
+        s_touch_indev = NULL;
+    }
+    if (s_touch_fd >= 0) {
+        close(s_touch_fd);
+        s_touch_fd = -1;
+    }
+    s_touch_path[0] = 0;
+
+    if (s_disp && !try_open_touch(s_disp)) {
+        /* Not back yet. The retry that runs at startup does this again. */
+        s_touch_since = millis();
+        s_touch_next_try = s_touch_since + TOUCH_RETRY_MS;
+    }
 }
 
 /* ---- main ----------------------------------------------------------------- */
