@@ -275,6 +275,12 @@ static int commit(n31_drmfb *s, bool modeset)
     drmModeAtomicAddProperty(req, s->plane_id, s->plane.crtc_w, s->w);
     drmModeAtomicAddProperty(req, s->plane_id, s->plane.crtc_h, s->h);
 
+    /* "All of it changed", which for a surface written in place is true and
+       is the only way the driver can know it. */
+    if (s->p_damage && s->damage_blob)
+        drmModeAtomicAddProperty(req, s->plane_id, s->p_damage,
+                                 s->damage_blob);
+
     rc = drmModeAtomicCommit(s->fd, req, flags, s);
     drmModeAtomicFree(req);
     return rc;
@@ -342,6 +348,19 @@ bool n31_drmfb_open(n31_drmfb *s)
     if (!find_plane_props(s))
         goto fail;
 
+    /*
+     * Optional, and the difference between a picture and a black screen.
+     *
+     * A driver that does not advertise it takes the whole plane every time,
+     * which is what we want anyway; one that does needs telling, because this
+     * client commits the same framebuffer every frame and nothing else in the
+     * commit changes. tools/linux-n31/drmtest.c never hit this because it
+     * alternates two buffers, so its framebuffer differs from the previous
+     * one on every commit and the damage helper falls back to the full plane.
+     */
+    s->p_damage = prop_id(s->fd, s->plane_id, DRM_MODE_OBJECT_PLANE,
+                          "FB_DAMAGE_CLIPS", NULL);
+
     s->p_crtc_active = prop_id(s->fd, s->crtc_id, DRM_MODE_OBJECT_CRTC,
                                "ACTIVE", NULL);
     s->p_crtc_mode = prop_id(s->fd, s->crtc_id, DRM_MODE_OBJECT_CRTC,
@@ -395,6 +414,19 @@ bool n31_drmfb_open(n31_drmfb *s)
                                   &s->mode_blob) != 0)
         goto fail;
 
+    /* The whole surface, once, reused by every commit - see p_damage. */
+    if (s->p_damage) {
+        struct drm_mode_rect all;
+
+        all.x1 = 0;
+        all.y1 = 0;
+        all.x2 = (__s32)s->w;
+        all.y2 = (__s32)s->h;
+        if (drmModeCreatePropertyBlob(s->fd, &all, sizeof all,
+                                      &s->damage_blob) != 0)
+            s->damage_blob = 0;     /* not fatal; some drivers manage without */
+    }
+
     /* Bring it up, and wait for the pipeline to say it did. */
     if (commit(s, true) != 0) {
         fprintf(stderr, "drmfb: the first commit was refused: %s\n",
@@ -406,8 +438,8 @@ bool n31_drmfb_open(n31_drmfb *s)
     wait_flip(s);
 
     drmModeFreeResources(res);
-    snprintf(s_desc, sizeof s_desc, "DRM %ux%u %s atomic", s->w, s->h,
-             card_path());
+    snprintf(s_desc, sizeof s_desc, "DRM %ux%u %s atomic%s", s->w, s->h,
+             card_path(), s->damage_blob ? " damage" : " no-damage-prop");
     return true;
 
 fail:
@@ -460,6 +492,10 @@ void n31_drmfb_close(n31_drmfb *s)
     if (s->mode_blob) {
         drmModeDestroyPropertyBlob(s->fd, s->mode_blob);
         s->mode_blob = 0;
+    }
+    if (s->damage_blob) {
+        drmModeDestroyPropertyBlob(s->fd, s->damage_blob);
+        s->damage_blob = 0;
     }
 
     /* The mode as it was found, so whatever had the screen before this gets

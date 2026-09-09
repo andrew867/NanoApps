@@ -72,6 +72,21 @@ typedef struct {
 
     /* Property ids, looked up once. */
     n31_drmfb_planeprops plane;
+    /*
+     * FB_DAMAGE_CLIPS, and a blob holding one full-surface rectangle.
+     *
+     * This is what makes a single-buffered atomic client work. The driver
+     * copies the damaged part of the plane, and with the same framebuffer
+     * committed twice in a row there is nothing it can infer as damaged - so
+     * it copies nothing and the panel keeps showing the first frame. Handing
+     * it an explicit "all of it" every commit is the whole fix.
+     *
+     * The blob is created once. It describes a constant rectangle, so there
+     * is no reason to build one per frame.
+     */
+    uint32_t  p_damage;
+    uint32_t  damage_blob;
+
     uint32_t  p_crtc_active;
     uint32_t  p_crtc_mode;
     uint32_t  p_conn_crtc;
