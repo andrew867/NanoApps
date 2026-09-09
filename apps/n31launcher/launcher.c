@@ -1110,8 +1110,21 @@ static void idle_for(uint32_t ms)
 
         /* Drain our copy so it does not stay readable and turn this back
            into a spin. LVGL still has every event on its own descriptor. */
-        while (read(s_touch_fd, &ev, sizeof ev) == (ssize_t)sizeof ev)
-            ;
+        for (;;) {
+            ssize_t r = read(s_touch_fd, &ev, sizeof ev);
+
+            if (r == (ssize_t)sizeof ev)
+                continue;
+            /* Not "nothing to read" means the node has gone - the other way
+               this is found out, and the same answer. */
+            if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                printf("n31launcher: touch panel read failed; looking again\n");
+                fflush(stdout);
+                retake_touch();
+                return;
+            }
+            break;
+        }
 
         s_last_input = millis();
         if (s_asleep) {
@@ -1138,6 +1151,29 @@ static void idle_for(uint32_t ms)
             continue;
         if (!(pfd[i].revents & (POLLERR | POLLHUP | POLLNVAL)))
             continue;
+
+        /*
+         * The panel, which is not one of the button descriptors and so fell
+         * through this loop entirely.
+         *
+         * That is the whole of "touch stopped working on its own". A
+         * descriptor in error is ready for ever: poll returned instantly
+         * every time round, the launcher spun instead of sleeping, and the
+         * panel stayed dead until something else happened to re-discover it.
+         * Nothing did unless an app exited, which is why it looked like an
+         * app had caused it.
+         *
+         * Re-discovered here rather than merely dropped, because a panel
+         * whose node has gone is usually a panel whose node is about to come
+         * back under a different number.
+         */
+        if (touch_slot >= 0 && i == touch_slot) {
+            printf("n31launcher: touch panel went away; looking again\n");
+            fflush(stdout);
+            retake_touch();
+            continue;
+        }
+
         for (int j = 0; j < s_key_fds; j++) {
             if (s_key_fd[j] != pfd[i].fd)
                 continue;
