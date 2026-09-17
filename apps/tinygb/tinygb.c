@@ -14,10 +14,12 @@
  *   - there is no libc and no malloc. The cartridge lives in a static window
  *     (.bss costs nothing in the file), the machine in a static context.
  *
- * Phase 3: the library, the picture, the pad, the buttons, battery saves.
- * Silent - the audio queue and the frame pacing that hangs off it are
- * Phase 4, and until then one emulated frame runs per tick. The menu pages
- * are Phase 5; the pill under the picture returns to the library for now.
+ * Phases 3 and 4: the library, the picture, the pad, the buttons, battery
+ * saves, and sound. Sound is a chain of 60 ms blocks the OS mixer plays
+ * (platform/tg_audq.h), and the depth of that chain is the emulator's clock:
+ * a tick runs no emulated frame, one, or two, as many as the chain is short
+ * by. The menu pages are Phase 5; the pill under the picture returns to the
+ * library for now.
  */
 
 #include "hb_sdk.h"
@@ -26,6 +28,9 @@
 #include "hb_prefs.h"
 
 #include "core/tg_core.h"
+#include "platform/tg_audio.h"
+#include "platform/tg_audio_hb.h"
+#include "platform/tg_audq.h"
 #include "platform/tg_input_hb.h"
 #include "platform/tg_pad.h"
 #include "platform/tg_palette.h"
@@ -55,6 +60,17 @@
 static uint8_t  s_rom[TG_ROS_ROM_MAX];
 static uint8_t  s_sram[TG_ROS_SRAM_MAX];
 static uint64_t s_ctx[TG_ROS_CTX_MAX / 8];    /* aligned for the core */
+
+/* The sound buffers. Static rather than hb_os_alloc, and never given back:
+   a voice may still be reading one when Home ends the app, and this arena
+   outlives it by the seconds it takes to launch anything again. 63 KB. */
+static int16_t  s_aud_pool[TG_AUDQ_POOL_SAMPLES];
+
+/* Comfortable rather than loud: 0x7fff is the OS's full scale. */
+#define TG_AUD_VOLUME 0x4800u
+
+/* The most one emulated frame can produce at 22050 (369 or 370), with room. */
+#define ABUF_FRAMES 512
 
 /* ---- the screen ----------------------------------------------------------- */
 
@@ -104,6 +120,30 @@ static tg_save        s_save;
 static tg_scaler      s_scaler;
 static tg_input_hb    s_input;
 static char           s_note[96];  /* one line under the list, or empty */
+
+/* Sound. */
+static tg_audq        s_audq;
+static tg_audio_clock s_aclock;
+static int16_t        s_abuf[ABUF_FRAMES * 2];
+static bool           s_sound;             /* this cartridge has a sink */
+static uint32_t       s_media_check_ms;
+
+#ifdef TG_TONE
+/* A 440 Hz sine at 40 % of full scale, in place of the Game Boy, for
+   proving the chain with a recording: a gap, a click or a pitch step is
+   plain to see in a waveform of a tone and buried in a game's. */
+static const int16_t k_sine[64] = {
+    0, 1285, 2557, 3805, 5016, 6179, 7282, 8315, 9268, 10132, 10898, 11559,
+    12109, 12542, 12855, 13044, 13107, 13044, 12855, 12542, 12109, 11559,
+    10898, 10132, 9268, 8315, 7282, 6179, 5016, 3805, 2557, 1285, 0, -1285,
+    -2557, -3805, -5016, -6179, -7282, -8315, -9268, -10132, -10898, -11559,
+    -12109, -12542, -12855, -13044, -13107, -13044, -12855, -12542, -12109,
+    -11559, -10898, -10132, -9268, -8315, -7282, -6179, -5016, -3805, -2557,
+    -1285,
+};
+static uint32_t s_tone_phase;              /* 26.6 fixed: 64 entries */
+#define TONE_STEP ((440u << 16) * 64u / TG_AUDQ_RATE)
+#endif
 
 /* ---- helpers -------------------------------------------------------------- */
 
@@ -311,12 +351,50 @@ static void enter_library(void)
 
 /* ---- the cartridge -------------------------------------------------------- */
 
+/* RetailOS acts on the Play/Pause key before this app sees it and starts
+   the Music player underneath. It cannot be stopped from doing that, but it
+   can be undone: if the OS player has started, pause it. Entrain's trick. */
+static void suppress_os_media(void)
+{
+    uint32_t now = hb_time_uptime_ms();
+
+    if (now - s_media_check_ms < 250) return;   /* 4 Hz is plenty */
+    s_media_check_ms = now;
+    if (hb_media_state() == 0) hb_media_set_paused(true);
+}
+
+/* One emulated frame's worth of sound, into the chain. */
+static void emit_audio(void)
+{
+    unsigned n = tg_audio_clock_next(&s_aclock);
+    unsigned got;
+
+    if (n > ABUF_FRAMES) n = ABUF_FRAMES;
+
+#ifdef TG_TONE
+    for (unsigned i = 0; i < n; i++) {
+        int16_t v = k_sine[(s_tone_phase >> 16) & 63];
+
+        s_abuf[2 * i] = s_abuf[2 * i + 1] = v;
+        s_tone_phase += TONE_STEP;
+    }
+    got = n;
+#else
+    got = s_core->audio_pull(s_ctx, s_abuf, n);
+#endif
+    /* A short fill is padded with silence, never with a repeat. */
+    for (unsigned i = got * 2; i < n * 2; i++) s_abuf[i] = 0;
+    tg_audq_push(&s_audq, s_abuf, n);
+}
+
 static void stop_cartridge(void)
 {
     if (!s_core) return;
+    if (s_sound) tg_audq_stop(&s_audq);
     if (s_info.sram_size) tg_save_flush(&s_save);
     s_core->close(s_ctx);
     s_core = NULL;
+    s_sound = false;
 }
 
 static void start_cartridge(unsigned i)
@@ -365,13 +443,22 @@ static void start_cartridge(unsigned i)
         tg_save_load(&s_save, sav, s_sram, s_info.sram_size);
     }
 
-    /* Sound is Phase 4; audio_rate 0 asks the core for none. */
-    r = s_core->open(s_ctx, s_rom, s_rom_len, s_sram, s_info.sram_size, 0);
+    r = s_core->open(s_ctx, s_rom, s_rom_len, s_sram, s_info.sram_size,
+                     TG_AUDQ_RATE);
     if (r != TG_OK) {
         note(tg_strerror(r));
         s_core = NULL;
         return;
     }
+
+    /* The queue itself was set up once at launch and is still holding the
+       voice (looping silence) from the last cartridge, if there was one;
+       the first block of this one chains from that. Only the clock resets. */
+    s_sound = s_core->audio_pull != NULL;
+#ifdef TG_TONE
+    s_sound = true;
+#endif
+    tg_audio_clock_init(&s_aclock, TG_AUDQ_RATE);
 
     for (unsigned k = 0; k < 4; k++) pal[k] = shade[k] | OPAQUE;
     tg_scaler_init(&s_scaler, pal, true);
@@ -386,8 +473,12 @@ static void start_cartridge(unsigned i)
 
 static void play_tick(void)
 {
-    unsigned held = tg_input_hb_poll(&s_input);
+    unsigned held;
 
+    tg_audq_tick(&s_audq);
+    suppress_os_media();
+
+    held = tg_input_hb_poll(&s_input);
     if (held & TG_PAD_MENU) {
         /* Phase 5 puts the pause menu here. For now the pill is the way
            back to the shelf. */
@@ -397,10 +488,27 @@ static void play_tick(void)
     }
 
     s_core->set_buttons(s_ctx, (uint8_t)(held & 0xFF));
-    s_core->run_frame(s_ctx);
+
+    /*
+     * The chain is the clock. Run as many emulated frames as it is short
+     * by, up to two, so pitch is the mixer's and never ours; a tick that
+     * runs none repeats the picture, which nobody sees, and one that runs
+     * two catches up a stall. Without a sink there is nothing to pace
+     * against and the tick itself is the clock.
+     */
+    if (!s_sound) {
+        s_core->run_frame(s_ctx);
+    } else {
+        for (int runs = 0; runs < 2 && tg_audq_frames_wanted(&s_audq) > 0; runs++) {
+            s_core->run_frame(s_ctx);
+            emit_audio();
+        }
+    }
 
     /* The picture sits at the top, 240 wide - exactly the surface's width,
-       so its stride is the surface's and its origin is pixel zero. */
+       so its stride is the surface's and its origin is pixel zero. Rows that
+       did not change - all of them, on a tick that ran nothing - are
+       skipped. */
     tg_scale_15(&s_scaler, s_fb.px, s_fb.stride_px, s_core->pixels(s_ctx));
     tg_pad_draw(&s_fb, held & 0xFF, false);
 
@@ -425,6 +533,10 @@ void hb_raw_init(int w, int h)
        decided by, read back with `start trace` from the NanoApps tree. */
     hb_trace_init();
     hb_trace_log("TGHP", hb_os_heap_largest(), hb_os_heap_free());
+
+    /* Once, for the life of the app: the queue keeps the voice it starts,
+       looping silence between cartridges, so nothing is ever started twice. */
+    tg_audq_init(&s_audq, tg_audio_hb_ops(), s_aud_pool, TG_AUD_VOLUME);
 
     s_note[0] = 0;
     enter_library();

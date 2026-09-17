@@ -13,6 +13,7 @@
 
 #include "../core/tg_core.h"
 #include "../platform/tg_audio.h"
+#include "../platform/tg_audq.h"
 #include "../platform/tg_pad.h"
 #include "../platform/tg_palette.h"
 #include "../platform/tg_scale.h"
@@ -850,6 +851,213 @@ static void test_util(void)
     ok("strcasestr",          tg_strcasestr("Legend of Zelda", "ZELDA") != NULL && tg_strcasestr("abc", "d") == NULL);
 }
 
+/* ---- the audio queue, against a pretend audio task ----------------------- */
+
+/*
+ * The fake OS: a clock, one voice, and the two things the real audio task
+ * does that the queue depends on - it sets a descriptor's +0x64 while it
+ * holds it, and at the end of the buffer follows the chain and sets the
+ * next one's. On a 64-bit host a pointer does not fit the +0x54 word, so
+ * the chain lives in a side table keyed by descriptor.
+ */
+#define FAKE_N 16
+static struct { uint8_t *desc, *next; } s_links[FAKE_N];
+static uint32_t s_fake_ms;
+static uint8_t *s_fake_cur;          /* the descriptor sounding, or NULL */
+static uint32_t s_fake_cur_start;
+static unsigned s_fake_plays;
+static uint32_t s_fake_voice_rate = 22050;
+static uint32_t s_fake_voice[0x20];  /* +0x0C rate, +0x48 counter, as words */
+
+static uint8_t *fake_next_of(const uint8_t *d)
+{
+    for (int i = 0; i < FAKE_N; i++)
+        if (s_links[i].desc == d) return s_links[i].next;
+    return NULL;
+}
+
+static void fake_ctor(uint8_t *d) { memset(d, 0, TG_AUDQ_DESC_BYTES); }
+
+static void fake_set_next(uint8_t *d, uint8_t *next)
+{
+    for (int i = 0; i < FAKE_N; i++)
+        if (s_links[i].desc == d || !s_links[i].desc) {
+            s_links[i].desc = d; s_links[i].next = next; return;
+        }
+}
+
+static void fake_take_up(uint8_t *d)
+{
+    s_fake_cur = d;
+    s_fake_cur_start = s_fake_ms;
+    d[TG_SFX_OFF_PLAYING] = 1;
+    s_fake_voice[0x0C / 4] = s_fake_voice_rate;
+    /* setSource: the voice pointer lands in the descriptor. */
+    memcpy(d + TG_SFX_OFF_VOICE, &(uint32_t){ 0x08800000u }, 4);
+}
+
+static bool fake_play(uint8_t *d) { s_fake_plays++; fake_take_up(d); return true; }
+
+static uint32_t fake_voice_rate(const uint8_t *d)
+{
+    uint32_t v; memcpy(&v, d + TG_SFX_OFF_VOICE, 4);
+    return v ? s_fake_voice[0x0C / 4] : 0;
+}
+
+static void fake_voice_set_frames(const uint8_t *d, uint32_t frames)
+{
+    (void)d; s_fake_voice[0x48 / 4] = frames;
+}
+
+static uint32_t fake_now_ms(void) { return s_fake_ms; }
+
+static const tg_audq_ops k_fake_ops = {
+    fake_ctor, fake_set_next, fake_play, fake_voice_rate,
+    fake_voice_set_frames, fake_now_ms,
+};
+
+/* The audio task, run forward `ms`: buffers end, chains are followed. */
+static void fake_advance(uint32_t ms)
+{
+    s_fake_ms += ms;
+    while (s_fake_cur) {
+        uint32_t len; memcpy(&len, s_fake_cur + TG_SFX_OFF_BUF_LEN, 4);
+        uint32_t block_ms = (len / 4u) * 1000u / 22050u;
+
+        if (s_fake_ms - s_fake_cur_start < block_ms) break;
+        s_fake_cur[TG_SFX_OFF_PLAYING] = 0;
+        {
+            uint8_t *next = fake_next_of(s_fake_cur);
+            uint32_t start = s_fake_cur_start + block_ms;
+
+            s_fake_cur = NULL;
+            if (next) { fake_take_up(next); s_fake_cur_start = start; }
+        }
+    }
+}
+
+static void fake_reset(void)
+{
+    memset(s_links, 0, sizeof s_links);
+    s_fake_ms = 1000; s_fake_cur = NULL; s_fake_plays = 0;
+    s_fake_voice_rate = 22050;
+}
+
+static void push_const(tg_audq *q, unsigned frames, int16_t v)
+{
+    static int16_t buf[512 * 2];
+
+    while (frames) {
+        unsigned n = frames < 512 ? frames : 512;
+
+        for (unsigned i = 0; i < n * 2; i++) buf[i] = v;
+        tg_audq_push(q, buf, n);
+        frames -= n;
+    }
+}
+
+static void test_audq(void)
+{
+    static int16_t pool[TG_AUDQ_POOL_SAMPLES];
+    static tg_audq q;
+    const unsigned S = TG_AUDQ_SLOT_FRAMES;
+
+    printf("audio queue:\n");
+
+    fake_reset();
+    tg_audq_init(&q, &k_fake_ops, pool, 0x4000);
+
+    ok("a slot is a multiple of 441 frames",  S % 441 == 0);
+    ok("empty, it wants the whole target",
+       tg_audq_frames_wanted(&q) == (int)((TG_AUDQ_TARGET_LEAD + 1) * S));
+
+    /* The first block goes out on a fresh voice; the second is only linked. */
+    push_const(&q, S - 1, 1000);
+    ok("nothing is handed over before a slot is full", s_fake_plays == 0 && q.qn == 0);
+    push_const(&q, 1, 1000);
+    ok("a full slot is sealed and played",            s_fake_plays == 1 && q.qn == 1);
+    ok("the voice's counter was corrected",           s_fake_voice[0x48 / 4] == S);
+    ok("the mixer's rate was learned",                q.out_rate == 22050);
+    push_const(&q, S, 1000);
+    ok("the next block is chained, not played",
+       s_fake_plays == 1 && q.qn == 2 && fake_next_of(q.slot[q.q[0]].desc) == q.slot[q.q[1]].desc);
+    ok("its duration is stated exactly",
+       *(uint32_t *)(q.slot[q.q[1]].desc + TG_SFX_OFF_DURATION) == 60);
+    ok("the first went out with none",                q.zero_duration_joins == 1);
+
+    /* Queued frames follow the clock. */
+    fake_advance(30);
+    {
+        unsigned n = tg_audq_queued_frames(&q);
+        ok("queued frames subtract what has played", n > S && n < 2 * S);
+    }
+
+    /* Reclaim is FIFO and waits to have seen the flag. */
+    tg_audq_tick(&q);
+    ok("a sounding block is not reclaimed",           q.qn == 2 && q.slot[q.q[0]].seen_playing);
+    fake_advance(31);                     /* the first block ends at 60 ms */
+    tg_audq_tick(&q);
+    ok("a finished block is reclaimed and the next sounds",
+       q.qn == 1 && q.slot[q.q[0]].desc[TG_SFX_OFF_PLAYING] == 1);
+
+    /* Filling to the target stops the emulator being asked for more. */
+    while (tg_audq_frames_wanted(&q) > 0) push_const(&q, 100, 500);
+    ok("at the target it wants nothing",              tg_audq_frames_wanted(&q) <= 0);
+    ok("never more than the slots can hold",          q.dropped_frames == 0);
+
+    /* Pause: the chain is broken, the blocks behind the head are silent,
+       the silent block loops itself. */
+    {
+        uint8_t *head = q.slot[q.q[0]].desc;
+        uint8_t *second = q.qn > 1 ? q.slot[q.q[1]].desc : NULL;
+        int16_t *second_pcm = q.qn > 1 ? q.slot[q.q[1]].pcm : NULL;
+        unsigned plays = s_fake_plays;
+
+        tg_audq_pause(&q);
+        ok("pause breaks the chain",                  fake_next_of(head) == NULL);
+        ok("pause silences the blocks behind the head",
+           second && second_pcm[100] == 0 && fake_next_of(second) == NULL);
+        ok("the quiet block is chained to itself",    fake_next_of(q.quiet.desc) == q.quiet.desc);
+        ok("and started on its own voice",            s_fake_plays == plays + 1 && q.quiet_armed);
+        ok("paused, it wants nothing",                tg_audq_frames_wanted(&q) == 0);
+        ok("paused, pushes are dropped silently",     (push_const(&q, 10, 1), q.build < 0));
+    }
+
+    /* Resume: the next block fades in and is chained from the silence. */
+    tg_audq_resume(&q);
+    fake_advance(20);
+    tg_audq_tick(&q);
+    {
+        unsigned plays = s_fake_plays;
+
+        push_const(&q, S, 8000);
+        ok("resume chains from the silence, no new voice",
+           s_fake_plays == plays && fake_next_of(q.quiet.desc) == q.slot[q.q[0]].desc);
+        ok("the first block after a resume fades in",
+           q.slot[q.q[0]].pcm[0] < q.slot[q.q[0]].pcm[2 * 800] &&
+           q.slot[q.q[0]].pcm[2 * (S - 1)] == 8000);
+    }
+
+    /* Starvation: a long gap means the OS took the mixer; start over. */
+    fake_advance(5000);
+    tg_audq_tick(&q);
+    ok("a long gap drops the queue and counts a restart", q.qn == 0 && q.restarts == 1);
+
+    /* Duration exactness at other mixer rates. */
+    q.out_rate = 44100; q.duration_bad = false;
+    ok("exact at 44100",     tg_audq_duration_ms(&q, S) == 30);
+    q.out_rate = 48000;
+    ok("not stated at 48000", tg_audq_duration_ms(&q, S) == 0);
+    ok("the quiet block is exact where the slots are",
+       (q.out_rate = 22050, tg_audq_duration_ms(&q, TG_AUDQ_QUIET_FRAMES) == 320));
+
+    /* No free slot: frames are dropped and counted, never blocked on. */
+    fake_reset();
+    tg_audq_init(&q, &k_fake_ops, pool, 0x4000);
+    push_const(&q, S * (TG_AUDQ_SLOTS + 1), 1);
+    ok("pushing past the slots drops and counts", q.dropped_frames > 0 && q.qn == TG_AUDQ_SLOTS);
+}
+
 int main(void)
 {
     test_header();
@@ -864,6 +1072,7 @@ int main(void)
     test_text();
     test_pad();
     test_util();
+    test_audq();
 
     printf(fails ? "\n%d FAILED\n" : "\nall passed\n", fails);
     return fails != 0;
