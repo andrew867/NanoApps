@@ -1,0 +1,14 @@
+Vendored from NanoApps at commit 981465f on 2026-09-17.
+Refresh with tools/sync-n31-shims.sh --apply; do not edit here.
+
+drmfb.c          <- apps/n31launcher/drmfb.c
+drmfb.h          <- apps/n31launcher/drmfb.h
+fbcon.c          <- apps/n31launcher/fbcon.c
+fbcon.h          <- apps/n31launcher/fbcon.h
+touch.c          <- apps/n31launcher/touch.c
+touch.h          <- apps/n31launcher/touch.h
+fbrefresh.h      <- apps/n31launcher/fbrefresh.h
+build_stamp.c    <- apps/build_stamp.c
+build_stamp.h    <- apps/build_stamp.h
+lvgl-mirror.mk   <- apps/lvgl-mirror.mk
+lv_conf_base.h   <- sdk/lv_conf.h
