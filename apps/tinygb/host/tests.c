@@ -15,6 +15,8 @@
 #include "../platform/tg_audio.h"
 #include "../platform/tg_audq.h"
 #include "../platform/tg_pad.h"
+#include "../platform/tg_settings.h"
+#include "../ui/tg_menu_raw.h"
 #include "../platform/tg_palette.h"
 #include "../platform/tg_scale.h"
 #include "../platform/tg_text.h"
@@ -1058,6 +1060,162 @@ static void test_audq(void)
     ok("pushing past the slots drops and counts", q.dropped_frames > 0 && q.qn == TG_AUDQ_SLOTS);
 }
 
+/* ---- settings ------------------------------------------------------------- */
+
+static void test_settings(void)
+{
+    tg_settings s;
+    char buf[256];
+
+    printf("settings:\n");
+
+    tg_settings_defaults(&s, true);
+    ok("defaults: DMG, smooth, no overlay",
+       strcmp(s.palette, "DMG") == 0 && s.smooth && s.tilt && !s.overlay && !s.last_rom[0]);
+
+    tg_strlcpy(s.palette, "Ink", sizeof s.palette);
+    s.smooth = false; s.overlay = true;
+    tg_strlcpy(s.last_rom, "Tetris (World).gb", sizeof s.last_rom);
+    tg_settings_format(&s, buf, sizeof buf);
+    ok("formats as key=value lines", strstr(buf, "palette=Ink\n") && strstr(buf, "smooth=0\n") &&
+                                     strstr(buf, "last_rom=Tetris (World).gb\n"));
+
+    tg_settings_defaults(&s, false);
+    ok("round trip", tg_settings_parse(&s, buf, strlen(buf)) == 5 &&
+                     strcmp(s.palette, "Ink") == 0 && !s.smooth && s.tilt && s.overlay &&
+                     strcmp(s.last_rom, "Tetris (World).gb") == 0);
+
+    tg_settings_defaults(&s, false);
+    {
+        const char *odd = "colour=blue\r\npalette=Sepia\r\nsmooth=yes\r\n\r\ntilt=true\n";
+
+        ok("unknown keys ignored, CRLF tolerated, misspelt palette is the default",
+           tg_settings_parse(&s, odd, strlen(odd)) == 3 &&
+           strcmp(s.palette, "DMG") == 0 && s.smooth && s.tilt);
+    }
+}
+
+/* ---- the menu, tapped on ---------------------------------------------------- */
+
+static int menu_tap(tg_menu_raw *m, const tg_surface *fb, int x, int y, uint32_t *now)
+{
+    int a;
+
+    tg_menu_raw_tick(m, fb, x, y, true, 0, *now); *now += 16;
+    a = tg_menu_raw_tick(m, fb, x, y, false, 0, *now); *now += 16;
+    return a;
+}
+
+/* Open a page and let one idle tick pass. The menu assumes the finger that
+   opened it (the pill) and any held key are still down when it opens, so
+   nothing counts until they have been seen up once. */
+static void menu_open_idle(tg_menu_raw *m, const tg_surface *fb, bool pause, uint32_t *now)
+{
+    tg_menu_raw_open(m, pause);
+    tg_menu_raw_tick(m, fb, 0, 0, false, 0, *now); *now += 16;
+}
+
+static void test_menu_raw(void)
+{
+    static uint32_t px[240 * 432];
+    static char *names[3] = { "Tetris (World).gb", "Zelda.gb", "big.gbc" };
+    tg_surface fb = { px, 240, 432, 240, 0 };
+    tg_menu_theme th = { 0x000000u, 0x111111u, 0xEEEEEEu, 0x888888u, 0x7BAB3Au, 0x000000u };
+    tg_rom_list lib = { "/roms", names, 3, 0 };
+    tg_menu_state st;
+    tg_menu_raw m;
+    uint32_t now = 1000;
+    int a;
+
+    printf("menu:\n");
+
+    memset(&st, 0, sizeof st);
+    st.smooth = true;
+    tg_menu_raw_init(&m, &st, &th);
+    tg_menu_raw_set_library(&m, &lib, true);
+    tg_menu_raw_open(&m, false);
+    tg_menu_raw_tick(&m, &fb, 0, 0, false, 0, now);
+    ok("opens on the shelf",                     tg_menu_raw_page(&m) == TG_MR_PAGE_ROMS);
+    ok("the title bar was painted",               px[10 * 240 + 10] == 0x111111u);
+
+    /* Rows are 48 px from y = 44: row 1 is y 92..139. */
+    a = menu_tap(&m, &fb, 120, 100, &now);
+    ok("a tap on a cartridge plays it",           a == TG_MENU_PLAY);
+    ok("with its path and a clean title",         strcmp(st.rom_path, "/roms/Zelda.gb") == 0 &&
+                                                  strcmp(st.rom_title, "Zelda") == 0);
+
+    /* A press that drags is a scroll, not a tap. */
+    tg_menu_raw_tick(&m, &fb, 120, 100, true, 0, now); now += 16;
+    tg_menu_raw_tick(&m, &fb, 120, 60, true, 0, now);  now += 16;
+    a = tg_menu_raw_tick(&m, &fb, 120, 60, false, 0, now); now += 16;
+    ok("a drag does not choose",                  a == TG_MENU_RAW_NONE);
+
+    /* Row 3 is Settings (three cartridges, no Resume row). */
+    a = menu_tap(&m, &fb, 120, 44 + 3 * 48 + 10, &now);
+    ok("Settings opens a page",                   a == TG_MENU_RAW_NONE && tg_menu_raw_page(&m) == TG_MR_PAGE_SETTINGS);
+    a = menu_tap(&m, &fb, 120, 44 + 1 * 48 + 10, &now);
+    ok("a toggle flips and reports",              a == TG_MENU_RAW_SETTINGS_CHANGED && !st.smooth);
+    a = menu_tap(&m, &fb, 120, 44 + 10, &now);
+    ok("Palette opens its list",                  tg_menu_raw_page(&m) == TG_MR_PAGE_PALETTE);
+    a = menu_tap(&m, &fb, 120, 44 + 4 * 48 + 10, &now);
+    ok("choosing a palette reports and goes back", a == TG_MENU_RAW_SETTINGS_CHANGED && st.palette == 4 &&
+                                                  tg_menu_raw_page(&m) == TG_MR_PAGE_SETTINGS);
+
+    /* The chevron, and the edge swipe, both go back. */
+    a = menu_tap(&m, &fb, 14, 22, &now);
+    ok("the chevron goes back",                   tg_menu_raw_page(&m) == TG_MR_PAGE_ROMS);
+    a = menu_tap(&m, &fb, 120, 44 + 4 * 48 + 10, &now);
+    ok("About opens",                             tg_menu_raw_page(&m) == TG_MR_PAGE_ABOUT);
+    tg_menu_raw_tick(&m, &fb, 5, 200, true, 0, now);  now += 16;
+    tg_menu_raw_tick(&m, &fb, 40, 202, true, 0, now); now += 16;
+    a = tg_menu_raw_tick(&m, &fb, 90, 203, false, 0, now); now += 16;
+    ok("a swipe in from the left edge goes back", tg_menu_raw_page(&m) == TG_MR_PAGE_ROMS);
+
+    /* The pause page. */
+    st.have_game = true; st.can_state = true; st.have_state = false;
+    tg_strlcpy(st.rom_title, "Zelda", sizeof st.rom_title);
+    menu_open_idle(&m, &fb, true, &now);
+    ok("pause page without a state has five rows", tg_menu_raw_page(&m) == TG_MR_PAGE_PAUSE);
+    a = menu_tap(&m, &fb, 120, 44 + 2 * 48 + 10, &now);
+    ok("without a state, row 2 is Restart",       a == TG_MENU_RESET);
+    st.have_state = true;
+    menu_open_idle(&m, &fb, true, &now);
+    a = menu_tap(&m, &fb, 120, 44 + 2 * 48 + 10, &now);
+    ok("with a state, row 2 is Load state",       a == TG_MENU_LOAD_STATE);
+    a = menu_tap(&m, &fb, 14, 22, &now);
+    ok("back from the pause page is Resume",      a == TG_MENU_RESUME);
+    menu_open_idle(&m, &fb, true, &now);
+    a = menu_tap(&m, &fb, 120, 44 + 5 * 48 + 10, &now);
+    ok("the last row leaves for the shelf",       a == TG_MENU_RAW_CHOOSE);
+
+    /* The finger that opened the menu is not a tap on it. */
+    tg_menu_raw_open(&m, true);
+    a = menu_tap(&m, &fb, 120, 44 + 10, &now);
+    ok("a press already down when it opens does nothing", a == TG_MENU_RAW_NONE);
+
+    /* Keys move the highlight, with repeat. The shelf keeps its highlight
+       across visits (it is on About from the taps above), so start it over. */
+    st.have_game = false;
+    menu_open_idle(&m, &fb, false, &now);
+    ok("the shelf keeps its highlight between visits", m.sel[TG_MR_PAGE_ROMS] == 4);
+    m.sel[TG_MR_PAGE_ROMS] = 0;
+    tg_menu_raw_tick(&m, &fb, 0, 0, false, 2, now); now += 16;
+    ok("Vol Down moves the highlight",            m.sel[TG_MR_PAGE_ROMS] == 1);
+    tg_menu_raw_tick(&m, &fb, 0, 0, false, 2, now); now += 16;
+    ok("held, it does not repeat at once",        m.sel[TG_MR_PAGE_ROMS] == 1);
+    now += 400;
+    tg_menu_raw_tick(&m, &fb, 0, 0, false, 2, now); now += 16;
+    ok("...but does after the delay",             m.sel[TG_MR_PAGE_ROMS] == 2);
+
+    /* The Resume row appears only when there is a state to come back to. */
+    st.have_state = true; tg_strlcpy(st.rom_path, "/roms/Zelda.gb", sizeof st.rom_path);
+    menu_open_idle(&m, &fb, false, &now);
+    a = menu_tap(&m, &fb, 120, 44 + 10, &now);
+    ok("the first row resumes the last game",     a == TG_MENU_RAW_RESUME_STATE);
+    a = menu_tap(&m, &fb, 120, 44 + 48 + 10, &now);
+    ok("and the cartridges follow it",            a == TG_MENU_PLAY && strcmp(st.rom_title, "Tetris (World)") == 0);
+}
+
 int main(void)
 {
     test_header();
@@ -1073,6 +1231,8 @@ int main(void)
     test_pad();
     test_util();
     test_audq();
+    test_settings();
+    test_menu_raw();
 
     printf(fails ? "\n%d FAILED\n" : "\nall passed\n", fails);
     return fails != 0;

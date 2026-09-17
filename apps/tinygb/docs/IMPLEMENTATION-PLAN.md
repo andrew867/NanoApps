@@ -115,20 +115,21 @@ Deferred to the device: the tone recording (AC-AUD-001), five minutes of Tetris 
 
 **Completion**: as above, less the device checks.
 
-## Phase 5: RetailOS menu, saves, settings, polish
+## Phase 5: RetailOS menu, saves, settings, polish (code done 2026-09-17; device checks deferred)
 
 **Goal**: the app is complete for a player.
 
-Files: `ui/tg_menu_raw.c` (new), `platform/tg_settings.c` (new, shared with N31 later), `platform/tg_fs_hb.c` (saves, states), `retailos/tinygb.c` (modes), `linux/tg_linux.c` (adopt `tg_settings` so both targets read the same file format).
+Done, without a device:
+1. `ui/tg_menu_raw.c`: the menu as a tick-driven mode in the nano's own shape (REQ-ROS-031, -032, -035): title bar with a back chevron, 48 px rows with chevrons, toggles and check marks, theme colours from NanoApps' prefs; tap with pressed highlight, drag to scroll, edge swipe or chevron to go back, Vol Up/Down move a highlight with 380/90 ms repeat. Pages: the shelf (with a Resume row for the last game when its state exists, then Settings and About), Pause (Resume, Save state, Load state when there is one, Restart, Settings, Choose another game), Settings (Palette, Smooth scaling, Tilt d-pad, Show counters, About), Palette, About (build stamp, core, the last log lines). Portable: nothing in it touches the OS, and 21 host checks tap through it.
+2. `platform/tg_settings.c`: `key=value` file, defaults, tolerant parser, round trip tested; `/Apps/Data/TinyGB/settings.txt` on RetailOS. `last_rom` recorded when a cartridge starts.
+3. `tinygb.c`: the pill opens the pause page (audio paused in place, battery save flushed, a state written per REQ-DATA-023); Resume repaints and resumes the chain; save and load states through a 160 KB static buffer at `<rom>.st0`; settings changes re-init the scaler and the tilt live; the idle-reset poke every 10 s while playing (the raw runtime's equivalent of `hb_wake_lock`); an fps / queue / underrun overlay in the strip beside the pill behind the Show counters toggle; the build stamp on About via `linux/shim/build_stamp.c` compiled into the RetailOS app with fresh defines every build.
+4. `tg_menu_state` gained `overlay`; the N31 LVGL menu ignores it.
 
-Tasks:
-1. Menu pages and rows per REQ-ROS-031/032; About row with `en_build_version()` (the build stamp mechanism moves into a portable `platform/tg_build.c` and both Makefiles set the defines).
-2. Battery save cadence 2 s; flush on menu; state on pause; Resume in the library.
-3. Settings file; palette/smooth/tilt live changes with full repaint.
-4. Wake-lock poke; empty-library help screen; the "too big" listing state.
-5. Overlay (fps, queue depth, underruns) behind a Settings toggle.
+Not done: the N31 front end still keeps its settings in the LVGL menu's own state rather than `tg_settings` (deferred; low value until the N31 device session).
 
-**Completion**: AC-ROS-004, -005, -007, -008 and AC-DATA-001..005 pass; MAN-ROS-* all Pass.
+Deferred to the device: everything in MAN-ROS-* and MAN-DATA-*; AC-ROS-004, -005, -007, -008; AC-DATA-001..005.
+
+**Completion**: as above, less the device checks.
 
 ## Phase 6: Hardening and release
 

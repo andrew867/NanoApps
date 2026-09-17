@@ -29,10 +29,15 @@ SRCS        := tinygb.c \
                platform/tg_scale.c platform/tg_audio_clock.c platform/tg_tilt.c \
                platform/tg_palette.c platform/tg_pad.c platform/tg_text.c \
                platform/tg_font_ui.c platform/tg_font_small.c platform/tg_util.c \
-               platform/tg_save.c platform/tg_audq.c \
+               platform/tg_save.c platform/tg_audq.c platform/tg_settings.c \
                platform/tg_sys_hb.c platform/tg_roms_hb.c platform/tg_input_hb.c \
-               platform/tg_audio_hb.c
+               platform/tg_audio_hb.c ui/tg_menu_raw.c linux/shim/build_stamp.c
 RAW_SURFACE := 1
+
+# Which build this is, on the About page. hb_app.mk compiles everything in
+# one invocation, so the stamp is fresh on every build by construction.
+BUILD_STAMP := $(shell date -u +%Y%m%d.%H%M)
+BUILD_GIT   := $(shell git rev-parse --short=7 HEAD 2>/dev/null || echo nogit)
 
 # The part is a Cortex-A5 with VFPv4 and no NEON - read off the device under
 # N31; the SDK's cortex-a8/neon is a claim the silicon does not back. hb_app.mk
@@ -57,6 +62,7 @@ TONE_FLAG := $(if $(filter 1,$(TG_TONE)),-DTG_TONE=1,)
 EXTRA_CFLAGS := -O2 \
                 -DAUDIO_SAMPLE_RATE=22050 -DMINIGB_APU_AUDIO_FORMAT_S16SYS=1 \
                 -DTG_SAVE_CHECK_MS=2000 $(TONE_FLAG) \
+                -DEN_BUILD_STAMP='"$(BUILD_STAMP)"' -DEN_BUILD_GIT='"$(BUILD_GIT)"' \
                 -Wno-sign-compare -Wno-implicit-fallthrough \
                 -Wno-unused-but-set-variable -Wno-type-limits
 

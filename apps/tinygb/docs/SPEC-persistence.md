@@ -48,7 +48,7 @@ Define what TinyGB writes to disk, where, in what format, and when, on both devi
 
 ### Settings
 
-- **REQ-DATA-030**: Settings are one text file, `key=value` per line, keys `palette` (name), `smooth` (0/1), `tilt` (0/1), `last_rom` (filename), `volume` (RetailOS, 0..100). Location: N31 `$XDG_CONFIG_HOME/tinygb/settings` else `~/.config/tinygb/settings`; RetailOS `/Apps/Data/TinyGB/settings.txt`.
+- **REQ-DATA-030**: Settings are one text file, `key=value` per line, keys `palette` (name), `smooth` (0/1), `tilt` (0/1), `overlay` (0/1), `last_rom` (filename). Location: RetailOS `/Apps/Data/TinyGB/settings.txt`; N31 `$XDG_CONFIG_HOME/tinygb/settings` else `~/.config/tinygb/settings` (not yet adopted there). A volume setting is deferred: the descriptor volume is a constant until the device says otherwise.
 - **REQ-DATA-031**: Unknown keys are ignored; an unknown palette name selects palette 0; a missing file means defaults (palette 0, smooth 1, tilt: N31 1, RetailOS 0). The parser is portable and unit-tested.
 - **REQ-DATA-032**: Settings are written on every change, whole-file, and never more than once per tick.
 
