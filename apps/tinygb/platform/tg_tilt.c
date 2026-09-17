@@ -4,8 +4,8 @@
 
 #include "tg_tilt.h"
 
-#include <stdio.h>
 #include "../core/tg_core.h"
+#include "tg_util.h"
 
 void tg_tilt_init(tg_tilt *t, int min, int max, int on_pct, int off_pct)
 {
@@ -87,12 +87,22 @@ static const char *axis_name(int a)
 const char *tg_tilt_describe(const tg_tilt *t)
 {
     static char buf[96];
+    char num[24];
 
-    snprintf(buf, sizeof buf,
-             "lean %s%s  tip %s%s  (centre %d,%d,%d)",
-             t->roll_sign < 0 ? "-" : "+", axis_name(t->roll_axis),
-             t->pitch_sign < 0 ? "-" : "+", axis_name(t->pitch_axis),
-             t->cx, t->cy, t->cz);
+    /* Assembled by hand: this also runs where there is no snprintf. */
+    tg_strlcpy(buf, "lean ", sizeof buf);
+    tg_strlcat(buf, t->roll_sign < 0 ? "-" : "+", sizeof buf);
+    tg_strlcat(buf, axis_name(t->roll_axis), sizeof buf);
+    tg_strlcat(buf, "  tip ", sizeof buf);
+    tg_strlcat(buf, t->pitch_sign < 0 ? "-" : "+", sizeof buf);
+    tg_strlcat(buf, axis_name(t->pitch_axis), sizeof buf);
+    tg_strlcat(buf, "  (centre ", sizeof buf);
+    tg_strlcat(buf, tg_itoa(t->cx, num, sizeof num), sizeof buf);
+    tg_strlcat(buf, ",", sizeof buf);
+    tg_strlcat(buf, tg_itoa(t->cy, num, sizeof num), sizeof buf);
+    tg_strlcat(buf, ",", sizeof buf);
+    tg_strlcat(buf, tg_itoa(t->cz, num, sizeof num), sizeof buf);
+    tg_strlcat(buf, ")", sizeof buf);
     return buf;
 }
 

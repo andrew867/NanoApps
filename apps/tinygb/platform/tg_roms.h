@@ -29,6 +29,7 @@ typedef struct {
     char   dir[512];    /* the library directory, no trailing slash */
     char **name;        /* file names within it, sorted, case-insensitive */
     unsigned n;
+    unsigned skipped;   /* found but beyond what this platform can list */
 } tg_rom_list;
 
 /*

@@ -46,6 +46,9 @@
 #include "../platform/tg_audio.h"
 #include "../platform/tg_scale.h"
 
+/* The framebuffer as the pad sees it: pixels and a pitch, nothing about DRM. */
+static tg_surface s_fbs;
+
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
@@ -641,7 +644,7 @@ static enum tg_menu_action play_once(int argc, char **argv, tg_menu_state *st,
              * unless something changed.
              */
             if (tg_input_sources(input) & TG_SRC_TOUCH)
-                tg_pad_draw(&fb, held, false);
+                tg_pad_draw(&s_fbs, held, false);
 
             if (tg_input_take_quit(input)) {
                 /*
@@ -691,6 +694,8 @@ static enum tg_menu_action play_once(int argc, char **argv, tg_menu_state *st,
                        it - a stale one draws into the old mapping. */
                     tg_fb_layout(&fb, &ox, &oy);
                     dst = tg_fb_at(&fb, ox, oy);
+                    s_fbs = (tg_surface){ fb.pixels, fb.w, fb.h, fb.stride_px, 0 };
+        s_fbs = (tg_surface){ fb.pixels, fb.w, fb.h, fb.stride_px, 0 };
                 }
 
                 /* Back into the game: the menu may have changed how it is

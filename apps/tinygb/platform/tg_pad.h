@@ -20,6 +20,9 @@
  * Diagonals come free from the shape of the d-pad: it is hit-tested as a
  * three-by-three grid rather than as four arms, so a thumb in a corner cell
  * presses two directions exactly as a real cross does.
+ *
+ * Draws into a tg_surface, so it is the same pad on both operating systems
+ * and it can be drawn into an array on the host and checked there.
  */
 
 #ifndef TINYGB_PAD_H
@@ -28,10 +31,19 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "tg_fb.h"
+#include "tg_surface.h"
 
 /*
- * Which buttons a contact at (x, y) is pressing, as TG_* bits from tg_core.h.
+ * One control that is not a Game Boy button: the menu pill, between the
+ * picture and the cross. On RetailOS Home leaves the app outright, so the
+ * pause menu needs a place on the screen; on N31 it is a second way in.
+ * Above the eight joypad bits so `hit & 0xFF` is still the joypad.
+ */
+#define TG_PAD_MENU (1u << 8)
+
+/*
+ * Which controls a contact at (x, y) is pressing: TG_* bits from tg_core.h,
+ * plus TG_PAD_MENU.
  *
  * Zero for a touch on the picture, in the gaps between buttons, or anywhere
  * else. Panel coordinates, which is what the driver reports.
@@ -46,7 +58,7 @@ unsigned tg_pad_hit(int x, int y);
  * bottom of the screen - clearing the framebuffer, or coming back from the
  * menu - because this cannot see that happen.
  */
-void tg_pad_draw(tg_fb *fb, unsigned held, bool force);
+void tg_pad_draw(const tg_surface *s, unsigned held, bool force);
 
 /* Forget what was last drawn, so the next draw paints everything. */
 void tg_pad_invalidate(void);

@@ -192,6 +192,8 @@ SRCS := ../core/tg_core.c \
         ../ui/tg_menu.c \
         ../linux/shim/build_stamp.c \
         ../platform/tg_save.c \
+        ../platform/tg_util.c \
+        ../platform/tg_sys_posix.c \
         ../linux/shim/fbcon.c \
         ../linux/shim/touch.c \
         ../linux/shim/drmfb.c \
@@ -268,6 +270,8 @@ $(BUILD)/tg_pad.o:  ../platform/tg_pad.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP 
 $(BUILD)/tg_tilt.o: ../platform/tg_tilt.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/tg_roms.o: ../platform/tg_roms.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/tg_save.o: ../platform/tg_save.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/tg_util.o: ../platform/tg_util.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/tg_sys_posix.o: ../platform/tg_sys_posix.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/fbcon.o:       ../linux/shim/fbcon.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/touch.o:       ../linux/shim/touch.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/drmfb.o:       ../linux/shim/drmfb.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<

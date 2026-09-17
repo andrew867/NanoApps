@@ -5,7 +5,7 @@
 	<key>CFBundleName</key>		<string>TinyGB</string>
 	<key>CFBundleExecutable</key>	<string>tinygb</string>
 	<key>HBAppKind</key>			<integer>1</integer>
-	<key>HBIconGlyph</key>		<string>paintbrush</string>
-	<key>HBIconColor</key>		<string>#c468ee</string>
+	<key>HBIconGlyph</key>		<string>gamepad</string>
+	<key>HBIconColor</key>		<string>#7bab3a</string>
 </dict>
 </plist>
