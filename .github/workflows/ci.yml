@@ -1,0 +1,48 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update -q && sudo apt-get install -y -q gcc make python3-pil
+      - name: unit tests
+        run: make test
+      - name: vendor hashes
+        run: make check-vendor
+      - name: seam
+        run: make check-seam
+      - name: test ROMs
+        run: bash tools/fetch-testroms.sh
+      - name: gate
+        run: make gate
+      - name: keep the acid2 frame
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dmg-acid2
+          path: host/build/dmg-acid2.ppm
+          if-no-files-found: ignore
+
+  # The RetailOS app, built exactly the way NanoApps builds it: this repository
+  # checked out as apps/tinygb inside a NanoApps tree. Proves the .hbapp links,
+  # that nothing outside the freestanding SDK is referenced, and that the size
+  # stays under the ceiling.
+  retailos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: andrew867/NanoApps
+          path: NanoApps
+      - uses: actions/checkout@v4
+        with:
+          path: NanoApps/apps/tinygb
+      - name: deps
+        run: sudo apt-get update -q && sudo apt-get install -y -q gcc-arm-none-eabi make python3-pyelftools
+      - name: build
+        run: make -C NanoApps/apps/tinygb all
+      - name: size
+        run: make -C NanoApps/apps/tinygb check-size
