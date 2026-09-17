@@ -12,7 +12,7 @@ TinyGB puts a Game Boy on the nano's 240 x 432 screen at exactly one-and-a-half 
 |---|---|
 | Core, scaler, audio clock, tilt, save logic | done; unit tests and the Blargg / dmg-acid2 gate pass |
 | N31 Linux front end | done and playable: DRM or fbdev picture, alsa-lib sound, keys + tilt + touch, LVGL menu, saves, states |
-| RetailOS (NanoApps) front end | library, picture, multitouch pad, volume buttons, battery saves: built and unit-tested, not yet run on a device. Sound (Phase 4) and the menu pages (Phase 5) to come |
+| RetailOS (NanoApps) front end | library, picture, multitouch pad, volume buttons, battery saves, and sound through the OS mixer's descriptor chain: built and unit-tested, not yet run on a device. The menu pages (Phase 5) to come |
 | This repository | extracted from the NanoApps fork with history; documented; host tests, the gate, vendor and seam checks, and the RetailOS build run in CI (Phase 1 done) |
 
 ## Who this is for

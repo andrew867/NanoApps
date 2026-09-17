@@ -101,20 +101,19 @@ Tasks:
 
 **Completion**: AC-ROS-006 passes (build-side); AC-ROS-001 and AC-ROS-003 and the five-minute silent Tetris run wait for the device.
 
-## Phase 4: RetailOS audio
+## Phase 4: RetailOS audio (code done 2026-09-17; device checks deferred)
 
 **Goal**: sound, paced correctly, with pause/resume that does not click.
 
-Files: `platform/tg_audio_hb.c` (new), `retailos/tinygb.c` (pacing decision), `host/tests.c` (slot state machine + duration exactness tests with fakes).
+Done, without a device:
+1. `platform/tg_audq.c`: the slot queue per `SPEC-retailos-audio.md`, portable, with every OS action behind `tg_audq_ops`; `platform/tg_audio_hb.c` binds the firmware addresses. 60 ms blocks (1323 frames, a multiple of 441 so the duration field converts exactly), six of them, target lead two; static 63 KB pool; FIFO reclaim on the `+0x64` flag; the duration self-check; starvation restart; pause/resume/stop by in-place silence and a self-chained quiet block.
+2. `tinygb.c`: the queue is initialised once at launch (so a voice left looping silence between cartridges is reused, never doubled); a tick runs 0, 1 or 2 emulated frames by `tg_audq_frames_wanted`; `emit_audio` pulls exactly the audio clock's frames per emulated frame, pads short fills with silence, pushes. `suppress_os_media` re-pauses the Music player at 4 Hz.
+3. `make TG_TONE=1` builds the 440 Hz tone in place of the APU for AC-AUD-001.
+4. `host/tests.c` `test_audq`: a fake audio task (sets the flag, follows the chain, clears it) drives 30 checks: seal at a full block, first block played and its counter corrected, later blocks chained not played, exact duration stated, queued frames follow the clock, FIFO reclaim waits to see the flag, target reached stops the emulator being asked, pause breaks the chain / silences behind the head / self-chains the quiet block / drops pushes, resume chains from the silence with a fade, starvation restarts, duration exactness at 22050 / 44100 / 48000, overflow drops and counts.
 
-Tasks:
-1. Implement the slot queue per `SPEC-retailos-audio.md` with a build-time test-tone generator switch.
-2. Tone first: 60 s of 440 Hz recorded through headphones, checked for gaps (AC-AUD-001).
-3. Switch to `core->audio_pull`; implement the 0/1/2-frames-per-tick decision from queue depth; tune `TG_AUD_SLOT_FRAMES`, `TG_AUD_SLOTS`, `TG_AUD_TARGET_LEAD` on the device; record the numbers (OQ-010).
-4. Pause/resume/stop with the in-place silence; menu pill wiring can be a placeholder tap zone for now.
-5. Media re-pause poll; starvation restart.
+Deferred to the device: the tone recording (AC-AUD-001), five minutes of Tetris (AC-AUD-002, AC-ROS-002), pause clicks (AC-AUD-003), felt latency (AC-AUD-004), and tuning the three constants (OQ-010). The one thing no host test can settle is whether the completion handler keeps up at 60 ms blocks; the tone recording answers it first.
 
-**Completion**: AC-AUD-001..004 and AC-ROS-002 pass.
+**Completion**: as above, less the device checks.
 
 ## Phase 5: RetailOS menu, saves, settings, polish
 

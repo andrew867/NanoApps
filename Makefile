@@ -29,8 +29,9 @@ SRCS        := tinygb.c \
                platform/tg_scale.c platform/tg_audio_clock.c platform/tg_tilt.c \
                platform/tg_palette.c platform/tg_pad.c platform/tg_text.c \
                platform/tg_font_ui.c platform/tg_font_small.c platform/tg_util.c \
-               platform/tg_save.c \
-               platform/tg_sys_hb.c platform/tg_roms_hb.c platform/tg_input_hb.c
+               platform/tg_save.c platform/tg_audq.c \
+               platform/tg_sys_hb.c platform/tg_roms_hb.c platform/tg_input_hb.c \
+               platform/tg_audio_hb.c
 RAW_SURFACE := 1
 
 # The part is a Cortex-A5 with VFPv4 and no NEON - read off the device under
@@ -48,9 +49,14 @@ HB_ARCH_FLAGS := -mcpu=cortex-a5 -mthumb -mfpu=vfpv4
 #
 # There is no exit callback on RetailOS, so the battery save is looked at
 # every two seconds rather than the five Linux can afford.
+#
+# TG_TONE=1 replaces the Game Boy's sound with a 440 Hz tone, for proving the
+# audio path with a recording before the APU is trusted to sound right
+# (docs/SPEC-retailos-audio.md, AC-AUD-001). Never in a build anyone plays.
+TONE_FLAG := $(if $(filter 1,$(TG_TONE)),-DTG_TONE=1,)
 EXTRA_CFLAGS := -O2 \
                 -DAUDIO_SAMPLE_RATE=22050 -DMINIGB_APU_AUDIO_FORMAT_S16SYS=1 \
-                -DTG_SAVE_CHECK_MS=2000 \
+                -DTG_SAVE_CHECK_MS=2000 $(TONE_FLAG) \
                 -Wno-sign-compare -Wno-implicit-fallthrough \
                 -Wno-unused-but-set-variable -Wno-type-limits
 

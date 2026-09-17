@@ -40,7 +40,8 @@ CORE_SRCS := ../core/tg_core.c ../core/tg_peanut.c ../vendor/minigb_apu.c \
              ../platform/tg_roms.c ../platform/tg_palette.c \
              ../platform/tg_util.c ../platform/tg_sys_posix.c \
              ../platform/tg_text.c ../platform/tg_font_ui.c \
-             ../platform/tg_font_small.c ../platform/tg_pad.c
+             ../platform/tg_font_small.c ../platform/tg_pad.c \
+             ../platform/tg_audq.c
 CORE_OBJS := $(addprefix $(BUILD)/,$(notdir $(CORE_SRCS:.c=.o)))
 
 .PHONY: all test gate roms clean
@@ -78,6 +79,9 @@ $(BUILD)/tg_font_small.o: ../platform/tg_font_small.c | $(BUILD)
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
 $(BUILD)/tg_pad.o: ../platform/tg_pad.c | $(BUILD)
+	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+
+$(BUILD)/tg_audq.o: ../platform/tg_audq.c | $(BUILD)
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
 $(BUILD)/tg_save.o: ../platform/tg_save.c | $(BUILD)
