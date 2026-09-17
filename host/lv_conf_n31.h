@@ -17,7 +17,7 @@
 #ifndef TINYGB_LV_CONF_N31_H
 #define TINYGB_LV_CONF_N31_H
 
-#include "../../../sdk/lv_conf.h"
+#include "../linux/shim/lv_conf_base.h"
 
 /* The device build swaps in freestanding replacements for two libc headers.
    musl has the real ones. */
@@ -54,8 +54,8 @@
 #undef  LV_USE_EVDEV
 #define LV_USE_EVDEV            1
 
-/* The SoC is a Cortex-A8 without NEON — the CPU reports vfpv3/vfpv4 and no
-   neon flag — so LVGL's assembly blend paths must stay off. They are already
+/* The SoC is a Cortex-A5 with VFPv4 and no NEON — /proc/cpuinfo says part 0xc05,
+   vfpv4, no neon — so LVGL's assembly blend paths must stay off. They are already
    off in the base config; this is here so nobody turns them on by accident. */
 #undef  LV_USE_DRAW_SW_ASM
 #define LV_USE_DRAW_SW_ASM      LV_DRAW_SW_ASM_NONE

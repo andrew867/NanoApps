@@ -6,7 +6,7 @@
 
 #include "fbrefresh.h"
 #include "tg_scale.h"
-#include "../../n31launcher/fbcon.h"
+#include "../linux/shim/fbcon.h"
 
 #include <fcntl.h>
 #include <linux/fb.h>

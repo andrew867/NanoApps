@@ -41,7 +41,7 @@
 #include "../platform/tg_palette.h"
 #include "../platform/tg_roms.h"
 #include "../ui/tg_menu.h"
-#include "../../build_stamp.h"
+#include "shim/build_stamp.h"
 #include "../platform/tg_save.h"
 #include "../platform/tg_audio.h"
 #include "../platform/tg_scale.h"
@@ -910,7 +910,7 @@ int main(int argc, char **argv)
     }
 
     if (named)
-        return play_once(argc, argv, &st, false) == TG_MENU_QUIT ? 0 : 0;
+        return play_once(argc, argv, &st, false) == TG_MENU_QUIT ? 0 : 2;
 
     if (!tg_menu_init(NULL)) {
         fprintf(stderr, "tinygb: no menu, and no cartridge named\n");

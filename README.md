@@ -68,8 +68,8 @@ Linux or WSL. `make test`/`gate` need gcc and python3 with Pillow; the RetailOS 
 
 ## Current build priorities
 
-1. Phase 2: N31 built from here (vendored launcher shims); re-point the ipod tree's scripts; put the subtree into the NanoApps fork.
-2. Phases 3 to 5: the RetailOS front end. On-screen touch controls and a menu that behaves like the nano's own screens are the bar; picture first, then sound, then menu, saves, and settings.
+1. Phases 3 to 5: the RetailOS front end. On-screen touch controls and a menu that behaves like the nano's own screens are the bar; picture first, then sound, then menu, saves, and settings.
+2. Device session: RetailOS first, then the N31 build from this repository (Phase 2's deferred checks).
 3. Upstream: submit `apps/tinygb` to nfzerox/NanoApps once v0.1 is playable.
 
 ## Known gaps
@@ -77,7 +77,7 @@ Linux or WSL. `make test`/`gate` need gcc and python3 with Pillow; the RetailOS 
 - RetailOS: everything (see status).
 - No Game Boy Color: Peanut-GB has no colour code; that is a second core, deferred.
 - N31: the touch panel does not register on current kernels, so the on-screen pad is not usable there yet; keys and tilt are.
-- `main` in the N31 front end returns 0 even when a cartridge fails to start from the command line (fixed in Phase 2).
+- N31 built from this repository has not yet been run on the device (the byte-exact screen check and a play session are queued behind the RetailOS work).
 
 ## Licence
 

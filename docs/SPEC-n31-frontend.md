@@ -79,8 +79,8 @@ Nothing in this spec is new behaviour. Where the current code has a known defect
 
 ### Known defects carried into the spec
 
-- **REQ-N31-060**: `main` in menu-less mode shall return `play_once`'s result (today `:913` reads `== TG_MENU_QUIT ? 0 : 0`, so error exit 2 never reaches the shell). Fix in Phase 2.
-- **REQ-N31-061**: `lv_conf_n31.h` and `tg_scale.h` shall stop describing the SoC as a Cortex-A8; it is a Cortex-A5 with VFPv4 and no NEON. Comment fix in Phase 2.
+- **REQ-N31-060**: `main` in menu-less mode shall return 2 when `play_once` did not reach `TG_MENU_QUIT` (before Phase 2 the expression read `== TG_MENU_QUIT ? 0 : 0`, so a cartridge that would not start still exited 0). Fixed in Phase 2.
+- **REQ-N31-061**: `lv_conf_n31.h` and `tg_scale.h` shall describe the SoC as what it is: a Cortex-A5 with VFPv4 and no NEON, not a Cortex-A8. Fixed in Phase 2.
 
 ## State and Data
 

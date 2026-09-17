@@ -44,7 +44,7 @@
  * The palette, pre-chewed. Building the sixteen possible blends once per
  * palette change turns the inner loop into two table lookups and a copy, which
  * matters: this runs 51840 times a frame, sixty times a second, on a
- * single-issue Cortex-A8 with no NEON.
+ * single-issue Cortex-A5 with no NEON.
  */
 typedef struct {
     uint32_t solid[4];    /* the four shades, as 0x00RRGGBB */

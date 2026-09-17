@@ -109,7 +109,7 @@ CFLAGS := $(TG_OPT) -g0 -std=gnu11 $(ARCH_FLAGS) $(TG_EXTRA) \
           -Wall -Wextra -Wno-unused-parameter \
           -DAUDIO_SAMPLE_RATE=$(TG_AUDIO_RATE) \
           -DMINIGB_APU_AUDIO_FORMAT_S16SYS=1 \
-          -I../../n31launcher -I$(LIBDRM)/include
+          -I../linux/shim -I$(LIBDRM)/include
 LDFLAGS := -static -Wl,--gc-sections
 LDLIBS  := $(LIBDRM)/lib/libdrm.a -lm
 
@@ -137,8 +137,11 @@ VENDOR_CFLAGS := -Wno-sign-compare -Wno-implicit-fallthrough \
 # hash, so changing lv_conf selects different objects rather than rebuilding
 # these.
 #
-LVGL     ?= ../../../lvgl
-include ../../lvgl-mirror.mk
+# The pinned LVGL checkout NanoApps' start makes: at ../../../lvgl when this
+# repository is apps/tinygb inside NanoApps, at ../../NanoApps/lvgl when it is
+# a checkout beside one. Set LVGL= for anything else.
+LVGL     ?= $(or $(firstword $(wildcard ../../../lvgl ../../NanoApps/lvgl)),../../../lvgl)
+include ../linux/shim/lvgl-mirror.mk
 
 LV_CONF    := lv_conf_n31.h
 # The float ABI is part of the key, not just the config: objects of the
@@ -187,11 +190,11 @@ SRCS := ../core/tg_core.c \
         ../platform/tg_roms.c \
         ../platform/tg_palette.c \
         ../ui/tg_menu.c \
-        ../../build_stamp.c \
+        ../linux/shim/build_stamp.c \
         ../platform/tg_save.c \
-        ../../n31launcher/fbcon.c \
-        ../../n31launcher/touch.c \
-        ../../n31launcher/drmfb.c \
+        ../linux/shim/fbcon.c \
+        ../linux/shim/touch.c \
+        ../linux/shim/drmfb.c \
         ../linux/tg_linux.c
 
 # tinyalsa is eight files with no dependencies, which is exactly why it is used
@@ -265,9 +268,9 @@ $(BUILD)/tg_pad.o:  ../platform/tg_pad.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP 
 $(BUILD)/tg_tilt.o: ../platform/tg_tilt.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/tg_roms.o: ../platform/tg_roms.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/tg_save.o: ../platform/tg_save.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
-$(BUILD)/fbcon.o:       ../../n31launcher/fbcon.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
-$(BUILD)/touch.o:       ../../n31launcher/touch.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
-$(BUILD)/drmfb.o:       ../../n31launcher/drmfb.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/fbcon.o:       ../linux/shim/fbcon.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/touch.o:       ../linux/shim/touch.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/drmfb.o:       ../linux/shim/drmfb.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 $(BUILD)/tg_linux.o:    ../linux/tg_linux.c        | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
 $(LV_CACHE)/%.o: $(LVGL_SRC)/%.c
@@ -303,7 +306,7 @@ $(BUILD)/tg_menu.o: ../ui/tg_menu.c | $(BUILD)
 #
 # This way a build that really has nothing to do still has nothing to do, and
 # the stamp moves whenever any part of the binary did.
-$(BUILD)/build_stamp.o: ../../build_stamp.c \
+$(BUILD)/build_stamp.o: ../linux/shim/build_stamp.c \
                         $(filter-out $(BUILD)/build_stamp.o,$(OBJS)) | $(BUILD)
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 

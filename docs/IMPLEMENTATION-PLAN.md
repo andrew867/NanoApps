@@ -60,20 +60,20 @@ Found: `hb_app.mk` restates the arch flags at link, so OQ-008's `-mcpu=cortex-a5
 
 **Completion**: CI green; `make gate` prints `pass 3 fail 0 skip 0`.
 
-## Phase 2: N31 parity from the new repo
+## Phase 2: N31 parity from the new repo (code done 2026-09-17; device checks deferred)
 
 **Goal**: the N31 binary built from `C:\src\tinygb` is functionally identical to the one built from NanoApps, and the ipod tree builds it from the new location.
 
-Files: `linux/Makefile.n31` (paths), `linux/shim/*` (new, vendored), `tools/sync-n31-shims.sh` (new), `linux/tg_linux.c` (`:913` return-code fix), `host/lv_conf_n31.h` and `platform/tg_scale.h` (Cortex-A8 comments), `C:\src\ipod\tools\linux-n31\build-n31-apps.sh`, `install-n31os-disk.ps1` (paths), `docs/N31-INTEGRATION.md`.
+Done:
+1. `linux/shim/`: `drmfb.c/h`, `fbcon.c/h`, `touch.c/h`, `fbrefresh.h`, `build_stamp.c/h`, `lvgl-mirror.mk`, and `lv_conf_base.h` (NanoApps' `sdk/lv_conf.h`, which the N31 config layers on and which was the one reference the first list missed), with `PROVENANCE` (NanoApps commit `981465f`). `tools/sync-n31-shims.sh` diffs or re-copies; run by hand, never by the build.
+2. `host/Makefile.n31`: includes and sources point at `../linux/shim`; `LVGL` defaults to the NanoApps checkout whether this repository is the subtree or a sibling; every flag, the `check-built` assertions, the stamp rule, and the staging copy unchanged. `linux/tg_linux.c`, `platform/tg_fb_linux.c`, `host/lv_conf_n31.h` include the shims instead of `../../n31launcher` and `../../../sdk`.
+3. REQ-N31-060: menu-less `main` returns 2 when the cartridge would not start. REQ-N31-061: the Cortex-A8 comments now say Cortex-A5, VFPv4, no NEON.
+4. `C:\src\ipod\tools\linux-n31\build-n31-apps.sh` builds from `$TINYGB` (default: the checkout beside the ipod tree, else `$NANOAPPS/apps/tinygb`); `install-n31os-disk.ps1` takes the binary from `artifacts\linux-n31`, where both builds stage it. Left uncommitted in the ipod tree, which was mid-way through other work on a feature branch.
+5. A clean `make n31` from the standalone checkout builds and passes `check-built`; no dependency file names a NanoApps path.
 
-Tasks:
-1. Copy the five launcher files, `build_stamp.c/h`, and `lvgl-mirror.mk` into `linux/shim/` with a `PROVENANCE` file (source path, NanoApps commit `08eed61`). `sync-n31-shims.sh` re-copies from `$NANOAPPS` and prints a diff; it is run by hand, not by the build.
-2. Rewrite the include and source paths in `Makefile.n31` to `../linux/shim` and repo-relative `../platform`; keep every flag, the `check-built` assertions, the stamp rule, and the staging copy exactly.
-3. Build, run `check-built`, push to the device, play Tetris and one battery game; capture `/dev/fb0` for dmg-acid2 and compare to `tg_headless -S` (AC-N31-002).
-4. Re-point `build-n31-apps.sh` (`build_tinygb` -> `make -C "$TINYGB/linux" -f Makefile.n31`, with `TINYGB=${TINYGB:-$(dirname "$ROOT")/tinygb}`) and `install-n31os-disk.ps1` (binary path). `mk-release-zip.sh` reads from artifacts and needs no change.
-5. Fix REQ-N31-060 and REQ-N31-061.
+Deferred to the device session after the RetailOS work (owner's call, 2026-09-17): AC-N31-002 (byte-identical acid2 capture) and the play checks (MAN-SMOKE-003, MAN-N31-010, MAN-DATA-001).
 
-**Completion**: `bash tools/linux-n31/build-n31-apps.sh tinygb` in the ipod tree builds from the new repo; AC-N31-001..004 pass; the NanoApps fork's `apps/tinygb` can now be reduced to the forwarder (Phase 3, step 1).
+**Completion**: as above, less the device checks.
 
 ## Phase 3: RetailOS picture and input
 
