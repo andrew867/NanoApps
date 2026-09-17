@@ -13,9 +13,12 @@
 
 #include "../core/tg_core.h"
 #include "../platform/tg_audio.h"
+#include "../platform/tg_pad.h"
 #include "../platform/tg_palette.h"
 #include "../platform/tg_scale.h"
+#include "../platform/tg_text.h"
 #include "../platform/tg_tilt.h"
+#include "../platform/tg_util.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -714,6 +717,139 @@ static void test_scale_alpha(void)
     ok("a palette without one adds none", bad == 0);
 }
 
+/* ---- text ----------------------------------------------------------------- */
+
+static unsigned count_px(const uint32_t *px, unsigned n, uint32_t c)
+{
+    unsigned k = 0;
+
+    for (unsigned i = 0; i < n; i++) if (px[i] == c) k++;
+    return k;
+}
+
+static void test_text(void)
+{
+    static uint32_t buf[64 * 40];
+    tg_surface s = { buf, 64, 40, 64, 0 };
+    const tg_font *f = &tg_font_ui;
+
+    printf("text:\n");
+
+    ok("the ui font covers printable ASCII",
+       f->first == 32 && f->count == 95 && f->w >= 6 && f->h >= 10);
+    ok("width is cells times characters",
+       tg_text_width(f, "abc", 1) == 3u * f->w && tg_text_width(f, "abc", 2) == 6u * f->w);
+    ok("fit counts whole cells", tg_text_fit(f, "abcdef", 3u * f->w + 2, 1) == 3);
+
+    /* Every glyph has some ink, except space, and none has ink outside
+       its cell - which is what a table with a row missing would show. */
+    {
+        unsigned blank = 0, wide = 0;
+
+        for (unsigned g = 0; g < f->count; g++) {
+            unsigned ink = 0;
+
+            for (unsigned r = 0; r < f->h; r++) {
+                uint16_t bits = f->rows[g * f->h + r];
+
+                if (bits >> f->w) wide++;
+                if (bits) ink++;
+            }
+            if (!ink && g + f->first != ' ') blank++;
+        }
+        ok("every glyph but space has ink", blank == 0);
+        ok("no glyph spills past its cell", wide == 0);
+    }
+
+    /* Drawn where asked, and only there. */
+    memset(buf, 0, sizeof buf);
+    tg_text_draw(&s, f, 10, 5, "I", 1, 0x00FFFFFFu);
+    {
+        unsigned outside = 0;
+
+        for (unsigned y = 0; y < 40; y++)
+            for (unsigned x = 0; x < 64; x++)
+                if (buf[y * 64 + x] &&
+                    (x < 10 || x >= 10u + f->w || y < 5 || y >= 5u + f->h))
+                    outside++;
+        ok("ink lands inside the cell", outside == 0 && count_px(buf, 64 * 40, 0x00FFFFFFu) > 0);
+    }
+
+    /* Clipping: text hanging off every edge writes nothing outside. */
+    memset(buf, 0, sizeof buf);
+    tg_text_draw(&s, f, -5, -5, "WW", 1, 0x00FFFFFFu);
+    tg_text_draw(&s, f, 60, 35, "WW", 2, 0x00FFFFFFu);
+    ok("clipped at the edges without dying", count_px(buf, 64 * 40, 0x00FFFFFFu) > 0);
+
+    /* The or_mask reaches the pixels. */
+    s.or_mask = 0xFF000000u;
+    memset(buf, 0, sizeof buf);
+    tg_text_draw(&s, f, 0, 0, "A", 1, 0x00123456u);
+    ok("the surface's mask is applied", count_px(buf, 64 * 40, 0xFF123456u) > 0 &&
+                                        count_px(buf, 64 * 40, 0x00123456u) == 0);
+}
+
+/* ---- the pad -------------------------------------------------------------- */
+
+static void test_pad(void)
+{
+    static uint32_t buf[240 * 432];
+    tg_surface s = { buf, 240, 432, 240, 0 };
+
+    printf("pad:\n");
+
+    ok("the picture is not a control",  tg_pad_hit(120, 100) == 0);
+    ok("a gap is nothing",              tg_pad_hit(2, 218) == 0);
+    ok("d-pad up",                      tg_pad_hit(6 + 60, 248 + 20) == TG_UP);
+    ok("d-pad down",                    tg_pad_hit(6 + 60, 248 + 100) == TG_DOWN);
+    ok("d-pad left",                    tg_pad_hit(6 + 20, 248 + 60) == TG_LEFT);
+    ok("d-pad right",                   tg_pad_hit(6 + 100, 248 + 60) == TG_RIGHT);
+    ok("a corner is two directions",    tg_pad_hit(6 + 100, 248 + 100) == (TG_RIGHT | TG_DOWN));
+    ok("the centre is the dead spot",   tg_pad_hit(6 + 60, 248 + 60) == 0);
+    ok("A",                             tg_pad_hit(208, 274) == TG_A);
+    ok("B",                             tg_pad_hit(168, 326) == TG_B);
+    ok("a near miss on A still counts", tg_pad_hit(208 + 30, 274) == TG_A);
+    ok("Select",                        tg_pad_hit(36 + 10, 386 + 10) == TG_SELECT);
+    ok("Start",                         tg_pad_hit(132 + 10, 386 + 10) == TG_START);
+    ok("the menu pill",                 tg_pad_hit(120, 216 + 16) == TG_PAD_MENU);
+    ok("the pill is not a joypad bit",  (tg_pad_hit(120, 216 + 16) & 0xFF) == 0);
+
+    /* Drawing writes the pad half and nothing above it. */
+    memset(buf, 0x11, sizeof buf);
+    tg_pad_invalidate();
+    tg_pad_draw(&s, 0, true);
+    ok("nothing above the pad is touched", count_px(buf, 240 * 216, 0x11111111u) == 240 * 216);
+    ok("the pad half was painted",        count_px(buf + 240 * 216, 240 * 216, 0x11111111u) == 0);
+
+    /* The same mask again writes nothing; a new one writes. */
+    memset(buf, 0x22, sizeof buf);
+    tg_pad_draw(&s, 0, false);
+    ok("an unchanged mask is a no-op",    count_px(buf, 240 * 432, 0x22222222u) == 240 * 432);
+    tg_pad_draw(&s, TG_A, false);
+    ok("a changed mask repaints",         count_px(buf + 240 * 216, 240 * 216, 0x22222222u) == 0);
+}
+
+/* ---- the string helpers --------------------------------------------------- */
+
+static void test_util(void)
+{
+    char buf[8];
+
+    printf("util:\n");
+
+    ok("utoa",                tg_utoa(1048576, buf, sizeof buf) && strcmp(buf, "1048576") == 0);
+    ok("utoa zero",           strcmp(tg_utoa(0, buf, sizeof buf), "0") == 0);
+    ok("utoa bounded",        strcmp(tg_utoa(123456789, buf, 4), "123") == 0);
+    ok("itoa negative",       strcmp(tg_itoa(-42, buf, sizeof buf), "-42") == 0);
+    ok("strlcpy truncates",   tg_strlcpy(buf, "abcdefghij", 4) == 10u && strcmp(buf, "abc") == 0);
+    ok("strlcat appends",     (tg_strlcpy(buf, "ab", sizeof buf), tg_strlcat(buf, "cd", sizeof buf)) == 4u && strcmp(buf, "abcd") == 0);
+    ok("strlcat bounded",     (tg_strlcpy(buf, "abcdef", sizeof buf), tg_strlcat(buf, "ghij", sizeof buf)) == 10u && strcmp(buf, "abcdefg") == 0);
+    ok("strrchr",             tg_strrchr("a/b.c/d.gb", '.') && strcmp(tg_strrchr("a/b.c/d.gb", '.'), ".gb") == 0 && tg_strrchr("abc", 'z') == NULL);
+    ok("stricmp",             tg_stricmp("Tetris.GB", "tetris.gb") == 0 && tg_stricmp("a", "b") < 0);
+    ok("ends with, any case", tg_ends_with_nocase("Zelda.Gb", ".gb") && !tg_ends_with_nocase("x.gbx", ".gb"));
+    ok("strcasestr",          tg_strcasestr("Legend of Zelda", "ZELDA") != NULL && tg_strcasestr("abc", "d") == NULL);
+}
+
 int main(void)
 {
     test_header();
@@ -725,6 +861,9 @@ int main(void)
     test_audio_clock();
     test_tilt();
     test_palette();
+    test_text();
+    test_pad();
+    test_util();
 
     printf(fails ? "\n%d FAILED\n" : "\nall passed\n", fails);
     return fails != 0;

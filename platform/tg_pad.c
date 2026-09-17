@@ -38,6 +38,12 @@
 #define SELECT_X    36
 #define START_X     132
 
+/* The menu pill, in the strip between the picture and the cross, centred. */
+#define MENU_W      44
+#define MENU_H      18
+#define MENU_X      ((240 - MENU_W) / 2)
+#define MENU_Y      (PAD_TOP + 7)
+
 /* ---- colour --------------------------------------------------------------
  *
  * The same palette the rest of the apps use, so the pad does not look like it
@@ -55,49 +61,19 @@ static unsigned s_drawn = ~0u;           /* the mask last painted */
 
 /* ---- drawing primitives --------------------------------------------------- */
 
-static void rect(tg_fb *fb, int x, int y, int w, int h, uint32_t c)
+static void rect(const tg_surface *s, int x, int y, int w, int h, uint32_t c)
 {
-    int yy;
-
-    if (!fb || !fb->pixels) return;
-
-    for (yy = y; yy < y + h; yy++) {
-        uint32_t *row;
-        int xx;
-
-        if (yy < 0 || yy >= (int)fb->h) continue;
-        row = fb->pixels + (size_t)yy * fb->stride_px;
-
-        for (xx = x; xx < x + w; xx++) {
-            if (xx < 0 || xx >= (int)fb->w) continue;
-            row[xx] = c;
-        }
-    }
+    tg_surface_rect(s, x, y, w, h, c);
 }
 
 /* A filled disc, by the squared distance so there is no arithmetic on
    fractions anywhere in this file. */
-static void disc(tg_fb *fb, int cx, int cy, int r, uint32_t c)
+static void disc(const tg_surface *s, int cx, int cy, int r, uint32_t c)
 {
-    int y;
-
-    if (!fb || !fb->pixels) return;
-
-    for (y = -r; y <= r; y++) {
-        int py = cy + y;
-        uint32_t *row;
-        int x;
-
-        if (py < 0 || py >= (int)fb->h) continue;
-        row = fb->pixels + (size_t)py * fb->stride_px;
-
-        for (x = -r; x <= r; x++) {
-            int px = cx + x;
-
-            if (px < 0 || px >= (int)fb->w) continue;
-            if (x * x + y * y <= r * r) row[px] = c;
-        }
-    }
+    for (int y = -r; y <= r; y++)
+        for (int x = -r; x <= r; x++)
+            if (x * x + y * y <= r * r)
+                tg_surface_px(s, cx + x, cy + y, c);
 }
 
 /*
@@ -112,15 +88,13 @@ static void disc(tg_fb *fb, int cx, int cy, int r, uint32_t c)
 static const uint8_t k_glyph_a[7] = { 0x04, 0x0A, 0x11, 0x11, 0x1F, 0x11, 0x11 };
 static const uint8_t k_glyph_b[7] = { 0x0F, 0x11, 0x11, 0x0F, 0x11, 0x11, 0x0F };
 
-static void glyph(tg_fb *fb, const uint8_t *g, int x, int y, int scale,
-                  uint32_t c)
+static void glyph(const tg_surface *s, const uint8_t *g, int x, int y,
+                  int scale, uint32_t c)
 {
-    int row;
-
-    for (row = 0; row < 7; row++)
+    for (int row = 0; row < 7; row++)
         for (int col = 0; col < 5; col++)
             if (g[row] & (1u << col))
-                rect(fb, x + col * scale, y + row * scale, scale, scale, c);
+                rect(s, x + col * scale, y + row * scale, scale, scale, c);
 }
 
 /* ---- hit-testing ---------------------------------------------------------- */
@@ -155,6 +129,11 @@ unsigned tg_pad_hit(int x, int y)
     if (in_rect(x, y, SELECT_X, PILL_Y, PILL_W, PILL_H)) return TG_SELECT;
     if (in_rect(x, y, START_X,  PILL_Y, PILL_W, PILL_H)) return TG_START;
 
+    /* The menu pill is small and sits by itself, so it gets the same
+       generosity as the discs: a few pixels around it count. */
+    if (in_rect(x, y, MENU_X - 6, MENU_Y - 6, MENU_W + 12, MENU_H + 12))
+        return TG_PAD_MENU;
+
     if (in_rect(x, y, DPAD_X, DPAD_Y, DPAD_SPAN, DPAD_SPAN)) {
         int col = (x - DPAD_X) / DPAD_CELL;
         int row = (y - DPAD_Y) / DPAD_CELL;
@@ -177,11 +156,11 @@ unsigned tg_pad_hit(int x, int y)
 
 void tg_pad_invalidate(void) { s_drawn = ~0u; }
 
-void tg_pad_draw(tg_fb *fb, unsigned held, bool force)
+void tg_pad_draw(const tg_surface *s, unsigned held, bool force)
 {
     uint32_t face;
 
-    if (!fb || !fb->pixels)
+    if (!s || !s->px)
         return;
     if (!force && held == s_drawn)
         return;
@@ -189,43 +168,50 @@ void tg_pad_draw(tg_fb *fb, unsigned held, bool force)
 
     /* The whole pad area, so a button that has just been released is cleared
        rather than left lit. */
-    rect(fb, 0, PAD_TOP, (int)fb->w, (int)fb->h - PAD_TOP, C_PAD_BG);
+    rect(s, 0, PAD_TOP, (int)s->w, (int)s->h - PAD_TOP, C_PAD_BG);
 
     /* The cross. Drawn as three bars - the two arms and the middle - because
        that is the shape, and because the middle must not look like a button
        when it is not one. */
     face = (held & (TG_UP | TG_DOWN)) ? C_FACE_DOWN : C_FACE;
-    rect(fb, DPAD_X + DPAD_CELL, DPAD_Y, DPAD_CELL, DPAD_SPAN, C_FACE);
+    rect(s, DPAD_X + DPAD_CELL, DPAD_Y, DPAD_CELL, DPAD_SPAN, C_FACE);
     if (held & TG_UP)
-        rect(fb, DPAD_X + DPAD_CELL, DPAD_Y, DPAD_CELL, DPAD_CELL, face);
+        rect(s, DPAD_X + DPAD_CELL, DPAD_Y, DPAD_CELL, DPAD_CELL, face);
     if (held & TG_DOWN)
-        rect(fb, DPAD_X + DPAD_CELL, DPAD_Y + DPAD_CELL * 2,
+        rect(s, DPAD_X + DPAD_CELL, DPAD_Y + DPAD_CELL * 2,
              DPAD_CELL, DPAD_CELL, face);
 
     face = (held & (TG_LEFT | TG_RIGHT)) ? C_FACE_DOWN : C_FACE;
-    rect(fb, DPAD_X, DPAD_Y + DPAD_CELL, DPAD_SPAN, DPAD_CELL, C_FACE);
+    rect(s, DPAD_X, DPAD_Y + DPAD_CELL, DPAD_SPAN, DPAD_CELL, C_FACE);
     if (held & TG_LEFT)
-        rect(fb, DPAD_X, DPAD_Y + DPAD_CELL, DPAD_CELL, DPAD_CELL, face);
+        rect(s, DPAD_X, DPAD_Y + DPAD_CELL, DPAD_CELL, DPAD_CELL, face);
     if (held & TG_RIGHT)
-        rect(fb, DPAD_X + DPAD_CELL * 2, DPAD_Y + DPAD_CELL,
+        rect(s, DPAD_X + DPAD_CELL * 2, DPAD_Y + DPAD_CELL,
              DPAD_CELL, DPAD_CELL, face);
 
     /* A hairline around the middle cell, so the dead centre reads as part of
        the cross rather than as a fifth button. */
-    rect(fb, DPAD_X + DPAD_CELL, DPAD_Y + DPAD_CELL, DPAD_CELL, 1, C_EDGE);
-    rect(fb, DPAD_X + DPAD_CELL, DPAD_Y + DPAD_CELL * 2 - 1,
+    rect(s, DPAD_X + DPAD_CELL, DPAD_Y + DPAD_CELL, DPAD_CELL, 1, C_EDGE);
+    rect(s, DPAD_X + DPAD_CELL, DPAD_Y + DPAD_CELL * 2 - 1,
          DPAD_CELL, 1, C_EDGE);
 
-    disc(fb, A_CX, A_CY, BTN_R, (held & TG_A) ? C_FACE_DOWN : C_FACE);
-    disc(fb, B_CX, B_CY, BTN_R, (held & TG_B) ? C_FACE_DOWN : C_FACE);
+    disc(s, A_CX, A_CY, BTN_R, (held & TG_A) ? C_FACE_DOWN : C_FACE);
+    disc(s, B_CX, B_CY, BTN_R, (held & TG_B) ? C_FACE_DOWN : C_FACE);
 
     /* Centred by hand: five columns at two pixels is ten wide, seven rows is
        fourteen tall. */
-    glyph(fb, k_glyph_a, A_CX - 5, A_CY - 7, 2, C_GLYPH);
-    glyph(fb, k_glyph_b, B_CX - 5, B_CY - 7, 2, C_GLYPH);
+    glyph(s, k_glyph_a, A_CX - 5, A_CY - 7, 2, C_GLYPH);
+    glyph(s, k_glyph_b, B_CX - 5, B_CY - 7, 2, C_GLYPH);
 
-    rect(fb, SELECT_X, PILL_Y, PILL_W, PILL_H,
+    rect(s, SELECT_X, PILL_Y, PILL_W, PILL_H,
          (held & TG_SELECT) ? C_FACE_DOWN : C_FACE);
-    rect(fb, START_X, PILL_Y, PILL_W, PILL_H,
+    rect(s, START_X, PILL_Y, PILL_W, PILL_H,
          (held & TG_START) ? C_FACE_DOWN : C_FACE);
+
+    /* The menu pill: a face with three lines on it, the glyph every phone
+       uses for "there is a menu here". */
+    rect(s, MENU_X, MENU_Y, MENU_W, MENU_H,
+         (held & TG_PAD_MENU) ? C_FACE_DOWN : C_FACE);
+    for (int i = 0; i < 3; i++)
+        rect(s, MENU_X + MENU_W / 2 - 7, MENU_Y + 4 + i * 4, 14, 2, C_GLYPH);
 }

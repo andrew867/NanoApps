@@ -1,13 +1,23 @@
 /*
  * tg_save.c — see tg_save.h.
+ *
+ * Written against tg_sys.h rather than stdio, so the same file backs both
+ * the Linux front end and the RetailOS one. The only thing that differs
+ * between them is how often the RAM is looked at, and that is a build
+ * setting: RetailOS has no exit callback, so a change there has to reach the
+ * disk within a couple of seconds or a press of Home loses it.
  */
 
 #include "tg_save.h"
+#include "tg_sys.h"
+#include "tg_util.h"
 
-#include <stdio.h>
 #include <string.h>
 
-#define CHECK_EVERY_NS 5000000000LL   /* five seconds */
+#ifndef TG_SAVE_CHECK_MS
+# define TG_SAVE_CHECK_MS 5000
+#endif
+#define CHECK_EVERY_NS ((long long)TG_SAVE_CHECK_MS * 1000000LL)
 
 static uint32_t crc32_of(const uint8_t *p, size_t n)
 {
@@ -44,9 +54,9 @@ void tg_save_path_for(const char *rom_path, char *out, size_t cap)
      * truncated at the dot, and the save would be written somewhere else
      * entirely - or not at all.
      */
-    dot = strrchr(rom_path, '.');
+    dot = tg_strrchr(rom_path, '.');
     {
-        const char *slash = strrchr(rom_path, '/');
+        const char *slash = tg_strrchr(rom_path, '/');
 
         if (dot && (!slash || dot > slash)) n = (size_t)(dot - rom_path);
     }
@@ -58,31 +68,33 @@ void tg_save_path_for(const char *rom_path, char *out, size_t cap)
 
 bool tg_save_load(tg_save *s, const char *path, uint8_t *ram, size_t len)
 {
-    FILE *f;
     long size;
     bool ok = false;
 
     memset(s, 0, sizeof *s);
     s->ram = ram;
     s->len = len;
-    snprintf(s->path, sizeof s->path, "%s", path ? path : "");
+    tg_strlcpy(s->path, path ? path : "", sizeof s->path);
 
     if (!ram || !len || !s->path[0]) return false;
 
-    if ((f = fopen(s->path, "rb"))) {
-        if (fseek(f, 0, SEEK_END) == 0 && (size = ftell(f)) >= 0) {
-            rewind(f);
-            if ((size_t)size == len && fread(ram, 1, len, f) == len) {
-                ok = true;
-            } else if ((size_t)size != len) {
-                /* Wrong size is a save for something else. Say so and start
-                   fresh rather than load part of it over a real one. */
-                fprintf(stderr,
-                        "tinygb: %s is %ld bytes, this cartridge wants %zu"
-                        " - ignoring it\n", s->path, size, len);
-            }
+    size = tg_file_size(s->path);
+    if (size >= 0) {
+        if ((size_t)size == len) {
+            ok = tg_file_read(s->path, ram, len) == (long)len;
+        } else {
+            /* Wrong size is a save for something else. Say so and start
+               fresh rather than load part of it over a real one. */
+            char line[160], num[24];
+
+            tg_strlcpy(line, s->path, sizeof line);
+            tg_strlcat(line, " is ", sizeof line);
+            tg_strlcat(line, tg_utoa((unsigned long)size, num, sizeof num), sizeof line);
+            tg_strlcat(line, " bytes, this cartridge wants ", sizeof line);
+            tg_strlcat(line, tg_utoa((unsigned long)len, num, sizeof num), sizeof line);
+            tg_strlcat(line, " - ignoring it", sizeof line);
+            tg_log(line);
         }
-        fclose(f);
     }
 
     s->on_disk = crc32_of(ram, len);
@@ -91,26 +103,20 @@ bool tg_save_load(tg_save *s, const char *path, uint8_t *ram, size_t len)
 
 bool tg_save_flush(tg_save *s)
 {
-    FILE *f;
     uint32_t now;
 
     if (!s || !s->ram || !s->len || !s->path[0]) return false;
 
     now = crc32_of(s->ram, s->len);
 
-    if (!(f = fopen(s->path, "wb"))) {
-        fprintf(stderr, "tinygb: cannot write %s\n", s->path);
+    if (!tg_file_write(s->path, s->ram, s->len)) {
+        char line[160];
+
+        tg_strlcpy(line, "cannot write ", sizeof line);
+        tg_strlcat(line, s->path, sizeof line);
+        tg_log(line);
         return false;
     }
-    if (fwrite(s->ram, 1, s->len, f) != s->len) {
-        fprintf(stderr, "tinygb: short write to %s\n", s->path);
-        fclose(f);
-        return false;
-    }
-    /* Flushed before the handle goes away, so a power cut a moment later
-       loses nothing that this call claimed to have written. */
-    fflush(f);
-    fclose(f);
 
     s->on_disk = now;
     return true;

@@ -24,26 +24,33 @@ NANOAPPS ?= ../..
 # ---- the RetailOS app -------------------------------------------------------
 
 APP_NAME    := tinygb
-SRCS        := tinygb.c
+SRCS        := tinygb.c \
+               core/tg_core.c core/tg_peanut.c vendor/minigb_apu.c \
+               platform/tg_scale.c platform/tg_audio_clock.c platform/tg_tilt.c \
+               platform/tg_palette.c platform/tg_pad.c platform/tg_text.c \
+               platform/tg_font_ui.c platform/tg_font_small.c platform/tg_util.c \
+               platform/tg_save.c \
+               platform/tg_sys_hb.c platform/tg_roms_hb.c platform/tg_input_hb.c
 RAW_SURFACE := 1
+
+# The part is a Cortex-A5 with VFPv4 and no NEON - read off the device under
+# N31; the SDK's cortex-a8/neon is a claim the silicon does not back. hb_app.mk
+# reads its arch flags from this variable (a NanoApps change made for TinyGB,
+# default unchanged), so this is the whole build's target, SDK included; code
+# built for an A5 runs on anything the SDK thought it was.
+HB_ARCH_FLAGS := -mcpu=cortex-a5 -mthumb -mfpu=vfpv4
 
 # hb_app.mk folds EXTRA_CFLAGS into CFLAGS with := at include time, so it has
 # to be complete here, not appended later.
 #
 # -O2 over the SDK's -Os: an emulator's inner loop is where the time goes and
-# an in-order core pays for every branch -Os keeps. A later -O wins, so this
-# one does apply to every source in the link, SDK included.
+# an in-order core pays for every branch -Os keeps. A later -O wins.
 #
-# The arch flags are the part's (Cortex-A5, VFPv4, no NEON - read off the
-# device under N31; the SDK's neon is a claim the silicon does not back), and
-# today they do NOT take effect: hb_app.mk compiles and links in one gcc
-# invocation and restates -mcpu=cortex-a8 -mfpu=neon in RELOC_LDFLAGS after
-# EXTRA_CFLAGS, and the last -m flag wins. They are here so the intent is in
-# one place; they start working the day hb_app.mk reads its arch flags from a
-# variable (docs/OPEN-QUESTIONS.md OQ-008). Until then the build is the SDK's
-# cortex-a8/neon, which every other NanoApps app runs on.
-EXTRA_CFLAGS := -O2 -mcpu=cortex-a5 -mfpu=vfpv4 \
+# There is no exit callback on RetailOS, so the battery save is looked at
+# every two seconds rather than the five Linux can afford.
+EXTRA_CFLAGS := -O2 \
                 -DAUDIO_SAMPLE_RATE=22050 -DMINIGB_APU_AUDIO_FORMAT_S16SYS=1 \
+                -DTG_SAVE_CHECK_MS=2000 \
                 -Wno-sign-compare -Wno-implicit-fallthrough \
                 -Wno-unused-but-set-variable -Wno-type-limits
 
