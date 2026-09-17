@@ -12,7 +12,7 @@ TinyGB puts a Game Boy on the nano's 240 x 432 screen at exactly one-and-a-half 
 |---|---|
 | Core, scaler, audio clock, tilt, save logic | done; unit tests and the Blargg / dmg-acid2 gate pass |
 | N31 Linux front end | done and playable: DRM or fbdev picture, alsa-lib sound, keys + tilt + touch, LVGL menu, saves, states |
-| RetailOS (NanoApps) front end | library, picture, multitouch pad, volume buttons, battery saves, and sound through the OS mixer's descriptor chain: built and unit-tested, not yet run on a device. The menu pages (Phase 5) to come |
+| RetailOS (NanoApps) front end | complete in code: library, picture, multitouch pad, volume buttons, sound through the OS mixer's descriptor chain, pause menu with save states, settings, About. Built and unit-tested; not yet run on a device |
 | This repository | extracted from the NanoApps fork with history; documented; host tests, the gate, vendor and seam checks, and the RetailOS build run in CI (Phase 1 done) |
 
 ## Who this is for
@@ -68,8 +68,8 @@ Linux or WSL. `make test`/`gate` need gcc and python3 with Pillow; the RetailOS 
 
 ## Current build priorities
 
-1. Phases 3 to 5: the RetailOS front end. On-screen touch controls and a menu that behaves like the nano's own screens are the bar; picture first, then sound, then menu, saves, and settings.
-2. Device session: RetailOS first, then the N31 build from this repository (Phase 2's deferred checks).
+1. Device session on RetailOS: heap headroom from the trace ring, the tone recording, then the manual plan. Tune the audio constants. Fix what the device shows.
+2. Then the N31 build from this repository (Phase 2's deferred checks), and Phase 6: size audit, soaks, screenshots, `v0.1.0`.
 3. Upstream: submit `apps/tinygb` to nfzerox/NanoApps once v0.1 is playable.
 
 ## Known gaps

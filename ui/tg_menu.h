@@ -47,6 +47,7 @@ typedef struct {
     unsigned palette;         /* index into tg_palette */
     bool     smooth;
     bool     tilt;
+    bool     overlay;         /* fps and queue counters, RetailOS only */
     bool     have_game;
     bool     can_state;       /* the core supports save states */
     bool     have_state;      /* one has been written for this cartridge */
