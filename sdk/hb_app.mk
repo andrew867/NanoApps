@@ -132,8 +132,14 @@ LINK_VA ?= 0x09280000
 # heap) for coexist binaries that run alongside the OS.
 BSS_VA ?= 0x09200000
 
+# The target, in one place. The default is what every app has always been
+# built for; an app that knows the part better (the SoC is a Cortex-A5 with
+# VFPv4 and no NEON, per /proc/cpuinfo under Linux) sets this before the
+# include and the whole link - SDK, libgcc choice and all - follows.
+HB_ARCH_FLAGS ?= -mcpu=cortex-a8 -mthumb -mfpu=neon
+
 CFLAGS := \
-    -mcpu=cortex-a8 -mthumb -mfpu=neon \
+    $(HB_ARCH_FLAGS) \
     -fno-pic -fno-builtin -ffreestanding -nostdlib \
     -fno-jump-tables -fno-common -fno-exceptions \
     -Os -Wall -Wextra -fdata-sections -ffunction-sections \
@@ -150,7 +156,7 @@ LDFLAGS := -Wl,--gc-sections -Wl,--build-id=none \
 # __aeabi_lmul, etc). The basic SDK rarely needs them, but anything
 # touching division or 64-bit math (notably LVGL) does. Linking libgcc
 # after -nostdlib gets the helpers without pulling in libc.
-LIBGCC := $(shell $(CC) -mcpu=cortex-a8 -mthumb -mfpu=neon -print-libgcc-file-name)
+LIBGCC := $(shell $(CC) $(HB_ARCH_FLAGS) -print-libgcc-file-name)
 LDLIBS := $(LIBGCC)
 
 ifeq ($(LVGL_ENABLE),1)
@@ -226,7 +232,7 @@ BUILD := build
 # mkrelocapp can extract the ABS32 reloc offsets; entry = payload_entry; no
 # fixed-VA linker script. Everything else links fixed-VA to a flat .bin.
 ifeq ($(RELOC),1)
-  RELOC_LDFLAGS := -mcpu=cortex-a8 -mthumb -mfpu=neon -nostdlib \
+  RELOC_LDFLAGS := $(HB_ARCH_FLAGS) -nostdlib \
                    -Wl,--gc-sections -Wl,--build-id=none \
                    -Wl,-q -Wl,-e,payload_entry -Wl,-Ttext,0
   APP_OUT := $(BUILD)/$(APP_NAME).hbapp
