@@ -1,0 +1,370 @@
+# Makefile.n31 — cross-build TinyGB for the N31 Linux port on iPod nano 7G.
+#
+#   make -f Makefile.n31            build build-n31/tinygb
+#   make -f Makefile.n31 push       build, scp to /tmp, chmod
+#   make -f Makefile.n31 run        push, then run it on the device
+#   make -f Makefile.n31 check      verify the float ABI and that it is static
+#
+# Target facts this encodes, all read off the device rather than assumed and all
+# the same ones Entrain's Makefile.n31 encodes - see it for the longer story:
+#
+#   * /dev/fb0 is 240x432, 32 bpp, 960-byte lines. A Game Boy scaled 1.5x is
+#     240x216, which is exactly the top half.
+#   * Cortex-A5, VFPv4 with 32 double registers, and a SOFT-FLOAT ABI.
+#     Read off the device rather than assumed - /proc/cpuinfo gives CPU part
+#     0xc05, which is an A5, and lists vfpv4 and vfpd32 among its features.
+#     This file used to say Cortex-A8 with VFPv3-D16 and claim VFPv4 was an
+#     undefined instruction here; all three were wrong, and the last one had
+#     been propagating into the build's own safety check.
+#
+#     The soft-float ABI is the one thing that IS as described, and it is a
+#     property of the toolchain rather than the part: this targets
+#     arm-linux-musleabi, whose libc passes floats in integer registers, so
+#     -mfloat-abi=hard fails at the link against every libc object with "uses
+#     VFP register arguments". Hard float needs a musleabihf toolchain, not a
+#     different flag.
+#   * No NEON - it is absent from the feature list, so vfpv4 and not
+#     neon-vfpv4.
+#   * Static musl. The initramfs has essentially no shared libraries.
+
+IPOD_ROOT ?= /mnt/c/src/ipod/artifacts/linux-n31
+# Static libdrm, so the emulator can drive /dev/dri/card0 rather than the
+# fbdev emulation over it. Built by build-n31-libdrm.sh in the ipod repo.
+LIBDRM    ?= $(IPOD_ROOT)/libdrm
+TOOLCHAIN ?= $(IPOD_ROOT)/tinyalsa-build/arm-linux-musleabi-cross
+
+# Which toolchain, and which float ABI.
+#
+# Overridable so a hard-float build can be made without disturbing this one.
+# The default is unchanged and stays unchanged until hard float has been shown
+# to work on hardware: this is what currently boots.
+#
+# softfp is not soft float. The FPU does the arithmetic either way; what the
+# ABI decides is whether a float crossing a function boundary travels in a VFP
+# register or in a pair of integer ones. Hard float cannot simply be switched
+# on here, because musleabi's own libc is built the other way and the link
+# fails with "uses VFP register arguments" - it needs the whole parallel
+# toolchain, and every vendored library rebuilt against it.
+#
+#   make -f Makefile.n31 \
+#     TOOLCHAIN=$(IPOD_ROOT)/toolchain-hf/arm-linux-musleabihf-cross \
+#     TRIPLE=arm-linux-musleabihf FLOAT_ABI=hard BUILD=build-n31-hf
+#
+# BUILD has to differ too. Objects of the two ABIs cannot be linked together -
+# which at least fails loudly rather than quietly - but they would happily
+# share an object directory and confuse every later build.
+TRIPLE    ?= arm-linux-musleabi
+FLOAT_ABI ?= softfp
+
+# Hard-float builds stage under a different name. The soft-float
+# artifact is what mk-initramfs.sh packs, and a parallel ABI
+# experiment must not quietly become the thing that boots.
+STAGE_SUFFIX := $(if $(filter-out softfp,$(FLOAT_ABI)),-$(FLOAT_ABI),)
+TINYALSA  ?= $(IPOD_ROOT)/tinyalsa-build/tinyalsa-2.0.0
+ALSALIB   ?= $(IPOD_ROOT)/alsa
+
+#
+# Which sound library. alsa-lib by default, and not for preference.
+#
+# tinyalsa is five files with no dependencies and would be the obvious choice,
+# but on this device its view of the stream is wrong: the status page it mmaps
+# never updates, so it re-prepares the stream before every write and reports a
+# state that never changes. mpg123 and ffplay use alsa-lib and play correctly
+# on the same hardware. Build with TG_AUDIO=tinyalsa to get the other one -
+# it is worth keeping, because it is much the smaller of the two and the fault
+# may be fixed in the driver.
+#
+#   make -f Makefile.n31                    alsa-lib   (default)
+#   make -f Makefile.n31 TG_AUDIO=tinyalsa  tinyalsa
+#
+TG_AUDIO ?= alsalib
+SSH_KEY   ?= $(IPOD_ROOT)/n31_id
+DEVICE    ?= root@192.168.7.2
+
+CROSS  := $(TOOLCHAIN)/bin/$(TRIPLE)-
+CCACHE := $(shell command -v ccache 2>/dev/null)
+CC     := $(CCACHE) $(CROSS)gcc
+STRIP  := $(CROSS)strip
+AR     := $(CROSS)ar
+READELF:= $(CROSS)readelf
+
+BUILD  ?= build-n31
+APP    := $(BUILD)/tinygb
+
+ARCH_FLAGS := -mcpu=cortex-a5 -mthumb -mfpu=vfpv4 -mfloat-abi=$(FLOAT_ABI)
+
+# The APU is compiled for one rate and it is the sink's, so nothing resamples.
+# 48000 because the codec's 12 MHz master clock only divides into that family -
+# 44100 is accepted by hw_params here and then never actually clocked.
+TG_AUDIO_RATE ?= 48000
+
+# Overridable so a flag sweep can compare builds without editing this file -
+# guessing between -O2/-O3 and thumb/arm on an in-order core is how an
+# afternoon disappears; measuring takes ten minutes.
+TG_OPT   ?= -O2
+TG_EXTRA ?=
+
+CFLAGS := $(TG_OPT) -g0 -std=gnu11 $(ARCH_FLAGS) $(TG_EXTRA) \
+          -ffunction-sections -fdata-sections \
+          -Wall -Wextra -Wno-unused-parameter \
+          -DAUDIO_SAMPLE_RATE=$(TG_AUDIO_RATE) \
+          -DMINIGB_APU_AUDIO_FORMAT_S16SYS=1 \
+          -I../../n31launcher -I$(LIBDRM)/include
+LDFLAGS := -static -Wl,--gc-sections
+LDLIBS  := $(LIBDRM)/lib/libdrm.a -lm
+
+ifeq ($(TG_AUDIO),alsalib)
+AUDIO_SRC := ../platform/tg_audio_alsalib.c
+CFLAGS    += -I$(ALSALIB)/include
+# -lpthread because alsa-lib uses it, and it must follow -lasound: a static
+# archive only resolves symbols for objects already seen.
+LDLIBS    += $(ALSALIB)/lib/libasound.a -lpthread
+else
+AUDIO_SRC := ../platform/tg_audio_linux.c
+CFLAGS    += -I$(TINYALSA)/include
+endif
+
+# Someone else's emulator, and we are not going to relitigate its warnings.
+VENDOR_CFLAGS := -Wno-sign-compare -Wno-implicit-fallthrough \
+                 -Wno-unused-but-set-variable -Wno-type-limits
+
+#
+# LVGL, for the menu.
+#
+# Built from a native mirror and cached per config, the same way Entrain and
+# the launcher do it - see apps/lvgl-mirror.mk for why compiling it across the
+# Windows mount is not an option. The cache directory carries the config's
+# hash, so changing lv_conf selects different objects rather than rebuilding
+# these.
+#
+LVGL     ?= ../../../lvgl
+include ../../lvgl-mirror.mk
+
+LV_CONF    := lv_conf_n31.h
+# The float ABI is part of the key, not just the config: objects of the
+# two ABIs cannot be linked together, and a cache that ignored the
+# difference would hand a hard-float build its soft-float objects.
+LV_CONF_ID := $(shell md5sum $(LV_CONF) 2>/dev/null | cut -c1-12)
+LV_CACHE   ?= $(HOME)/.cache/n31-lvgl/tinygb-n31-$(LV_CONF_ID)-$(FLOAT_ABI)
+LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_n31.h\" \
+             -I$(LVGL_SRC) -I$(LVGL_SRC)/src -I$(LVGL_SRC)/include -I$(LVGL_SRC)/..
+
+# Everything but the platforms this target will never be.
+LV_SRCS := $(shell find $(LVGL_SRC)/src -name '*.c' \
+             -not -name 'lv_freertos.c' -not -name 'lv_cmsis_rtos2.c' \
+             -not -name 'lv_mqx.c'      -not -name 'lv_rtthread.c' \
+             -not -name 'lv_windows.c'  -not -name 'lv_sdl2.c' \
+             -not -path '*/drivers/nuttx/*'    -not -path '*/drivers/qnx/*' \
+             -not -path '*/drivers/uefi/*'     -not -path '*/drivers/windows/*' \
+             -not -path '*/drivers/wayland/*'  -not -path '*/drivers/x11/*' \
+             -not -path '*/drivers/libinput/*' -not -path '*/drivers/opengles/*' \
+             -not -path '*/drivers/sdl/*'      -not -path '*/drivers/display/drm/*' \
+             2>/dev/null)
+LV_OBJS := $(patsubst $(LVGL_SRC)/%.c,$(LV_CACHE)/%.o,$(LV_SRCS))
+LVLIB   := $(LV_CACHE)/liblvgl_n31.a
+
+CFLAGS  += $(LV_CFLAGS)
+
+# ---- build stamp -----------------------------------------------------------
+#
+# Which build this is. An app on the device that is months old looks exactly
+# like the one just compiled - and the disk installer reported "no build stamp
+# in the binary" for TinyGB, so the launcher was falling back to file dates to
+# decide between two copies.
+BUILD_STAMP := $(shell date -u +%Y%m%d.%H%M)
+BUILD_GIT   := $(shell git rev-parse --short=7 HEAD 2>/dev/null || echo nogit)
+CFLAGS += -DEN_BUILD_STAMP='"$(BUILD_STAMP)"' -DEN_BUILD_GIT='"$(BUILD_GIT)"'
+
+SRCS := ../core/tg_core.c \
+        ../core/tg_peanut.c \
+        ../vendor/minigb_apu.c \
+        ../platform/tg_scale.c \
+        ../platform/tg_fb_linux.c \
+        ../platform/tg_audio_clock.c \
+        ../platform/tg_input_linux.c \
+        ../platform/tg_pad.c \
+        ../platform/tg_tilt.c \
+        ../platform/tg_roms.c \
+        ../platform/tg_palette.c \
+        ../ui/tg_menu.c \
+        ../../build_stamp.c \
+        ../platform/tg_save.c \
+        ../../n31launcher/fbcon.c \
+        ../../n31launcher/touch.c \
+        ../../n31launcher/drmfb.c \
+        ../linux/tg_linux.c
+
+# tinyalsa is eight files with no dependencies, which is exactly why it is used
+# rather than alsa-lib: a fully static musl binary stays practical. Compiled in
+# rather than linked against, so there is nothing to install on the device.
+TA_SRCS := $(TINYALSA)/src/pcm.c $(TINYALSA)/src/pcm_hw.c \
+           $(TINYALSA)/src/pcm_plugin.c $(TINYALSA)/src/mixer.c \
+           $(TINYALSA)/src/mixer_hw.c $(TINYALSA)/src/mixer_plugin.c \
+           $(TINYALSA)/src/snd_card_plugin.c $(TINYALSA)/src/limits.c
+TA_OBJS := $(patsubst $(TINYALSA)/src/%.c,$(BUILD)/ta/%.o,$(TA_SRCS))
+
+SRCS += $(AUDIO_SRC)
+
+OBJS := $(addprefix $(BUILD)/,$(notdir $(SRCS:.c=.o)))
+
+# tinyalsa is only compiled in when it is the backend; a megabyte of unused
+# archive is not free on a 55 MiB machine.
+ifneq ($(TG_AUDIO),alsalib)
+LINK_TA := $(TA_OBJS)
+endif
+
+.PHONY: all push run check check-built clean
+
+# Stated rather than implied. Including lvgl-mirror.mk above this brings its
+# own lvgl-resync rule in first, and the first rule in a makefile is what a
+# bare `make` builds - so without this, building TinyGB deleted the LVGL
+# mirror and reported success. Entrain's makefile carries the same line and
+# the same warning.
+.DEFAULT_GOAL := all
+
+all: $(APP)
+
+.PHONY: deps
+deps:
+ifeq ($(TG_AUDIO),alsalib)
+	@test -f $(ALSALIB)/lib/libasound.a || { \
+	   echo "no alsa-lib at $(ALSALIB) - run tools/linux-n31/build-n31-alsa-lib.sh"; \
+	   exit 1; }
+else
+	@test -d $(TINYALSA)/src || { echo "no tinyalsa at $(TINYALSA)"; exit 1; }
+endif
+
+$(BUILD):
+	@mkdir -p $(BUILD)
+
+# Its own order-only target rather than a second mkdir in $(BUILD)'s recipe:
+# $(BUILD) already existed from the previous build, so that recipe never ran
+# again and the assembler was left writing into a directory that was not there.
+$(BUILD)/ta:
+	@mkdir -p $(BUILD)/ta
+
+# Someone else's library; its warnings are not ours to fix either.
+$(BUILD)/ta/%.o: $(TINYALSA)/src/%.c | $(BUILD)/ta
+	$(CC) $(CFLAGS) $(VENDOR_CFLAGS) -c -o $@ $<
+
+# Two pattern rules rather than a vpath, so the vendor warning suppressions
+# apply to exactly the two files that need them.
+$(BUILD)/tg_peanut.o: ../core/tg_peanut.c | $(BUILD)
+	$(CC) $(CFLAGS) $(VENDOR_CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/minigb_apu.o: ../vendor/minigb_apu.c | $(BUILD)
+	$(CC) $(CFLAGS) $(VENDOR_CFLAGS) -MMD -MP -c -o $@ $<
+
+$(BUILD)/tg_core.o:     ../core/tg_core.c          | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/tg_scale.o:    ../platform/tg_scale.c     | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/tg_fb_linux.o: ../platform/tg_fb_linux.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/tg_audio_linux.o: ../platform/tg_audio_linux.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/tg_audio_alsalib.o: ../platform/tg_audio_alsalib.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/tg_audio_clock.o: ../platform/tg_audio_clock.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/tg_input_linux.o: ../platform/tg_input_linux.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/tg_pad.o:  ../platform/tg_pad.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/tg_tilt.o: ../platform/tg_tilt.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/tg_roms.o: ../platform/tg_roms.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/tg_save.o: ../platform/tg_save.c | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/fbcon.o:       ../../n31launcher/fbcon.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/touch.o:       ../../n31launcher/touch.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/drmfb.o:       ../../n31launcher/drmfb.c  | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD)/tg_linux.o:    ../linux/tg_linux.c        | $(BUILD) ; $(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+
+$(LV_CACHE)/%.o: $(LVGL_SRC)/%.c
+	@mkdir -p $(dir $@)
+	@$(CC) $(CFLAGS) -w $(LV_CFLAGS) -c -o $@ $<
+
+$(LVLIB): $(LV_OBJS)
+	@echo "  AR  $@"
+	@$(AR) crs $@ $^
+
+$(BUILD)/tg_menu.o: ../ui/tg_menu.c | $(BUILD)
+	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+
+# The stamp is refreshed whenever anything else was rebuilt.
+#
+# BUILD_STAMP is computed fresh on every invocation and handed to the compiler
+# as -DEN_BUILD_STAMP, but build_stamp.c had not changed since the day it was
+# written - so make considered this object up to date, never recompiled it, and
+# the binary kept reporting the stamp baked in on the day the file was last
+# touched. Four days of TinyGB builds all claimed to be from 2026-09-04, which
+# is exactly backwards from what a build stamp is for: the one number you
+# consult when asking whether the thing on the device is the thing you just
+# built. Radio+ never had this because it compiles its whole source list in one
+# invocation, so build_stamp.c is recompiled every time by construction.
+#
+# Depending on the OTHER objects rather than on a FORCE target, which is the
+# obvious fix and is a trap here. $(APP)'s recipe runs `make check`, and check
+# depends on $(APP) - harmless while a no-op build is genuinely a no-op, and
+# infinite recursion the moment one prerequisite can never be satisfied. FORCE
+# is exactly such a prerequisite: the sub-make rebuilt the stamp, relinked,
+# called check, and went round again. Seven of them were still running ten
+# hours later.
+#
+# This way a build that really has nothing to do still has nothing to do, and
+# the stamp moves whenever any part of the binary did.
+$(BUILD)/build_stamp.o: ../../build_stamp.c \
+                        $(filter-out $(BUILD)/build_stamp.o,$(OBJS)) | $(BUILD)
+	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+
+$(BUILD)/tg_palette.o: ../platform/tg_palette.c | $(BUILD)
+	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+
+# Staged into artifacts/linux-n31 like every other N31 app.
+#
+# This one is not in the initramfs - it lives on the volume beside its roms/
+# folder, because it reads /proc/self/exe and looks for cartridges next to
+# itself - so for a while it was the only app whose binary never reached the
+# shared artifacts directory. mk-release-zip.sh reads from there and only
+# there, which is how TinyGB came to be missing from the release entirely
+# while being perfectly built.
+$(APP): $(OBJS) $(LINK_TA) $(LVLIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+	$(STRIP) $@
+	@echo "  $(APP)  $$(stat -c%s $(APP)) bytes"
+	@$(MAKE) -s -f Makefile.n31 check-built
+	@mkdir -p $(IPOD_ROOT)
+	@cp -f $@ $(IPOD_ROOT)/tinygb$(STAGE_SUFFIX)
+	@echo "  staged -> $(IPOD_ROOT)/tinygb$(STAGE_SUFFIX)"
+
+# The two ways this binary can be wrong without failing to build: a float ABI
+# the libc does not share, and a dynamic binary looking for a loader that is
+# not in the initramfs.
+#
+# The FP_arch list is what the part reports it can execute. It used to stop at
+# VFPv3-D16 on the strength of a claim that VFPv4 faulted here, which
+# /proc/cpuinfo disproves - so the check was rejecting instructions the core
+# runs perfectly well. NEON stays off the list, because that one really is
+# absent from the features.
+#
+# Tag_ABI_VFP_args is the separate question and the one that actually breaks:
+# it says floats travel in VFP registers, which this libc does not do.
+# `check` builds first, for a person running it by hand. `check-built` only
+# inspects, and is what the link recipe calls - so the recipe can no longer ask
+# make to build the thing whose recipe is currently running.
+check: $(APP) check-built
+
+check-built:
+	@fp=$$($(READELF) -A $(APP) | sed -n 's/.*Tag_FP_arch: //p'); \
+	 case "$$fp" in \
+	   VFPv2|VFPv3|VFPv3-D16|VFPv4|VFPv4-D16) echo "  FP_arch $$fp  ok";; \
+	   *) echo "  FP_arch $$fp  NOT SAFE on Cortex-A5" >&2; exit 1;; \
+	 esac
+	@if $(READELF) -A $(APP) | grep -q Tag_ABI_VFP_args; then \
+	   echo "  hard-float ABI against a soft-float libc" >&2; exit 1; \
+	 else echo "  float ABI  softfp  ok"; fi
+	@n=$$($(READELF) -d $(APP) 2>/dev/null | grep -c NEEDED); \
+	 if [ "$$n" -eq 0 ]; then echo "  static  ok"; \
+	 else echo "  $$n dynamic NEEDED entries" >&2; exit 1; fi
+
+push: $(APP)
+	scp -i $(SSH_KEY) $(APP) $(DEVICE):/tmp/tinygb
+	ssh -i $(SSH_KEY) $(DEVICE) 'chmod +x /tmp/tinygb'
+
+run: push
+	ssh -i $(SSH_KEY) $(DEVICE) '/tmp/tinygb $(ROM) $(ARGS)'
+
+clean:
+	@rm -rf $(BUILD)
+
+-include $(wildcard $(BUILD)/*.d)
